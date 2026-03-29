@@ -85,110 +85,12 @@ ESP32-S3 DevKitC-1
    D7  ──► GPIO11  (MOSI / CMD)
 ```
 
-The SVG schematic below provides a visual layout suitable for GitHub rendering:
+The wiring diagram is available as a standalone SVG file:
 
-```svg
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 460" font-family="monospace" font-size="13">
-  <!-- Background -->
-  <rect width="820" height="460" fill="#1a1a2e" rx="12"/>
+**[📐 View Wiring Diagram (SVG)](doc/wiring.svg)**
 
-  <!-- ESP32-S3 chip body -->
-  <rect x="290" y="80" width="240" height="300" fill="#0f3460" rx="8" stroke="#e94560" stroke-width="2"/>
-  <text x="410" y="108" fill="#e94560" text-anchor="middle" font-size="14" font-weight="bold">ESP32-S3</text>
-  <text x="410" y="126" fill="#a8a8b3" text-anchor="middle" font-size="11">DevKitC-1 N16R8</text>
+> The diagram shows all four SD_MMC signal wires, power and ground, the RGB LED connection on GPIO 48, and both USB connectors (UART bridge and OTG).
 
-  <!-- Left GPIO pins on ESP32 -->
-  <text x="298" y="165" fill="#53d8fb">GPIO10</text>
-  <text x="298" y="195" fill="#53d8fb">GPIO11</text>
-  <text x="298" y="225" fill="#53d8fb">GPIO12</text>
-  <text x="298" y="255" fill="#53d8fb">GPIO13</text>
-  <text x="298" y="285" fill="#f5a623">GPIO48</text>
-  <text x="298" y="330" fill="#7ed321">3V3</text>
-  <text x="298" y="355" fill="#9b9b9b">GND</text>
-
-  <!-- Dots for pins -->
-  <circle cx="287" cy="161" r="4" fill="#53d8fb"/>
-  <circle cx="287" cy="191" r="4" fill="#53d8fb"/>
-  <circle cx="287" cy="221" r="4" fill="#53d8fb"/>
-  <circle cx="287" cy="251" r="4" fill="#53d8fb"/>
-  <circle cx="287" cy="281" r="4" fill="#f5a623"/>
-  <circle cx="287" cy="326" r="4" fill="#7ed321"/>
-  <circle cx="287" cy="351" r="4" fill="#9b9b9b"/>
-
-  <!-- USB ports on ESP32 right side -->
-  <rect x="528" y="155" width="60" height="32" fill="#16213e" rx="4" stroke="#e94560" stroke-width="1.5"/>
-  <text x="558" y="168" fill="#e94560" text-anchor="middle" font-size="10">USB</text>
-  <text x="558" y="181" fill="#a8a8b3" text-anchor="middle" font-size="9">UART</text>
-  <rect x="528" y="210" width="60" height="32" fill="#16213e" rx="4" stroke="#7ed321" stroke-width="1.5"/>
-  <text x="558" y="223" fill="#7ed321" text-anchor="middle" font-size="10">USB</text>
-  <text x="558" y="236" fill="#a8a8b3" text-anchor="middle" font-size="9">OTG</text>
-
-  <!-- SD Card module -->
-  <rect x="30" y="130" width="180" height="200" fill="#0f3460" rx="8" stroke="#53d8fb" stroke-width="2"/>
-  <text x="120" y="158" fill="#53d8fb" text-anchor="middle" font-size="13" font-weight="bold">SD Module</text>
-  <text x="120" y="175" fill="#a8a8b3" text-anchor="middle" font-size="10">(3.3 V)</text>
-
-  <!-- SD pin labels -->
-  <text x="145" y="207" fill="#e0e0e0" text-anchor="end">CS / D4</text>
-  <text x="145" y="232" fill="#e0e0e0" text-anchor="end">CLK / D5</text>
-  <text x="145" y="257" fill="#e0e0e0" text-anchor="end">MISO / D6</text>
-  <text x="145" y="282" fill="#e0e0e0" text-anchor="end">MOSI / D7</text>
-  <text x="145" y="307" fill="#7ed321" text-anchor="end">VCC</text>
-  <text x="145" y="332" fill="#9b9b9b" text-anchor="end">GND</text>
-
-  <!-- SD pin dots -->
-  <circle cx="153" cy="203" r="4" fill="#53d8fb"/>
-  <circle cx="153" cy="228" r="4" fill="#53d8fb"/>
-  <circle cx="153" cy="253" r="4" fill="#53d8fb"/>
-  <circle cx="153" cy="278" r="4" fill="#53d8fb"/>
-  <circle cx="153" cy="303" r="4" fill="#7ed321"/>
-  <circle cx="153" cy="328" r="4" fill="#9b9b9b"/>
-
-  <!-- Wires SD → ESP32 -->
-  <line x1="153" y1="203" x2="287" y2="161" stroke="#53d8fb" stroke-width="1.8"/>
-  <line x1="153" y1="228" x2="287" y2="191" stroke="#53d8fb" stroke-width="1.8"/>
-  <line x1="153" y1="253" x2="287" y2="221" stroke="#53d8fb" stroke-width="1.8"/>
-  <line x1="153" y1="278" x2="287" y2="251" stroke="#53d8fb" stroke-width="1.8"/>
-  <line x1="153" y1="303" x2="220" y2="303" stroke="#7ed321" stroke-width="1.8"/>
-  <line x1="220" y1="303" x2="220" y2="326" stroke="#7ed321" stroke-width="1.8"/>
-  <line x1="220" y1="326" x2="287" y2="326" stroke="#7ed321" stroke-width="1.8"/>
-  <line x1="153" y1="328" x2="240" y2="328" stroke="#9b9b9b" stroke-width="1.8"/>
-  <line x1="240" y1="328" x2="240" y2="351" stroke="#9b9b9b" stroke-width="1.8"/>
-  <line x1="240" y1="351" x2="287" y2="351" stroke="#9b9b9b" stroke-width="1.8"/>
-
-  <!-- Wire label annotations -->
-  <text x="200" y="154" fill="#53d8fb" font-size="10">CS</text>
-  <text x="200" y="179" fill="#53d8fb" font-size="10">CLK</text>
-  <text x="200" y="204" fill="#53d8fb" font-size="10">MISO</text>
-  <text x="200" y="229" fill="#53d8fb" font-size="10">MOSI</text>
-
-  <!-- RGB LED -->
-  <circle cx="287" cy="400" r="22" fill="#f5a623" opacity="0.25" stroke="#f5a623" stroke-width="1.5"/>
-  <circle cx="287" cy="400" r="10" fill="#f5a623"/>
-  <text x="287" y="432" fill="#f5a623" text-anchor="middle" font-size="11">WS2812B</text>
-  <text x="287" y="445" fill="#a8a8b3" text-anchor="middle" font-size="10">GPIO48 (onboard)</text>
-  <line x1="287" y1="281" x2="287" y2="378" stroke="#f5a623" stroke-width="1.8" stroke-dasharray="4,3"/>
-
-  <!-- PC boxes on right -->
-  <rect x="640" y="140" width="150" height="60" fill="#16213e" rx="6" stroke="#e94560" stroke-width="1.5"/>
-  <text x="715" y="165" fill="#e94560" text-anchor="middle" font-size="12">Host PC</text>
-  <text x="715" y="183" fill="#a8a8b3" text-anchor="middle" font-size="10">Serial Monitor</text>
-
-  <rect x="640" y="230" width="150" height="60" fill="#16213e" rx="6" stroke="#7ed321" stroke-width="1.5"/>
-  <text x="715" y="255" fill="#7ed321" text-anchor="middle" font-size="12">Target PC</text>
-  <text x="715" y="273" fill="#a8a8b3" text-anchor="middle" font-size="10">Virtual CD-ROM</text>
-
-  <!-- USB wires to PCs -->
-  <line x1="588" y1="171" x2="640" y2="171" stroke="#e94560" stroke-width="2"/>
-  <text x="614" y="165" fill="#e94560" text-anchor="middle" font-size="10">115200</text>
-  <line x1="588" y1="226" x2="640" y2="260" stroke="#7ed321" stroke-width="2"/>
-  <text x="614" y="250" fill="#7ed321" text-anchor="middle" font-size="10">USB MSC</text>
-
-  <!-- Title -->
-  <text x="410" y="43" fill="#e94560" text-anchor="middle" font-size="16" font-weight="bold">ESP32-S3 Virtual CD-ROM — Hardware Connections</text>
-  <text x="410" y="62" fill="#a8a8b3" text-anchor="middle" font-size="12">SD_MMC 1-bit mode  ·  GPIO10/11/12/13  ·  RGB LED GPIO48</text>
-</svg>
-```
 
 ---
 
