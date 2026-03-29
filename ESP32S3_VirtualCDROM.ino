@@ -43,6 +43,7 @@
 #include "SD_MMC.h"
 #include <Adafruit_NeoPixel.h>
 #include "USB.h"
+#include "soc/usb_serial_jtag_reg.h"  // disable USB-Serial/JTAG peripheral
 #include "USBMSC.h"
 extern "C" { bool tud_disconnect(void); bool tud_connect(void); }
 
@@ -425,6 +426,18 @@ static int32_t mscWriteCb(uint32_t lba, uint32_t offset, uint8_t *buf, uint32_t 
 
 static void mscFlushCb(void) {}
 
+// Disable the USB Serial/JTAG peripheral so it does not enumerate on the host.
+// On ESP32-S3 both the JTAG controller and the USB OTG (TinyUSB) share one
+// physical USB port. The JTAG controller is active from power-on by default.
+// Clearing USB_PAD_ENABLE disconnects it from the D+/D- pads immediately,
+// preventing the host from ever seeing the JTAG device.
+// This must run as early as possible — called from setup() before USB.begin().
+static void disableUsbJtag() {
+  // Clear USB_SERIAL_JTAG_USB_PAD_ENABLE bit — detaches JTAG from USB pads
+  REG_CLR_BIT(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_USB_PAD_ENABLE);
+  Serial.println(F("[USB]  JTAG peripheral disabled (USB pads released to OTG)."));
+}
+
 void initUSBMSC() {
   msc.vendorID("ESP32-S3");
   msc.productID("VirtualCDROM");
@@ -432,10 +445,23 @@ void initUSBMSC() {
   msc.onRead(mscReadCb);
   msc.onWrite(mscWriteCb);
   msc.isWritable(false);
-  msc.begin(1, 2048);       // dummy - updated on mount
+  msc.begin(1, 2048);
   msc.mediaPresent(false);
+  disableUsbJtag();  // Detach JTAG from USB pads before USB.begin()
   USB.begin();
-  Serial.println(F("[OK]  USB MSC CD-ROM initialized (no disc)."));
+  // Immediately disconnect — keep D+ low until a disc image is ready.
+  // Without this the host (especially Windows 9x) sees an empty MSC device,
+  // then a disconnect/reconnect once the ISO mounts, causing re-enumeration chaos.
+  delay(50);
+  tud_disconnect();
+  Serial.println(F("[OK]  USB MSC initialized (disconnected until disc ready)."));
+}
+
+// Call once after a disc image has been mounted to present the drive to the host.
+void usbConnect() {
+  tud_disconnect(); delay(200);
+  tud_connect();
+  Serial.println(F("[USB]  Connected to host."));
 }
 
 // =============================================================================
@@ -1545,12 +1571,18 @@ void setup() {
 
   Serial.println(F("\n[READY] Type 'help' for available commands\n"));
 
-  // Auto-mount default image
+  // Auto-mount default image, then connect USB.
+  // If no default image, connect USB anyway (host will see empty drive).
   if (sdReady && defaultMount.length()) {
     Serial.printf("[AUTO] Default image: %s\n", defaultMount.c_str());
     File _f = SD_MMC.open(defaultMount.c_str());
     if (_f) { _f.close(); doMount(defaultMount); }
-    else Serial.println(F("[AUTO] File not found on SD card."));
+    else {
+      Serial.println(F("[AUTO] File not found on SD card."));
+      usbConnect();  // connect with no disc rather than staying invisible
+    }
+  } else {
+    usbConnect();  // no default image configured — connect empty drive
   }
 }
 
