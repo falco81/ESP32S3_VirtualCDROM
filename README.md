@@ -85,11 +85,7 @@ ESP32-S3 DevKitC-1
    D7  ──► GPIO11  (MOSI / CMD)
 ```
 
-The wiring diagram is available as a standalone SVG file:
-
-**[📐 View Wiring Diagram (SVG)](doc/wiring.svg)**
-
-> The diagram shows all four SD_MMC signal wires, power and ground, the RGB LED connection on GPIO 48, and both USB connectors (UART bridge and OTG).
+![Wiring Diagram](doc/wiring.svg)
 
 
 ---
