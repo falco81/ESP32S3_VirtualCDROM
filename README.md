@@ -58,33 +58,6 @@ The MicroSD module is connected to the ESP32-S3 using SD_MMC in **1-bit mode** t
 
 ## Wiring Diagram
 
-```
-ESP32-S3 DevKitC-1
-───────────────────────────────────────────────────────
-                    ┌──────────────────────────────┐
-                    │         ESP32-S3             │
-                    │                              │
-   SD_MMC CLK  ─── │ GPIO12 ─────────────────── CLK │ ──► SD Module D5
-   SD_MMC CMD  ─── │ GPIO11 ─────────────────── CMD │ ──► SD Module D7 (MOSI)
-   SD_MMC D0   ─── │ GPIO13 ─────────────────── D0  │ ──► SD Module D6 (MISO)
-   SD_MMC D3   ─── │ GPIO10 ─────────────────── CS  │ ──► SD Module D4 (CS)
-                    │                              │
-   RGB LED     ─── │ GPIO48 ──────────────── WS2812B │ (onboard)
-                    │                              │
-   UART CH343  ─── │ USB (left connector)         │ ──► PC  serial monitor / programming
-   USB OTG     ─── │ USB (right connector)        │ ──► Target PC  (virtual CD-ROM)
-                    └──────────────────────────────┘
-
-   SD Module
-   ─────────────────────────
-   VCC ──► 3V3 rail on ESP32-S3
-   GND ──► GND
-   D4  ──► GPIO10  (CS / D3)
-   D5  ──► GPIO12  (CLK)
-   D6  ──► GPIO13  (MISO / D0)
-   D7  ──► GPIO11  (MOSI / CMD)
-```
-
 ![Wiring Diagram](doc/wiring.svg)
 
 
