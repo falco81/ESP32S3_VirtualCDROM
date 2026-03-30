@@ -71,8 +71,9 @@ extern "C" { bool tud_disconnect(void); bool tud_connect(void); }
 
 struct AudioTrack {
   uint8_t  number;          // Track number (1-based)
-  uint32_t startLba;        // First LBA of this track (relative to whole disc)
-  uint32_t lengthSectors;   // Track length in sectors
+  uint32_t startLba;        // Virtual disc LBA (absolute, reported in TOC)
+  uint32_t lengthSectors;   // Track length in sectors (usable audio, after pregap)
+  uint32_t pregapSectors;   // Pregap offset within BIN file (separate layout only)
   String   binFile;         // Full SD path to the .bin file for this track
   bool     valid;
 };
@@ -245,7 +246,8 @@ uint32_t mscBlockCount   = 0;
 uint16_t mscBlockSize    = 2048;
 
 // Block count shared with USBMSC.cpp patch (plain C++ — both TUs are C++)
-uint32_t cdromBlockCount = 0;
+uint32_t cdromBlockCount = 0;  // data track sectors (READ CAPACITY, I/O)
+uint32_t discLeadOutLba  = 0;  // lead-out LBA for READ TOC (includes audio tracks)
 
 bool initSD() {
   Serial.println(F("[SD]   Initializing SD_MMC (SDMMC hardware, 1-bit mode)"));
@@ -317,7 +319,12 @@ String parseCue(const String &cuePath) {
   // Clear audio track table
   audioTrackCount = 0;
   dataTrackEndLba = 0;
-  for (int i = 0; i < MAX_AUDIO_TRACKS; i++) audioTracks[i].valid = false;
+  for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
+    audioTracks[i].valid = false;
+    audioTracks[i].pregapSectors = 0;
+    audioTracks[i].startLba = 0;
+    audioTracks[i].lengthSectors = 0;
+  }
 
   String dataTrackBin = "";
   String currentFile  = "";
@@ -396,18 +403,21 @@ String parseCue(const String &cuePath) {
         at.valid    = true;
 
         if (separateFiles) {
-          // Each track in its own file — startLba within the file is from INDEX 01,
-          // but for playback we always read from byte 0 of the file (sector 0).
-          // INDEX 01 offset (e.g. 00:02:00 = 150 sectors pregap) is included in the file.
-          at.startLba = raw[i].startLba;  // pregap offset inside the file
-          // Length = total sectors in file
+          // Each track in its own file.
+          // pregapSectors = INDEX 01 offset within file (typically 150 = 2 seconds)
+          // lengthSectors = usable audio = file_size/2352 - pregap
+          uint32_t pregap = raw[i].startLba;  // INDEX 01 in file = pregap
           File af = SD_MMC.open(at.binFile.c_str());
           if (af) {
             uint64_t sz = af.size(); af.close();
-            at.lengthSectors = (uint32_t)(sz / 2352);
+            uint32_t totalSectors = (uint32_t)(sz / 2352);
+            at.pregapSectors  = pregap;
+            at.lengthSectors  = (totalSectors > pregap) ? (totalSectors - pregap) : totalSectors;
           } else {
-            at.lengthSectors = 0;
+            at.pregapSectors  = pregap;
+            at.lengthSectors  = 0;
           }
+          // virtualStart assigned after all tracks parsed (needs dataTrackSectors)
         } else {
           // Single BIN — INDEX 01 is absolute disc LBA
           at.startLba = raw[i].startLba;
@@ -415,8 +425,9 @@ String parseCue(const String &cuePath) {
           at.lengthSectors = (nextLba != 0xFFFFFFFF) ? (nextLba - at.startLba) : 0;
         }
 
-        Serial.printf("[CUE] Audio track %02d: LBA %lu  len %lu  (%s)\n",
-                      at.number, at.startLba, at.lengthSectors, at.binFile.c_str());
+        // startLba will be updated to virtual disc LBA after all tracks parsed
+        Serial.printf("[CUE] Audio track %02d: file len %lu sectors  (%s)\n",
+                      at.number, at.lengthSectors, at.binFile.c_str());
       }
     } else {
       dataTrackLba = raw[i].startLba;
@@ -425,6 +436,16 @@ String parseCue(const String &cuePath) {
         if (nextLba != 0xFFFFFFFF) {
           dataTrackSectors = nextLba - raw[i].startLba;
           dataTrackEndLba  = raw[i].startLba + dataTrackSectors;
+        }
+      } else {
+        // Separate BIN files: data track length from Track 01 file size
+        // File size / 2352 bytes-per-raw-sector = number of sectors
+        File dtf = SD_MMC.open(raw[i].file.c_str());
+        if (dtf) {
+          uint64_t sz = dtf.size(); dtf.close();
+          dataTrackSectors = (uint32_t)(sz / 2352);
+          dataTrackEndLba  = dataTrackLba + dataTrackSectors;
+          Serial.printf("[CUE] Data track sectors from file: %lu\n", dataTrackSectors);
         }
       }
     }
@@ -442,6 +463,28 @@ String parseCue(const String &cuePath) {
     }
   }
 
+  // For separate BIN layout: assign virtual disc LBAs
+  // data track occupies [0 .. dataTrackSectors-1]
+  // audio tracks follow sequentially, each with its pregap stripped
+  if (separateFiles && audioTrackCount > 0) {
+    uint32_t virtualCursor = (dataTrackSectors > 0) ? dataTrackSectors : mountedBlocks;
+    for (int i = 0; i < audioTrackCount; i++) {
+      audioTracks[i].startLba = virtualCursor;
+      virtualCursor += audioTracks[i].lengthSectors;
+    }
+    // Lead-out LBA = virtualCursor (used by READ TOC 0xAA entry)
+    discLeadOutLba = virtualCursor;
+    Serial.printf("[CUE] Virtual disc LBAs assigned, lead-out LBA=%lu\n", virtualCursor);
+  }
+
+  // Log final track table with correct virtual LBAs
+  for (int i = 0; i < audioTrackCount; i++) {
+    Serial.printf("[CUE] Track %02d: LBA %6lu  len %5lu  (~%lus)\n",
+                  audioTracks[i].number,
+                  audioTracks[i].startLba,
+                  audioTracks[i].lengthSectors,
+                  audioTracks[i].lengthSectors / 75);
+  }
   if (audioTrackCount > 0)
     Serial.printf("[CUE] %d audio track(s) found  (layout: %s)\n",
                   audioTrackCount, separateFiles ? "separate BIN files" : "single BIN");
@@ -490,6 +533,9 @@ bool doMount(const String &filename) {
   mscBlockCount   = mountedBlocks;
   mscBlockSize    = 2048;
   cdromBlockCount = mountedBlocks;
+  // For non-CUE or single-BIN: lead-out = data track end
+  // For CUE separate files: already set by parseCue() above
+  if (discLeadOutLba == 0) discLeadOutLba = mountedBlocks;
   mscMediaPresent = true;
 
   msc.begin(mountedBlocks, 2048);
@@ -523,7 +569,7 @@ void doUmount() {
   msc.mediaPresent(false);
   closeIso();
   mountedFile = ""; mountedBlocks = 0;
-  mscBlockCount = 0; cdromBlockCount = 0;
+  mscBlockCount = 0; cdromBlockCount = 0; discLeadOutLba = 0;
   audioTrackCount = 0; dataTrackEndLba = 0;
   msc.begin(1, 2048);
   tud_disconnect(); delay(300); tud_connect();
@@ -708,7 +754,7 @@ static void audioTask(void* arg) {
       }
       audioCurrentLba++;
       uint8_t am,as_,af,rm,rs,rf;
-      lbaToMsf(audioCurrentLba,am,as_,af);
+      lbaToMsf(audioCurrentLba+150,am,as_,af);  // +150 pregap
       uint32_t rel=audioCurrentLba-trk->startLba;
       lbaToMsf(rel,rm,rs,rf);
       subChannel.trackNum=trk->number;subChannel.indexNum=1;
@@ -731,7 +777,10 @@ static void audioTask(void* arg) {
     }
 
     // Seek to LBA position in the BIN file
-    uint64_t fileOffset = (uint64_t)lba * 2352;
+    // For separate BIN: virtual disc LBA -> file sector = (lba-startLba)+pregap
+    // For single BIN:   pregapSectors=0, startLba=absolute disc LBA -> fileOffset=lba*2352
+    uint64_t fileSector = (uint64_t)(lba - trk->startLba) + trk->pregapSectors;
+    uint64_t fileOffset = fileSector * 2352;
     if (!audioFile.seek(fileOffset)) {
       audioState = AUDIO_STOP;
       vTaskDelay(pdMS_TO_TICKS(10));
@@ -775,7 +824,7 @@ static void audioTask(void* arg) {
 
       // Compute sub-channel MSF
       uint8_t am, as_, af;
-      lbaToMsf(lba, am, as_, af);
+      lbaToMsf(lba + 150, am, as_, af);  // +150 = standard 2-sec pregap offset
       uint32_t relLba = lba - trk->startLba;
       uint8_t rm, rs, rf;
       lbaToMsf(relLba, rm, rs, rf);
@@ -872,7 +921,10 @@ int scsi_audio_track_info(int n, uint32_t* startLba, uint32_t* lenSectors) {
   return 0;
 }
 
-uint32_t cdromBlockCount_get() { return cdromBlockCount; }
+uint32_t cdromBlockCount_get() {
+  // For READ TOC lead-out: return full virtual disc LBA (includes audio)
+  return discLeadOutLba > 0 ? discLeadOutLba : cdromBlockCount;
+}
 
 // =============================================================================
 //  WIFI
