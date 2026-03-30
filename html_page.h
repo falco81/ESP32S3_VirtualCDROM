@@ -229,11 +229,19 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 
 <div class="panel" id="p3">
   <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
-    <div class="ct" style="display:flex;align-items:center;justify-content:space-between">
-      <span>&#128203; Event log</span>
-      <button class="btn gr" style="font-size:.7rem;padding:2px 8px" onclick="clearLog()">Clear</button>
+    <div class="ct" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
+      <span>&#128203; System Log</span>
+      <div style="display:flex;gap:6px;align-items:center">
+        <label style="font-size:.75rem;color:var(--muted);display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="logAutoScroll" checked> Auto-scroll
+        </label>
+        <label style="font-size:.75rem;color:var(--muted);display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="logLiveUpdate" checked onchange="logLiveToggle()"> Live
+        </label>
+        <button class="btn gr" style="font-size:.7rem;padding:2px 8px" onclick="clearLog()">Clear</button>
+      </div>
     </div>
-    <div id="log">Ready.</div>
+    <div id="log" style="flex:1;overflow-y:auto;font-size:.75rem;white-space:pre-wrap;word-break:break-all;min-height:0;background:var(--bg);padding:6px;border-radius:4px;border:1px solid var(--border)">Ready.</div>
   </div>
 </div>
 
@@ -312,13 +320,10 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <div class="cfg-row"><label class="cfg-lbl">DNS</label><input class="cfg-inp" id="cfgDns" type="text" placeholder="8.8.8.8"></div>
       </div>
       <div class="cfg-row"><label class="cfg-lbl">Hostname / FQDN</label>
-        <div style="display:flex;align-items:center;gap:8px;width:100%">
-          <input class="cfg-inp" id="cfgHostname" type="text" placeholder="espcd or espcd.corp.net" style="flex:1" oninput="cfgMdnsUpdate(this.value)">
-          <a id="cfgMdnsLink" href="#" target="_blank" style="font-size:.75rem;color:var(--accent);white-space:nowrap"></a>
-        </div>
-        <div style="font-size:.73rem;color:var(--muted);margin-top:3px">
-          FQDN: <span id="cfgFqdnPreview" style="color:var(--tx)"></span> &nbsp;&middot;&nbsp; mDNS: <span id="cfgMdnsPreview" style="color:var(--accent)"></span>
-        </div>
+        <input class="cfg-inp" id="cfgHostname" type="text" placeholder="espcd or espcd.corp.net" style="flex:1" oninput="cfgMdnsUpdate(this.value)">
+      </div>
+      <div style="padding-left:148px;font-size:.73rem;color:var(--muted);margin-top:-4px;margin-bottom:6px;line-height:1.8">
+        FQDN:&nbsp;<span id="cfgFqdnPreview" style="color:var(--tx)"></span>&emsp;·&emsp;mDNS:&nbsp;<a id="cfgMdnsLink" href="#" target="_blank" id2="cfgMdnsPreview"><span id="cfgMdnsPreview" style="color:var(--accent)"></span></a>
       </div>
     </div>
 
@@ -412,6 +417,23 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
 
+    <!-- DOS Compatibility Mode -->
+    <div class="card">
+      <div class="ct">&#128190; DOS Compatibility Mode</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">Mount behavior</label>
+        <select class="cfg-inp" id="cfgDosCompat" style="width:100%">
+          <option value="0">Normal (USB re-enumeration on mount/eject)</option>
+          <option value="1">DOS compatible (UNIT ATTENTION only, no re-enum)</option>
+        </select>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; Enable when using with DOS (MSCDEX / USBASPI). Prevents the device from
+        disappearing after disc swap. Uses UNIT&nbsp;ATTENTION&nbsp;0x28 instead of USB
+        re-enumeration so DOS drivers can reload the TOC without losing the device.
+      </div>
+    </div>
+
     <!-- Actions -->
     <div class="card">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -419,6 +441,8 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <button class="btn yw" onclick="cfgReboot()">&#8635; Reboot</button>
         <button class="btn gr" onclick="cfgFactory()" style="margin-left:auto">&#9888; Factory reset</button>
         <span class="sp" id="cfgActSp"></span>
+      </div>
+      <div style="margin-top:6px;min-height:1.4rem;text-align:right">
         <span id="cfgActMsg" style="font-size:.8rem"></span>
       </div>
       <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -434,7 +458,47 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 
 <script>
 function $(id){return document.getElementById(id);}
-function log(m){var el=$('log'),t=new Date().toTimeString().slice(0,8);el.textContent+='['+t+'] '+m+'\n';el.scrollTop=el.scrollHeight;}
+var logSeq=0, logTimer=null;
+
+function log(m){
+  // Client-side log — for UI action feedback
+  var el=$('log');
+  if(!el) return;
+  var t=new Date().toTimeString().slice(0,8);
+  el.textContent+='['+t+'] '+m+'\n';
+  if($('logAutoScroll')&&$('logAutoScroll').checked) el.scrollTop=el.scrollHeight;
+}
+
+function logFetch(){
+  fetch('/api/log?seq='+logSeq).then(function(r){return r.json();}).then(function(d){
+    if(!d||d.seq===undefined) return;
+    if(d.seq!==logSeq){
+      // New content available — replace entire log content
+      logSeq=d.seq;
+      var el=$('log');
+      if(!el) return;
+      el.textContent=d.log;
+      if($('logAutoScroll')&&$('logAutoScroll').checked) el.scrollTop=el.scrollHeight;
+    }
+  }).catch(function(){});
+}
+
+function logLiveToggle(){
+  var live=$('logLiveUpdate')&&$('logLiveUpdate').checked;
+  if(live){
+    if(!logTimer) logTimer=setInterval(logFetch,1000);
+    logFetch();
+  // Pre-fetch dosCompatOn so doMount knows mode before Status tab is opened
+  fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){dosCompatOn=s.dos_compat||false;}).catch(function(){});
+  } else {
+    if(logTimer){clearInterval(logTimer);logTimer=null;}
+  }
+}
+
+function clearLog(){
+  var el=$('log');
+  if(el) el.textContent='Log cleared.\n';
+}
 function fmtSz(b){if(!b||b<0)return '';var u=['B','KB','MB','GB'],i=0;while(b>=1024&&i<3){b/=1024;i++;}return(i?b.toFixed(1):b)+'\u00a0'+u[i];}
 function spin(id,on){$(id).style.display=on?'inline-block':'none';}
 function jp(b,n){return b==='/'?'/'+n:b+'/'+n;}
@@ -539,7 +603,7 @@ function apStopPoll(){
   // Keep a slow background poll (3s) so PC-driven changes are still detected
   // and the tab state badge / enable stays current
   if(apPollTimer){ clearInterval(apPollTimer); apPollTimer=null; }
-  if(!apBgTimer)  apBgTimer=setInterval(apBgPoll,2000);
+  if(!apBgTimer)  apBgTimer=setInterval(apBgPoll,2000);logFetch();
 }
 var apBgTimer=null;
 function apBgPoll(){
@@ -603,7 +667,7 @@ function apSeekRel(rel){
 function webAuthToggle(){
   $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
 }
-function showTab(n){curTab=n;for(var i=0;i<6;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===4)loadSysinfo();if(n===5)cfgLoad();}
+function showTab(n){curTab=n;for(var i=0;i<6;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===3){if($("logLiveUpdate")&&$("logLiveUpdate").checked){if(!logTimer)logTimer=setInterval(logFetch,1000);logFetch();}}else{if(n!==3&&logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===3){if(!logTimer&&$("logLiveUpdate")&&$("logLiveUpdate").checked){logTimer=setInterval(logFetch,1000);}logFetch();}else if(n!==3){if(logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===4)loadSysinfo();if(n===5)cfgLoad();}
 
 function cfgMsg(id,txt,isOk){var el=$(id);el.style.display='block';el.style.color=isOk?'var(--green)':'var(--red)';el.textContent=txt;}
 
@@ -860,6 +924,7 @@ function cfgLoad(){
     $('cfgEapKey')._savedVal  = c.eapKeyPath  || '';
     $('cfgEapKPass').value = '';  // never pre-fill password
     $('cfgAudioModule').value = c.audioModule ? '1' : '0';
+    $('cfgDosCompat').value = c.dosCompat ? '1' : '0';
     $('cfgWebAuth').value = c.webAuth ? '1' : '0';
     $('cfgWebUser').value = c.webUser || 'admin';
     $('cfgWebPass').value = '';
@@ -888,6 +953,7 @@ function cfgSave(){
   params.set('eapKeyPath',$('cfgEapKey').value||'');
   if($('cfgEapKPass').value.trim()) params.set('eapKeyPass',$('cfgEapKPass').value.trim());
   params.set('audioModule',$('cfgAudioModule').value);
+  params.set('dosCompat',$('cfgDosCompat').value);
   params.set('webAuth',$('cfgWebAuth').value);
   if($('cfgWebUser').value.trim()) params.set('webUser',$('cfgWebUser').value.trim());
   if($('cfgWebPass').value.trim()) params.set('webPass',$('cfgWebPass').value.trim());
@@ -937,7 +1003,7 @@ function sdRemount(){
   fetch('/api/sd/mount').then(function(r){return r.text();}).then(function(m){
     spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;
     sdCfgMsg(m, m.indexOf('OK')===0);
-    log(m);loadStatus();cdLoadDir('/');fmLoadDir('/');apBgTimer=setInterval(apBgPoll,2000);apBgPoll();setTimeout(apBgPoll,600);setTimeout(apBgPoll,1500);apPoll();
+    log(m);loadStatus();cdLoadDir('/');fmLoadDir('/');apBgTimer=setInterval(apBgPoll,2000);apBgPoll();setTimeout(apBgPoll,600);setTimeout(apBgPoll,1500);apPoll();logFetch();logFetch();
   }).catch(function(){spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;sdCfgMsg('ERROR: request failed',false);});
 }
 
@@ -1017,6 +1083,8 @@ function loadSysinfo(){
     siRow(sy,'CPU',s.sys_cpu_mhz+' MHz');
     siRow(sy,'Flash',s.sys_flash_mb+' MB');
     siRow(sy,'SDK',s.sys_sdk);
+    dosCompatOn=s.dos_compat||false;
+    siRow(sy,'DOS compat',s.dos_compat?'<span style="color:var(--ok)">&#10003; Enabled (no USB re-enum on mount)</span>':'<span style="color:var(--muted)">Disabled</span>');
       // Audio section
       var ta=$('siAudio')&&$('siAudio').querySelector('tbody');
       if(ta){
@@ -1036,13 +1104,14 @@ function loadSysinfo(){
   }).catch(function(){spin('siSp',false);$('siBtn').disabled=false;log('ERROR: sysinfo fetch failed.');});
 }
 
-var curDefault='';
+var curDefault='', dosCompatOn=false, curMounted='';
 function loadStatus(){
   fetch('/api/status').then(function(r){return r.json();}).then(function(s){
     $('badge').textContent=s.mounted?'MOUNTED':'NONE';
     $('badge').className='badge '+(s.mounted?'on':'off');
     $('mname').textContent=s.mounted?s.file:'— nothing mounted —';
     curDefault=s['default']||'';
+    curMounted=s.mounted?s.file:'';
     var db=$('defbar'),dbn=$('defbadge');
     if(s.mounted||curDefault.length){
       db.style.display='flex';
@@ -1099,7 +1168,30 @@ function cdLoadDir(path){
   }).catch(function(){spin('cdSp',false);log('ERROR: cannot read directory.');});
 }
 
-function doMount(path){log('Mounting: '+path);fetch('/api/mount?file='+encodeURIComponent(path)).then(function(r){return r.text();}).then(function(m){log(m);loadStatus();}).catch(function(){log('ERROR: mount failed.');});}
+function doMount(path){
+  var doActualMount=function(){
+    log('Mounting: '+path);
+    fetch('/api/mount?file='+encodeURIComponent(path))
+      .then(function(r){return r.text();})
+      .then(function(m){log(m);loadStatus();})
+      .catch(function(){log('ERROR: mount failed.');});
+  };
+  if(dosCompatOn&&curMounted){
+    // DOS compat: eject → wait for OS to process → mount
+    // Windows needs ~2s to fully process eject before new disc appears
+    log('DOS compat: ejecting...');
+    fetch('/api/umount').then(function(r){return r.text();})
+      .then(function(m){
+        log(m);
+        curMounted='';
+        loadStatus();
+        setTimeout(doActualMount,2500);
+      })
+      .catch(function(){doActualMount();});
+  } else {
+    doActualMount();
+  }
+}
 function doEject(){fetch('/api/umount').then(function(r){return r.text();}).then(function(m){log(m);loadStatus();});}
 
 var fmPath='/';

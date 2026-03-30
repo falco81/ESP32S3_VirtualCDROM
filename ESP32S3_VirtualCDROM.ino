@@ -45,7 +45,7 @@
 #include "USB.h"
 #include "USBMSC.h"
 #include <driver/i2s_std.h>       // PCM5102 audio output
-extern "C" { bool tud_disconnect(void); bool tud_connect(void); }
+extern "C" { bool tud_disconnect(void); bool tud_connect(void); void msc_set_unit_attention(void); }
 
 // =============================================================================
 //  PIN DEFINITIONS
@@ -140,6 +140,7 @@ struct Config {
   bool webAuth;            // true = HTTP Basic Auth enabled
   char webUser[32];        // Web UI username (default: admin)
   char webPass[64];        // Web UI password (default: admin)
+  bool dosCompat;          // true = skip USB re-enum on mount (DOS compatibility)
 };
 Config cfg;
 
@@ -168,6 +169,7 @@ void loadConfig() {
   cfg.webAuth = prefs.getBool("webAuth", false);
   strlcpy(cfg.webUser, prefs.getString("webUser", "admin").c_str(), sizeof(cfg.webUser));
   strlcpy(cfg.webPass, prefs.getString("webPass", "admin").c_str(), sizeof(cfg.webPass));
+  cfg.dosCompat = prefs.getBool("dosCompat", false);
   prefs.end();
 }
 
@@ -196,9 +198,79 @@ void saveConfig() {
   prefs.putBool("webAuth", cfg.webAuth);
   prefs.putString("webUser", cfg.webUser);
   prefs.putString("webPass", cfg.webPass);
+  prefs.putBool("dosCompat", cfg.dosCompat);
   prefs.end();
 }
 
+// ── Web log ring buffer ──────────────────────────────────────────────────────
+// Captures Serial output so the HTML Log tab can display it live
+#define WEB_LOG_SIZE   8192   // ring buffer size in bytes
+#define WEB_LOG_LINES  200    // max lines kept
+static char     webLogBuf[WEB_LOG_SIZE];
+static uint32_t webLogHead = 0;   // write position
+static uint32_t webLogSeq  = 0;   // monotonic sequence number (increments per line)
+
+// Call this instead of (or in addition to) Serial.println/printf
+void webLog(const char* msg) {
+  Serial.println(msg);
+  // Append to ring buffer with timestamp
+  char tmp[256];
+  uint32_t ms = millis();
+  snprintf(tmp, sizeof(tmp), "[%lu.%03lu] %s\n", ms/1000, ms%1000, msg);
+  size_t len = strlen(tmp);
+  for (size_t i = 0; i < len; i++) {
+    webLogBuf[webLogHead % WEB_LOG_SIZE] = tmp[i];
+    webLogHead++;
+  }
+  webLogSeq++;
+}
+
+// Append formatted string to web log (mirrors Serial.printf)
+void webLogf(const char* fmt, ...) {
+  char tmp[256];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(tmp, sizeof(tmp), fmt, args);
+  va_end(args);
+  // strip trailing newline if present (webLog adds one)
+  size_t l = strlen(tmp);
+  if (l > 0 && tmp[l-1] == '\n') tmp[l-1] = '\0';
+  webLog(tmp);
+}
+
+// Custom Print class that mirrors output to both Serial and web log buffer
+class DualPrint : public Print {
+public:
+  // Buffer incoming chars until newline then flush to webLog
+  size_t write(uint8_t c) override {
+    Serial.write(c);
+    if (c == '\n') {
+      _line[_pos] = '\0';
+      // Append line to ring buffer with timestamp
+      char tmp[280];
+      uint32_t ms = millis();
+      snprintf(tmp, sizeof(tmp), "[%lu.%03lu] %s\n", ms/1000, ms%1000, _line);
+      size_t len = strlen(tmp);
+      for (size_t i = 0; i < len; i++) {
+        webLogBuf[webLogHead % WEB_LOG_SIZE] = tmp[i];
+        webLogHead++;
+      }
+      webLogSeq++;
+      _pos = 0;
+    } else {
+      if (_pos < (int)sizeof(_line)-1) _line[_pos++] = (char)c;
+    }
+    return 1;
+  }
+  size_t write(const uint8_t *buf, size_t size) override {
+    for (size_t i = 0; i < size; i++) write(buf[i]);
+    return size;
+  }
+private:
+  char _line[256] = {};
+  int  _pos = 0;
+};
+DualPrint dualPrint; 
 void clearConfig() {
   prefs.begin("cfg", false);
   prefs.clear();
@@ -224,8 +296,9 @@ void clearConfig() {
   cfg.webAuth = false;
   strlcpy(cfg.webUser, "admin", sizeof(cfg.webUser));
   strlcpy(cfg.webPass, "admin", sizeof(cfg.webPass));
+  cfg.dosCompat = false;
   defaultMount = "";
-  Serial.println(F("[OK]  All NVS configuration cleared."));
+  dualPrint.println(F("[OK]  All NVS configuration cleared."));
 }
 
 // =============================================================================
@@ -247,16 +320,20 @@ uint16_t mscBlockSize    = 2048;
 
 // Block count shared with USBMSC.cpp patch (plain C++ — both TUs are C++)
 uint32_t cdromBlockCount = 0;  // data track sectors (READ CAPACITY, I/O)
+
+ // use this instead of Serial for log messages
+
 uint32_t discLeadOutLba  = 0;  // lead-out LBA for READ TOC (includes audio tracks)
+volatile bool unitAttentionPending = false;  // set on disc swap, cleared by TEST UNIT READY
 
 bool initSD() {
-  Serial.println(F("[SD]   Initializing SD_MMC (SDMMC hardware, 1-bit mode)"));
-  Serial.printf("[SD]   Pins: CLK=%d CMD=%d D0=%d D3(CS)=%d\n",
+  dualPrint.println(F("[SD]   Initializing SD_MMC (SDMMC hardware, 1-bit mode)"));
+  dualPrint.printf("[SD]   Pins: CLK=%d CMD=%d D0=%d D3(CS)=%d\n",
                 SD_SCK_PIN, SD_MOSI_PIN, SD_MISO_PIN, SD_CS_PIN);
 #ifdef CONFIG_FATFS_EXFAT_SUPPORT
-  Serial.println(F("[SD]   exFAT support: YES (compiled in)"));
+  dualPrint.println(F("[SD]   exFAT support: YES (compiled in)"));
 #else
-  Serial.println(F("[SD]   exFAT support: NO - recompile with CONFIG_FATFS_EXFAT_SUPPORT=y needed"));
+  dualPrint.println(F("[SD]   exFAT support: NO - recompile with CONFIG_FATFS_EXFAT_SUPPORT=y needed"));
 #endif
   SD_MMC.setPins(SD_SCK_PIN, SD_MOSI_PIN, SD_MISO_PIN);
   pinMode(SD_CS_PIN, INPUT_PULLUP);
@@ -266,14 +343,14 @@ bool initSD() {
     uint64_t mb = SD_MMC.cardSize() / (1024*1024);
     uint64_t freeMb = (SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024);
     uint64_t totalMb = SD_MMC.totalBytes() / (1024*1024);
-    Serial.printf("[SD]   OK  Type: %-10s  Size: %llu MB\n", tn, mb);
-    Serial.printf("[SD]   Used: %llu MB  Free: %llu MB  Total: %llu MB\n",
+    dualPrint.printf("[SD]   OK  Type: %-10s  Size: %llu MB\n", tn, mb);
+    dualPrint.printf("[SD]   Used: %llu MB  Free: %llu MB  Total: %llu MB\n",
                   totalMb - freeMb, freeMb, totalMb);
     return true;
   }
-  Serial.println(F("[ERR] SD_MMC.begin() failed!"));
-  Serial.println(F("[ERR] Check wiring: D5->GPIO12 D7->GPIO11 D6->GPIO13 D4->GPIO10"));
-  Serial.println(F("[ERR] VCC must be 3V3, not 5V! Card inserted?"));
+  dualPrint.println(F("[ERR] SD_MMC.begin() failed!"));
+  dualPrint.println(F("[ERR] Check wiring: D5->GPIO12 D7->GPIO11 D6->GPIO13 D4->GPIO10"));
+  dualPrint.println(F("[ERR] VCC must be 3V3, not 5V! Card inserted?"));
   return false;
 }
 
@@ -310,7 +387,7 @@ static void lbaToMsf(uint32_t lba, uint8_t &m, uint8_t &s, uint8_t &f) {
 
 String parseCue(const String &cuePath) {
   File cue = SD_MMC.open(cuePath.c_str(), FILE_READ);
-  if (!cue) { Serial.printf("[CUE] Cannot open: %s\n", cuePath.c_str()); return ""; }
+  if (!cue) { dualPrint.printf("[CUE] Cannot open: %s\n", cuePath.c_str()); return ""; }
 
   String dir = cuePath;
   int slash = dir.lastIndexOf('/');
@@ -361,13 +438,13 @@ String parseCue(const String &cuePath) {
       currentIsData   = (up.indexOf("MODE") >= 0);
       if (currentIsData && !foundData) {
         dataTrackBin = (dir == "/") ? "/" + currentFile : dir + "/" + currentFile;
-        if      (up.indexOf("MODE1/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2352 -> offset=16")); }
-        else if (up.indexOf("MODE2/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=24; binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2352 -> offset=24")); }
-        else if (up.indexOf("MODE2/2336") >= 0) { binRawSectorSize=2336; binHeaderOffset=8;  binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2336 -> offset=8")); }
-        else if (up.indexOf("MODE1/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2048 -> offset=0")); }
+        if      (up.indexOf("MODE1/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; dualPrint.println(F("[CUE] MODE1/2352 -> offset=16")); }
+        else if (up.indexOf("MODE2/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=24; binUserDataSize=2048; dualPrint.println(F("[CUE] MODE2/2352 -> offset=24")); }
+        else if (up.indexOf("MODE2/2336") >= 0) { binRawSectorSize=2336; binHeaderOffset=8;  binUserDataSize=2048; dualPrint.println(F("[CUE] MODE2/2336 -> offset=8")); }
+        else if (up.indexOf("MODE1/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; dualPrint.println(F("[CUE] MODE1/2048 -> offset=0")); }
         else { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; }
         foundData = true;
-        Serial.printf("[CUE] Data track %d: %s\n", currentTrackNum, dataTrackBin.c_str());
+        dualPrint.printf("[CUE] Data track %d: %s\n", currentTrackNum, dataTrackBin.c_str());
       }
     }
     else if (up.startsWith("INDEX 01") && currentTrackNum > 0 && rawCount < MAX_AUDIO_TRACKS + 1) {
@@ -426,7 +503,7 @@ String parseCue(const String &cuePath) {
         }
 
         // startLba will be updated to virtual disc LBA after all tracks parsed
-        Serial.printf("[CUE] Audio track %02d: file len %lu sectors  (%s)\n",
+        dualPrint.printf("[CUE] Audio track %02d: file len %lu sectors  (%s)\n",
                       at.number, at.lengthSectors, at.binFile.c_str());
       }
     } else {
@@ -445,7 +522,7 @@ String parseCue(const String &cuePath) {
           uint64_t sz = dtf.size(); dtf.close();
           dataTrackSectors = (uint32_t)(sz / 2352);
           dataTrackEndLba  = dataTrackLba + dataTrackSectors;
-          Serial.printf("[CUE] Data track sectors from file: %lu\n", dataTrackSectors);
+          dualPrint.printf("[CUE] Data track sectors from file: %lu\n", dataTrackSectors);
         }
       }
     }
@@ -474,22 +551,22 @@ String parseCue(const String &cuePath) {
     }
     // Lead-out LBA = virtualCursor (used by READ TOC 0xAA entry)
     discLeadOutLba = virtualCursor;
-    Serial.printf("[CUE] Virtual disc LBAs assigned, lead-out LBA=%lu\n", virtualCursor);
+    dualPrint.printf("[CUE] Virtual disc LBAs assigned, lead-out LBA=%lu\n", virtualCursor);
   }
 
   // Log final track table with correct virtual LBAs
   for (int i = 0; i < audioTrackCount; i++) {
-    Serial.printf("[CUE] Track %02d: LBA %6lu  len %5lu  (~%lus)\n",
+    dualPrint.printf("[CUE] Track %02d: LBA %6lu  len %5lu  (~%lus)\n",
                   audioTracks[i].number,
                   audioTracks[i].startLba,
                   audioTracks[i].lengthSectors,
                   audioTracks[i].lengthSectors / 75);
   }
   if (audioTrackCount > 0)
-    Serial.printf("[CUE] %d audio track(s) found  (layout: %s)\n",
+    dualPrint.printf("[CUE] %d audio track(s) found  (layout: %s)\n",
                   audioTrackCount, separateFiles ? "separate BIN files" : "single BIN");
 
-  if (!foundData) Serial.println(F("[CUE] No data track found!"));
+  if (!foundData) dualPrint.println(F("[CUE] No data track found!"));
   return dataTrackBin;
 }
 
@@ -497,26 +574,49 @@ String parseCue(const String &cuePath) {
 //  MOUNT / UMOUNT
 // =============================================================================
 bool doMount(const String &filename) {
-  if (!sdReady) { Serial.println(F("[ERR] SD not available.")); return false; }
+  if (!sdReady) { dualPrint.println(F("[ERR] SD not available.")); return false; }
+
+
 
   String fl = filename; fl.toLowerCase();
   String actualFile = filename;
 
   if (fl.endsWith(".cue")) {
-    Serial.printf("[CUE] Parsing: %s\n", filename.c_str());
+    dualPrint.printf("[CUE] Parsing: %s\n", filename.c_str());
     actualFile = parseCue(filename);
-    if (!actualFile.length()) { Serial.println(F("[ERR] CUE: no data track found.")); return false; }
+    if (!actualFile.length()) { dualPrint.println(F("[ERR] CUE: no data track found.")); return false; }
   }
 
+  bool hadDisc = isoOpen;  // remember if disc was already in drive
   closeIso();
   mscMediaPresent = false;
   delay(200);
 
+  // Reset disc state AFTER parseCue() so CUE geometry is preserved,
+  // but reset audio/LBA state that must be re-populated by parseCue
+  audioStop();
+  if (!fl.endsWith(".cue")) {
+    // For ISO/BIN: reset everything; for CUE parseCue() already set it
+    audioTrackCount   = 0;
+    dataTrackEndLba   = 0;
+    discLeadOutLba    = 0;
+    cdromBlockCount   = 0;
+    binRawSectorSize  = 2352;
+    binHeaderOffset   = 16;
+    binUserDataSize   = 2048;
+    for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
+      audioTracks[i].valid = false;
+      audioTracks[i].pregapSectors = 0;
+      audioTracks[i].startLba = 0;
+      audioTracks[i].lengthSectors = 0;
+    }
+  }
+
   isoFileHandle = SD_MMC.open(actualFile.c_str(), FILE_READ);
-  if (!isoFileHandle) { Serial.printf("[ERR] Cannot open: %s\n", actualFile.c_str()); return false; }
+  if (!isoFileHandle) { dualPrint.printf("[ERR] Cannot open: %s\n", actualFile.c_str()); return false; }
 
   uint64_t fileSize = isoFileHandle.size();
-  if (!fileSize) { isoFileHandle.close(); Serial.println(F("[ERR] File is empty.")); return false; }
+  if (!fileSize) { isoFileHandle.close(); dualPrint.println(F("[ERR] File is empty.")); return false; }
 
   // Set sector geometry (CUE already set binRawSectorSize/binHeaderOffset via parseCue)
   String orig = filename; orig.toLowerCase();
@@ -536,13 +636,35 @@ bool doMount(const String &filename) {
   // For non-CUE or single-BIN: lead-out = data track end
   // For CUE separate files: already set by parseCue() above
   if (discLeadOutLba == 0) discLeadOutLba = mountedBlocks;
-  mscMediaPresent = true;
-
-  msc.begin(mountedBlocks, 2048);
-  msc.mediaPresent(true);
-  tud_disconnect();
-  delay(500);
-  tud_connect();
+  // Signal new media to host
+  if (cfg.dosCompat) {
+    // DOS compat: msc.begin() is NEVER called after initUSBMSC
+    // because it triggers re-enumeration which DOS cannot recover from.
+    // mediaPresent(false→true) is sufficient for MSCDEX to re-read the disc.
+    if (hadDisc) {
+      // Disc swap: signal removal then insertion
+      mscMediaPresent = false;
+      msc.mediaPresent(false);
+      delay(1500);  // wait 3 MSCDEX poll cycles (~500ms each)
+    }
+    mscMediaPresent = true;
+    msc.mediaPresent(true);
+    msc_set_unit_attention();  // signal UNIT ATTENTION to host
+    dualPrint.printf("[USB]  DOS compat: media %s, UA signalled\n",
+                     hadDisc ? "swapped" : "inserted (first)");
+  } else {
+    // Normal (Windows/Linux): full USB re-enumeration with correct block count
+    mscMediaPresent = false;
+    msc.mediaPresent(false);
+    tud_disconnect();
+    delay(500);
+    msc.begin(mountedBlocks, 2048);
+    mscMediaPresent = true;
+    msc.mediaPresent(true);
+    tud_connect();
+    delay(200);
+    msc_set_unit_attention();  // signal UNIT ATTENTION to host
+  }
 
   // Benchmark: read first sector to estimate SD speed
   {
@@ -552,28 +674,35 @@ bool doMount(const String &filename) {
     isoFileHandle.read(buf, 2048);
     unsigned long dt = micros() - t0;
     float sdSpeedMBs = (dt > 0) ? (2048.0f / dt) : 0;
-    Serial.printf("[SD]   Read speed: %.2f MB/s  (USB max: ~1.0 MB/s)\n", sdSpeedMBs);
+    dualPrint.printf("[SD]   Read speed: %.2f MB/s  (USB max: ~1.0 MB/s)\n", sdSpeedMBs);
     isoFileHandle.seek(0);  // rewind after benchmark
   }
-  Serial.printf("[OK]  Mounted : %s\n", actualFile.c_str());
-  Serial.printf("      Image   : %s\n", filename.c_str());
-  Serial.printf("      Sectors : %lu x 2048 B  (raw: %u B/sector, header: +%u B)\n",
+  dualPrint.printf("[OK]  Mounted : %s\n", actualFile.c_str());
+  dualPrint.printf("      Image   : %s\n", filename.c_str());
+  dualPrint.printf("      Sectors : %lu x 2048 B  (raw: %u B/sector, header: +%u B)\n",
                 mountedBlocks, binRawSectorSize, binHeaderOffset);
-  Serial.printf("      Size    : %.1f MB\n", (float)fileSize / (1024.0f * 1024.0f));
+  dualPrint.printf("      Size    : %.1f MB\n", (float)fileSize / (1024.0f * 1024.0f));
   return true;
 }
 
 void doUmount() {
   audioStop();
   mscMediaPresent = false;
-  msc.mediaPresent(false);
   closeIso();
   mountedFile = ""; mountedBlocks = 0;
   mscBlockCount = 0; cdromBlockCount = 0; discLeadOutLba = 0;
+  unitAttentionPending = false;
   audioTrackCount = 0; dataTrackEndLba = 0;
-  msc.begin(1, 2048);
-  tud_disconnect(); delay(300); tud_connect();
-  Serial.println(F("[OK]  CD-ROM ejected."));
+  if (cfg.dosCompat) {
+    // DOS compat: drive stays connected — just eject the disc
+    msc.mediaPresent(false);   // signal: no media, drive stays enumerated
+    dualPrint.println(F("[USB]  DOS compat: disc ejected (drive stays connected)"));
+  } else {
+    msc.begin(1, 2048);
+    msc.mediaPresent(false);
+    tud_disconnect(); delay(800); tud_connect();
+  }
+  dualPrint.println(F("[OK]  CD-ROM ejected."));
 }
 
 // =============================================================================
@@ -661,10 +790,12 @@ void initUSBMSC() {
   msc.onRead(mscReadCb);
   msc.onWrite(mscWriteCb);
   msc.isWritable(false);
-  msc.begin(1, 2048);       // dummy - updated on mount
+  // In DOS compat mode msc.begin() is NEVER called again after this point
+  // Use 400000 blocks (~780MB) which covers any CD image
+  msc.begin(400000, 2048);
   msc.mediaPresent(false);
   USB.begin();
-  Serial.println(F("[OK]  USB MSC CD-ROM initialized (no disc)."));
+  dualPrint.println(F("[OK]  USB MSC CD-ROM initialized (no disc)."));
 }
 
 
@@ -676,13 +807,13 @@ void initUSBMSC() {
 // 44100 Hz, 16-bit signed, stereo, I2S Philips standard
 void initI2S() {
   if (!cfg.audioModule) {
-    Serial.println(F("[I2S]  Audio module disabled — I2S not initialized."));
+    dualPrint.println(F("[I2S]  Audio module disabled — I2S not initialized."));
     return;
   }
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.auto_clear = true;
   if (i2s_new_channel(&chan_cfg, &i2sTx, nullptr) != ESP_OK) {
-    Serial.println(F("[I2S]  Failed to create channel!")); return;
+    dualPrint.println(F("[I2S]  Failed to create channel!")); return;
   }
   i2s_std_config_t std_cfg = {
     .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
@@ -697,10 +828,10 @@ void initI2S() {
     }
   };
   if (i2s_channel_init_std_mode(i2sTx, &std_cfg) != ESP_OK) {
-    Serial.println(F("[I2S]  Failed to init STD mode!")); return;
+    dualPrint.println(F("[I2S]  Failed to init STD mode!")); return;
   }
   i2s_channel_enable(i2sTx);
-  Serial.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
+  dualPrint.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
 }
 
@@ -769,7 +900,7 @@ static void audioTask(void* arg) {
       audioFile  = SD_MMC.open(trk->binFile.c_str(), FILE_READ);
       openedFile = trk->binFile;
       if (!audioFile) {
-        Serial.printf("[AUDIO] Cannot open: %s\n", trk->binFile.c_str());
+        dualPrint.printf("[AUDIO] Cannot open: %s\n", trk->binFile.c_str());
         audioState = AUDIO_STOP;
         vTaskDelay(pdMS_TO_TICKS(100));
         continue;
@@ -852,7 +983,7 @@ static void audioTask(void* arg) {
 void startAudioTask() {
   if (audioTaskHandle) return;
   xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 5, &audioTaskHandle, 0);
-  Serial.println(F("[AUDIO] Task started on core 0."));
+  dualPrint.println(F("[AUDIO] Task started on core 0."));
 }
 
 // ── Playback control helpers ─────────────────────────────────────
@@ -870,7 +1001,7 @@ void audioPlay(uint32_t startLba, uint32_t endLba) {
   audioCurrentLba = startLba;
   audioEndLba     = endLba;
   audioState      = AUDIO_PLAY;
-  Serial.printf("[AUDIO] Play LBA %lu → %lu\n", startLba, endLba);
+  dualPrint.printf("[AUDIO] Play LBA %lu → %lu\n", startLba, endLba);
 }
 
 void audioStop() {
@@ -881,11 +1012,11 @@ void audioStop() {
     size_t w;
     for (int i = 0; i < 4; i++) i2s_channel_write(i2sTx, silence, sizeof(silence), &w, 10);
   }
-  Serial.println(F("[AUDIO] Stop."));
+  dualPrint.println(F("[AUDIO] Stop."));
 }
 
-void audioPause() { audioState = AUDIO_PAUSE; Serial.println(F("[AUDIO] Pause.")); }
-void audioResume(){ audioState = AUDIO_PLAY;  Serial.println(F("[AUDIO] Resume.")); }
+void audioPause() { audioState = AUDIO_PAUSE; dualPrint.println(F("[AUDIO] Pause.")); }
+void audioResume(){ audioState = AUDIO_PLAY;  dualPrint.println(F("[AUDIO] Resume.")); }
 
 // =============================================================================
 //  BRIDGE FUNCTIONS FOR USBMSC.cpp SCSI PATCH
@@ -977,34 +1108,34 @@ static bool extractCertCN(const char* pemBuf, char* out, size_t outLen) {
 // Caller must free() the returned pointer. Returns nullptr on failure.
 static char* loadPemFromSD(const char* path, const char* label = nullptr) {
   if (!sdReady || !path || !path[0]) {
-    if (label) Serial.printf("[EAP]  %s path not set\n", label);
+    if (label) dualPrint.printf("[EAP]  %s path not set\n", label);
     return nullptr;
   }
   File f = SD_MMC.open(path, "r");
-  if (!f) { Serial.printf("[EAP]  Cannot open: %s\n", path); return nullptr; }
+  if (!f) { dualPrint.printf("[EAP]  Cannot open: %s\n", path); return nullptr; }
   size_t sz = f.size();
-  if (sz == 0 || sz > 16000) { f.close(); Serial.printf("[EAP]  File too large or empty: %s (%u B)\n", path, sz); return nullptr; }
+  if (sz == 0 || sz > 16000) { f.close(); dualPrint.printf("[EAP]  File too large or empty: %s (%u B)\n", path, sz); return nullptr; }
   // +1 for null terminator required by esp_eap_client API
   // 4096-bit RSA key PEM ~3.2KB, cert ~2KB, CA ~2KB — 16KB limit covers all
   uint32_t freeHeap = ESP.getFreeHeap();
   if (freeHeap < sz * 3 + 8192) {
     f.close();
-    Serial.printf("[EAP]  Low heap (%lu B free) — cannot safely load %s\n", freeHeap, path);
+    dualPrint.printf("[EAP]  Low heap (%lu B free) — cannot safely load %s\n", freeHeap, path);
     return nullptr;
   }
   char* buf = (char*)malloc(sz + 1);
-  if (!buf) { f.close(); Serial.printf("[EAP]  malloc(%u) failed (heap: %lu B)\n", sz+1, freeHeap); return nullptr; }
+  if (!buf) { f.close(); dualPrint.printf("[EAP]  malloc(%u) failed (heap: %lu B)\n", sz+1, freeHeap); return nullptr; }
   f.readBytes(buf, sz);
   buf[sz] = 0;
   f.close();
-  Serial.printf("[EAP]  Loaded %s (%u bytes)\n", path, sz);
+  dualPrint.printf("[EAP]  Loaded %s (%u bytes)\n", path, sz);
   return buf;
 }
 
 void startWiFi() {
-  if (!strlen(cfg.ssid)) { Serial.println(F("[WARN] SSID not configured.")); return; }
+  if (!strlen(cfg.ssid)) { dualPrint.println(F("[WARN] SSID not configured.")); return; }
   freeEapBuffers();  // Free any previous EAP cert buffers
-  Serial.printf("[WiFi] Connecting to: %s\n", cfg.ssid);
+  dualPrint.printf("[WiFi] Connecting to: %s\n", cfg.ssid);
   WiFi.mode(WIFI_STA); WiFi.disconnect(false); delay(100);
   // Hostname must be set before WiFi.begin()
   WiFi.setHostname(cfg.hostname);
@@ -1019,7 +1150,7 @@ void startWiFi() {
   if (cfg.eapMode == EAP_PEAP || cfg.eapMode == EAP_TLS) {
     // ── WPA2-Enterprise (802.1x) ──────────────────────────────────────────
     const char* modeStr = (cfg.eapMode == EAP_PEAP) ? "PEAP" : "EAP-TLS";
-    Serial.printf("[EAP]  Mode: %s\n", modeStr);
+    dualPrint.printf("[EAP]  Mode: %s\n", modeStr);
     esp_eap_client_set_disable_time_check(true);
 
     // Clear previous EAP config
@@ -1038,23 +1169,23 @@ void startWiFi() {
         char cnBuf[64] = {};
         if (extractCertCN(tmpCert, cnBuf, sizeof(cnBuf))) {
           strlcpy(effectiveIdentity, cnBuf, sizeof(effectiveIdentity));
-          Serial.printf("[EAP]  Auto identity from cert CN: %s\n", effectiveIdentity);
+          dualPrint.printf("[EAP]  Auto identity from cert CN: %s\n", effectiveIdentity);
         }
         free(tmpCert);
       }
     }
     if (strlen(effectiveIdentity)) {
       esp_eap_client_set_identity((uint8_t*)effectiveIdentity, strlen(effectiveIdentity));
-      Serial.printf("[EAP]  Identity: %s\n", effectiveIdentity);
+      dualPrint.printf("[EAP]  Identity: %s\n", effectiveIdentity);
     }
 
     // CA cert (optional) — kept in global buffer for supplicant task lifetime
     s_eapCaBuf = loadPemFromSD(cfg.eapCaPath, nullptr);
     if (s_eapCaBuf) {
       esp_eap_client_set_ca_cert((uint8_t*)s_eapCaBuf, strlen(s_eapCaBuf) + 1);
-      Serial.println(F("[EAP]  CA cert loaded"));
+      dualPrint.println(F("[EAP]  CA cert loaded"));
     } else {
-      Serial.println(F("[EAP]  No CA cert — server cert not verified"));
+      dualPrint.println(F("[EAP]  No CA cert — server cert not verified"));
     }
 
     if (cfg.eapMode == EAP_PEAP) {
@@ -1063,7 +1194,7 @@ void startWiFi() {
         esp_eap_client_set_username((uint8_t*)cfg.eapUsername, strlen(cfg.eapUsername));
       if (strlen(cfg.eapPassword))
         esp_eap_client_set_password((uint8_t*)cfg.eapPassword, strlen(cfg.eapPassword));
-      Serial.printf("[EAP]  PEAP username: %s\n", cfg.eapUsername);
+      dualPrint.printf("[EAP]  PEAP username: %s\n", cfg.eapUsername);
       esp_wifi_sta_enterprise_enable();
       WiFi.begin(cfg.ssid, WPA2_AUTH_PEAP,
                  effectiveIdentity, cfg.eapUsername, cfg.eapPassword,
@@ -1075,41 +1206,41 @@ void startWiFi() {
       s_eapCertBuf = loadPemFromSD(cfg.eapCertPath, "Client cert");
       s_eapKeyBuf  = loadPemFromSD(cfg.eapKeyPath,  "Client key");
       if (!s_eapCertBuf || !s_eapKeyBuf) {
-        Serial.printf("[EAP]  ERROR: cert='%s' key='%s'\n",
+        dualPrint.printf("[EAP]  ERROR: cert='%s' key='%s'\n",
           strlen(cfg.eapCertPath) ? cfg.eapCertPath : "(not set)",
           strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
         freeEapBuffers();
-        Serial.println(F("[EAP]  Aborting."));
+        dualPrint.println(F("[EAP]  Aborting."));
         return;
       }
       // Key format info — PKCS#8 warning only, not blocked (may work on some builds)
-      Serial.println(F("[EAP]  ── Format Check ──"));
+      dualPrint.println(F("[EAP]  ── Format Check ──"));
       bool keyOk = true;
       if (strstr(s_eapKeyBuf, "BEGIN RSA PRIVATE KEY"))
-        Serial.println(F("[EAP]  Key : PKCS#1 RSA  ✓"));
+        dualPrint.println(F("[EAP]  Key : PKCS#1 RSA  ✓"));
       else if (strstr(s_eapKeyBuf, "BEGIN EC PRIVATE KEY"))
-        Serial.println(F("[EAP]  Key : EC  ✓"));
+        dualPrint.println(F("[EAP]  Key : EC  ✓"));
       else if (strstr(s_eapKeyBuf, "BEGIN PRIVATE KEY"))
-        Serial.println(F("[EAP]  Key : PKCS#8  ✓  (supported by ESP-IDF 5.x mbedTLS)"));
+        dualPrint.println(F("[EAP]  Key : PKCS#8  ✓  (supported by ESP-IDF 5.x mbedTLS)"));
       else if (strstr(s_eapKeyBuf, "BEGIN ENCRYPTED PRIVATE KEY")) {
         if (strlen(cfg.eapKeyPass)) {
-          Serial.println(F("[EAP]  Key : Encrypted  ✓  (passphrase provided)"));
+          dualPrint.println(F("[EAP]  Key : Encrypted  ✓  (passphrase provided)"));
         } else {
-          Serial.println(F("[EAP]  Key : Encrypted  ✗  Set passphrase: set eap-kpass <passphrase>"));
+          dualPrint.println(F("[EAP]  Key : Encrypted  ✗  Set passphrase: set eap-kpass <passphrase>"));
           keyOk = false;
         }
       } else {
-        Serial.println(F("[EAP]  Key : Unknown format — attempting anyway"));
+        dualPrint.println(F("[EAP]  Key : Unknown format — attempting anyway"));
       }
-      if (strstr(s_eapCertBuf, "BEGIN CERTIFICATE")) Serial.println(F("[EAP]  Cert: X.509 PEM  ✓"));
-      else { Serial.println(F("[EAP]  Cert: Unknown  ✗")); keyOk = false; }
-      if (!keyOk) { freeEapBuffers(); Serial.println(F("[EAP]  Aborting.")); return; }
+      if (strstr(s_eapCertBuf, "BEGIN CERTIFICATE")) dualPrint.println(F("[EAP]  Cert: X.509 PEM  ✓"));
+      else { dualPrint.println(F("[EAP]  Cert: Unknown  ✗")); keyOk = false; }
+      if (!keyOk) { freeEapBuffers(); dualPrint.println(F("[EAP]  Aborting.")); return; }
 
-      Serial.printf("[EAP]  Client cert + key OK  (heap: %lu B)\n", ESP.getFreeHeap());
+      dualPrint.printf("[EAP]  Client cert + key OK  (heap: %lu B)\n", ESP.getFreeHeap());
       // Key passphrase (for encrypted private keys)
       const uint8_t* keyPass   = strlen(cfg.eapKeyPass) ? (uint8_t*)cfg.eapKeyPass : nullptr;
       int            keyPassLen = strlen(cfg.eapKeyPass);
-      if (keyPass) Serial.println(F("[EAP]  Key passphrase: provided"));
+      if (keyPass) dualPrint.println(F("[EAP]  Key passphrase: provided"));
       esp_eap_client_set_certificate_and_key(
         (uint8_t*)s_eapCertBuf, strlen(s_eapCertBuf) + 1,
         (uint8_t*)s_eapKeyBuf,  strlen(s_eapKeyBuf)  + 1,
@@ -1126,16 +1257,16 @@ void startWiFi() {
     // ── WPA2-Personal (standard) ───────────────────────────────────────────
     WiFi.begin(cfg.ssid, cfg.password);
   }
-  Serial.print(F("[WiFi] "));
+  dualPrint.print(F("[WiFi] "));
   unsigned long t0 = millis();
   while (WiFi.status() != WL_CONNECTED) {
     if (millis()-t0 > 15000) break;
-    delay(500); Serial.print(".");
+    delay(500); dualPrint.print(".");
   }
-  Serial.println();
+  dualPrint.println();
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    Serial.printf("[WiFi] Connected!  IP: %s  RSSI: %d dBm  Ch: %d\n",
+    dualPrint.printf("[WiFi] Connected!  IP: %s  RSSI: %d dBm  Ch: %d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
     // Start mDNS so device is reachable as hostname.local
     // mDNS uses only the first label of an FQDN (before first dot)
@@ -1144,26 +1275,26 @@ void startWiFi() {
     if (char* dot = strchr(mdnsLabel, '.')) *dot = 0;  // truncate at first dot
     if (MDNS.begin(mdnsLabel)) {
       if (strchr(cfg.hostname, '.')) {
-        Serial.printf("[mDNS] Responder started: http://%s.local  (FQDN: %s)\n", mdnsLabel, cfg.hostname);
+        dualPrint.printf("[mDNS] Responder started: http://%s.local  (FQDN: %s)\n", mdnsLabel, cfg.hostname);
       } else {
-        Serial.printf("[mDNS] Responder started: http://%s.local\n", mdnsLabel);
+        dualPrint.printf("[mDNS] Responder started: http://%s.local\n", mdnsLabel);
       }
     } else {
-      Serial.println(F("[mDNS] Failed to start responder"));
+      dualPrint.println(F("[mDNS] Failed to start responder"));
     }
   } else {
     int st = WiFi.status();
-    Serial.printf("[WiFi] Failed (status=%d)\n", st);
+    dualPrint.printf("[WiFi] Failed (status=%d)\n", st);
     if (cfg.eapMode) {
-      Serial.println(F("[EAP]  Connection failed. Common causes:"));
-      Serial.println(F("[EAP]   1. User not in RADIUS DB — add via SQL or users file"));
-      Serial.printf("[EAP]      INSERT INTO radcheck (username,attribute,value,op)\n");
-      Serial.printf("[EAP]        VALUES ('%s','Auth-Type','EAP',':=');\n",
+      dualPrint.println(F("[EAP]  Connection failed. Common causes:"));
+      dualPrint.println(F("[EAP]   1. User not in RADIUS DB — add via SQL or users file"));
+      dualPrint.printf("[EAP]      INSERT INTO radcheck (username,attribute,value,op)\n");
+      dualPrint.printf("[EAP]        VALUES ('%s','Auth-Type','EAP',':=');\n",
                     strlen(cfg.eapIdentity) ? cfg.eapIdentity : "username");
-      Serial.println(F("[EAP]   2. RADIUS rejected cert — check raddb/certs CA chain"));
-      Serial.println(F("[EAP]   3. Identity mismatch — cert CN must match eap-id"));
-      Serial.println(F("[EAP]   4. Cipher suite unsupported by mbedTLS"));
-      Serial.println(F("[EAP]   5. Cert not PEM / key has passphrase (not supported)"));
+      dualPrint.println(F("[EAP]   2. RADIUS rejected cert — check raddb/certs CA chain"));
+      dualPrint.println(F("[EAP]   3. Identity mismatch — cert CN must match eap-id"));
+      dualPrint.println(F("[EAP]   4. Cipher suite unsupported by mbedTLS"));
+      dualPrint.println(F("[EAP]   5. Cert not PEM / key has passphrase (not supported)"));
     }
   }
 }
@@ -1188,18 +1319,18 @@ void handleFileUpload() {
   if (upload.status == UPLOAD_FILE_START) {
     String dir = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "/";
     uploadFilePath = (dir == "/" ? "" : dir) + "/" + String(upload.filename);
-    Serial.printf("[UPLOAD] Start: %s\n", uploadFilePath.c_str());
+    dualPrint.printf("[UPLOAD] Start: %s\n", uploadFilePath.c_str());
     uploadOk     = (bool)(uploadFile = SD_MMC.open(uploadFilePath.c_str(), FILE_WRITE));
     uploadActive = true;
-    if (!uploadOk) Serial.printf("[ERR] Cannot open for write: %s\n", uploadFilePath.c_str());
+    if (!uploadOk) dualPrint.printf("[ERR] Cannot open for write: %s\n", uploadFilePath.c_str());
   } else if (upload.status == UPLOAD_FILE_WRITE) {
     if (uploadOk && uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      Serial.println(F("[ERR] Write error!")); uploadOk = false;
+      dualPrint.println(F("[ERR] Write error!")); uploadOk = false;
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (uploadOk) {
       uploadFile.close();
-      Serial.printf("[UPLOAD] OK: %s  (%zu B)\n", uploadFilePath.c_str(), upload.totalSize);
+      dualPrint.printf("[UPLOAD] OK: %s  (%zu B)\n", uploadFilePath.c_str(), upload.totalSize);
     } else {
       if (uploadFile) uploadFile.close();
       SD_MMC.remove(uploadFilePath.c_str());
@@ -1239,6 +1370,34 @@ void handleApiStatus() {
   j += ",\"hdroffset\":" + String(binHeaderOffset);
   j += ",\"default\":\"" + jsonEsc(defaultMount.c_str()) + "\"}";
   httpServer.send(200, "application/json", j);
+}
+
+void handleApiLog() {
+  if (!checkAuth()) return;
+  // Optional: client sends ?seq=N to get only new lines since seq N
+  uint32_t clientSeq = 0;
+  if (httpServer.hasArg("seq")) clientSeq = (uint32_t)httpServer.arg("seq").toInt();
+  
+  // Build response: seq number + content since last request
+  String resp = "{";
+  resp += "\"seq\":" + String(webLogSeq) + ",";
+  // Extract readable portion of ring buffer
+  resp += "\"log\":";
+  // Determine how much of the buffer to return
+  uint32_t total = webLogHead;
+  uint32_t start = (total > WEB_LOG_SIZE) ? (total - WEB_LOG_SIZE) : 0;
+  resp += "\"";  // JSON string open
+  // Escape and output
+  for (uint32_t i = start; i < total; i++) {
+    char ch = webLogBuf[i % WEB_LOG_SIZE];
+    if      (ch == '"')  resp += "\\\""; 
+    else if (ch == '\\') resp += "\\\\";
+    else if (ch == '\n') resp += "\\n";
+    else if (ch == '\r') continue;
+    else                  resp += ch;
+  }
+  resp += "\"}";
+  httpServer.send(200, "application/json", resp);
 }
 
 void handleApiSysinfo() {
@@ -1330,6 +1489,7 @@ void handleApiSysinfo() {
   j += ",\"sys_cpu_mhz\":" + String(getCpuFrequencyMhz());
   j += ",\"sys_flash_mb\":" + String(ESP.getFlashChipSize() / (1024*1024));
   j += ",\"sys_sdk\":\""   + jsonEsc(ESP.getSdkVersion())           + "\"";
+  j += ",\"dos_compat\":" + String(cfg.dosCompat ? "true" : "false");
   j += ",\"audio_module\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"i2s_ready\":" + String(i2sTx ? "true" : "false");
   j += ",\"audio_state\":" + String((int)audioState);
@@ -1373,7 +1533,7 @@ void handleApiIsos() {
 void handleApiLs() {
   if (!checkAuth()) return;
   String path = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "/";
-  Serial.printf("[API]  GET /api/ls path=%s\n", path.c_str());
+  dualPrint.printf("[API]  GET /api/ls path=%s\n", path.c_str());
   if (!sdReady) { httpServer.send(200, "application/json", "[]"); return; }
   File dir = SD_MMC.open(path.c_str());
   if (!dir) { httpServer.send(404, "application/json", "[]"); return; }
@@ -1381,14 +1541,14 @@ void handleApiLs() {
   File f;
   while ((f = dir.openNextFile())) {
     String n = String(f.name()); bool isD = f.isDirectory();
-    Serial.printf("[LS]     '%s' dir=%d size=%lu\n", f.name(), (int)isD, (uint32_t)f.size());
+    dualPrint.printf("[LS]     '%s' dir=%d size=%lu\n", f.name(), (int)isD, (uint32_t)f.size());
     if (!first) json += ",";
     json += "{\"name\":\"" + jsonEsc(f.name()) + "\",\"dir\":" + (isD?"true":"false")
           + ",\"size\":" + String((uint32_t)f.size()) + "}";
     first = false; count++; f.close();
   }
   dir.close(); json += "]";
-  Serial.printf("[API]  ls: %d items\n", count);
+  dualPrint.printf("[API]  ls: %d items\n", count);
   httpServer.send(200, "application/json", json);
 }
 
@@ -1413,19 +1573,19 @@ void handleApiSdUnmount() {
   if (!checkAuth()) return;
   // Refuse if a file transfer is actively in progress
   if (uploadActive) {
-    Serial.println(F("[SD]   Unmount blocked: upload in progress."));
+    dualPrint.println(F("[SD]   Unmount blocked: upload in progress."));
     httpServer.send(409, "text/plain", "ERROR: Upload in progress - wait for it to finish first.");
     return;
   }
   if (downloadActive) {
-    Serial.println(F("[SD]   Unmount blocked: download in progress."));
+    dualPrint.println(F("[SD]   Unmount blocked: download in progress."));
     httpServer.send(409, "text/plain", "ERROR: Download in progress - wait for it to finish first.");
     return;
   }
 
   // Step 1: eject disc image from USB (tud_disconnect + reconnect without media)
   if (isoOpen || mscMediaPresent) {
-    Serial.println(F("[SD]   Ejecting disc image before SD unmount..."));
+    dualPrint.println(F("[SD]   Ejecting disc image before SD unmount..."));
     doUmount();
     delay(300);  // give USB host time to process eject
   }
@@ -1438,7 +1598,7 @@ void handleApiSdUnmount() {
   if (sdReady) {
     SD_MMC.end();
     sdReady = false;
-    Serial.println(F("[SD]   Safely unmounted. Card can be removed."));
+    dualPrint.println(F("[SD]   Safely unmounted. Card can be removed."));
     httpServer.send(200, "text/plain", "OK: SD card safely unmounted. You can now remove the card.");
   } else {
     httpServer.send(200, "text/plain", "OK: SD was already unmounted.");
@@ -1453,7 +1613,7 @@ void handleApiSdMount() {
   }
   sdReady = initSD();
   if (sdReady) {
-    Serial.println(F("[SD]   Remounted OK."));
+    dualPrint.println(F("[SD]   Remounted OK."));
     httpServer.send(200, "text/plain", "OK: SD card mounted.");
   } else {
     httpServer.send(500, "text/plain", "ERROR: SD card not found. Is the card inserted?");
@@ -1468,7 +1628,7 @@ void handleApiSetDefault() {
   prefs.begin("cfg", false);
   prefs.putString("defmount", defaultMount);
   prefs.end();
-  Serial.printf("[OK]  Default mount set: %s\n", defaultMount.c_str());
+  dualPrint.printf("[OK]  Default mount set: %s\n", defaultMount.c_str());
   httpServer.send(200, "text/plain", "OK: Default set: " + defaultMount);
 }
 
@@ -1478,7 +1638,7 @@ void handleApiClearDefault() {
   prefs.begin("cfg", false);
   prefs.putString("defmount", "");
   prefs.end();
-  Serial.println(F("[OK]  Default mount cleared."));
+  dualPrint.println(F("[OK]  Default mount cleared."));
   httpServer.send(200, "text/plain", "OK: Default cleared.");
 }
 
@@ -1523,6 +1683,7 @@ void handleApiGetConfig() {
   j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"webAuth\":" + String(cfg.webAuth ? "true" : "false");
   j += ",\"webUser\":\"" + jsonEsc(cfg.webUser) + "\"";
+    j += ",\"dosCompat\":" + String(cfg.dosCompat ? "true" : "false");
   // webPass intentionally omitted from GET response
   j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
@@ -1558,6 +1719,7 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
   if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("dosCompat"))  { String v=httpServer.arg("dosCompat");  cfg.dosCompat=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
   if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
@@ -1568,7 +1730,7 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
   if (changed) {
     saveConfig();
-    Serial.println(F("[OK]  Config saved via web."));
+    dualPrint.println(F("[OK]  Config saved via web."));
     httpServer.send(200, "text/plain", "OK: Configuration saved. Reboot to apply WiFi changes.");
   } else {
     httpServer.send(400, "text/plain", "No parameters provided.");
@@ -1605,7 +1767,7 @@ void handleApiDownload() {
   int sl = fname.lastIndexOf('/');
   if (sl >= 0) fname = fname.substring(sl + 1);
   size_t fileSize = f.size();
-  Serial.printf("[DOWNLOAD] Start: %s  (%zu B)\n", path.c_str(), fileSize);
+  dualPrint.printf("[DOWNLOAD] Start: %s  (%zu B)\n", path.c_str(), fileSize);
 
   // FIX: correct ASCII quotes in filename (curly quotes "" were wrong)
   httpServer.sendHeader("Content-Disposition", "attachment; filename=\"" + fname + "\"");
@@ -1626,7 +1788,7 @@ void handleApiDownload() {
 
   while (sent < fileSize) {
     if (!client.connected()) {
-      Serial.println("[DOWNLOAD] Client disconnected - aborting.");
+      dualPrint.println("[DOWNLOAD] Client disconnected - aborting.");
       break;
     }
     size_t toRead = min((size_t)sizeof(buf), fileSize - sent);
@@ -1635,7 +1797,7 @@ void handleApiDownload() {
     size_t wr = client.write(buf, (size_t)rd);
     if (wr > 0) { sent += wr; lastOk = millis(); }
     if (millis() - lastOk > 5000) {
-      Serial.println("[DOWNLOAD] Timeout - client stopped reading.");
+      dualPrint.println("[DOWNLOAD] Timeout - client stopped reading.");
       break;
     }
     yield();
@@ -1644,7 +1806,7 @@ void handleApiDownload() {
   downloadActive = false;
   f.close();
   client.stop();
-  Serial.printf("[DOWNLOAD] Done: %zu / %zu B sent.\n", sent, fileSize);
+  dualPrint.printf("[DOWNLOAD] Done: %zu / %zu B sent.\n", sent, fileSize);
 }
 
 void handleApiMkdir() {
@@ -1779,6 +1941,7 @@ void handleApiAudioSeek() {
 void setupWebServer() {
   httpServer.on("/",                 HTTP_GET,  handleRoot);
   httpServer.on("/api/status",       HTTP_GET,  handleApiStatus);
+  httpServer.on("/api/log",          HTTP_GET,  handleApiLog);
   httpServer.on("/api/sysinfo",      HTTP_GET,  handleApiSysinfo);
   httpServer.on("/api/isos",         HTTP_GET,  handleApiIsos);
   httpServer.on("/api/ls",           HTTP_GET,  handleApiLs);
@@ -1806,115 +1969,116 @@ void setupWebServer() {
   httpServer.on("/api/audio/mute",   HTTP_GET,  handleApiAudioMute);
   httpServer.on("/api/audio/seek",   HTTP_GET,  handleApiAudioSeek);
   httpServer.begin();
-  Serial.printf("[OK]  HTTP server started at http://%s\n", WiFi.localIP().toString().c_str());
+  dualPrint.printf("[OK]  HTTP server started at http://%s\n", WiFi.localIP().toString().c_str());
 }
 
 // =============================================================================
 //  UART CLI
 // =============================================================================
-void printSep() { Serial.println(F("================================================")); }
+void printSep() { dualPrint.println(F("================================================")); }
 
 void printConfig(bool showRuntime = true) {
   printSep();
-  Serial.println(F("  CONFIGURATION (NVS)"));
+  dualPrint.println(F("  CONFIGURATION (NVS)"));
   printSep();
-  Serial.printf("  WiFi SSID     : %s\n",  strlen(cfg.ssid)     ? cfg.ssid    : "(not set)");
-  Serial.printf("  WiFi Password : %s\n",  strlen(cfg.password) ? "********"  : "(not set)");
-  Serial.printf("  DHCP          : %s\n",  cfg.dhcp ? "enabled" : "disabled");
-  Serial.printf("  Static IP     : %s\n",  cfg.ip);
-  Serial.printf("  Subnet mask   : %s\n",  cfg.mask);
-  Serial.printf("  Gateway       : %s\n",  cfg.gw);
-  Serial.printf("  DNS           : %s\n",  cfg.dns);
-  Serial.printf("  Hostname/FQDN : %s\n",  cfg.hostname);
+  dualPrint.printf("  WiFi SSID     : %s\n",  strlen(cfg.ssid)     ? cfg.ssid    : "(not set)");
+  dualPrint.printf("  WiFi Password : %s\n",  strlen(cfg.password) ? "********"  : "(not set)");
+  dualPrint.printf("  DHCP          : %s\n",  cfg.dhcp ? "enabled" : "disabled");
+  dualPrint.printf("  Static IP     : %s\n",  cfg.ip);
+  dualPrint.printf("  Subnet mask   : %s\n",  cfg.mask);
+  dualPrint.printf("  Gateway       : %s\n",  cfg.gw);
+  dualPrint.printf("  DNS           : %s\n",  cfg.dns);
+  dualPrint.printf("  Hostname/FQDN : %s\n",  cfg.hostname);
   {
     char lbl[32]; strlcpy(lbl, cfg.hostname, sizeof(lbl));
     if (char* d = strchr(lbl, '.')) *d = 0;
-    Serial.printf("  mDNS address  : %s.local\n", lbl);
+    dualPrint.printf("  mDNS address  : %s.local\n", lbl);
   }
   // EAP / 802.1x
   const char* eapLabel = cfg.eapMode==1?"PEAP":cfg.eapMode==2?"EAP-TLS":"disabled";
-  Serial.printf("  802.1x EAP    : %s\n", eapLabel);
+  dualPrint.printf("  802.1x EAP    : %s\n", eapLabel);
   if (cfg.eapMode) {
-    Serial.printf("  EAP Identity  : %s\n", strlen(cfg.eapIdentity) ? cfg.eapIdentity : "(not set)");
+    dualPrint.printf("  EAP Identity  : %s\n", strlen(cfg.eapIdentity) ? cfg.eapIdentity : "(not set)");
     if (cfg.eapMode == 1) {
-      Serial.printf("  EAP Username  : %s\n", strlen(cfg.eapUsername) ? cfg.eapUsername : "(not set)");
-      Serial.printf("  EAP Password  : %s\n", strlen(cfg.eapPassword) ? "********" : "(not set)");
+      dualPrint.printf("  EAP Username  : %s\n", strlen(cfg.eapUsername) ? cfg.eapUsername : "(not set)");
+      dualPrint.printf("  EAP Password  : %s\n", strlen(cfg.eapPassword) ? "********" : "(not set)");
     }
-    Serial.printf("  CA cert path  : %s\n", strlen(cfg.eapCaPath)   ? cfg.eapCaPath   : "(none)");
+    dualPrint.printf("  CA cert path  : %s\n", strlen(cfg.eapCaPath)   ? cfg.eapCaPath   : "(none)");
     if (cfg.eapMode == 2) {
-      Serial.printf("  Client cert   : %s\n", strlen(cfg.eapCertPath) ? cfg.eapCertPath : "(not set)");
-      Serial.printf("  Client key    : %s\n", strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
-      Serial.printf("  Key passphrase: %s\n", strlen(cfg.eapKeyPass) ? "set (********)" : "(none)");
+      dualPrint.printf("  Client cert   : %s\n", strlen(cfg.eapCertPath) ? cfg.eapCertPath : "(not set)");
+      dualPrint.printf("  Client key    : %s\n", strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
+      dualPrint.printf("  Key passphrase: %s\n", strlen(cfg.eapKeyPass) ? "set (********)" : "(none)");
     }
   }
-  Serial.printf("  Default image : %s\n",  defaultMount.length() ? defaultMount.c_str() : "(none)");
-  Serial.printf("  Audio module  : %s\n",  cfg.audioModule ? "PCM5102 enabled" : "disabled");
-  Serial.printf("  Web auth      : %s\n",  cfg.webAuth ? "enabled" : "disabled (no login required)");
-  if (cfg.webAuth) Serial.printf("  Web user      : %s\n", cfg.webUser);
+  dualPrint.printf("  Default image : %s\n",  defaultMount.length() ? defaultMount.c_str() : "(none)");
+  dualPrint.printf("  Audio module  : %s\n",  cfg.audioModule ? "PCM5102 enabled" : "disabled");
+  dualPrint.printf("  Web auth      : %s\n",  cfg.webAuth ? "enabled" : "disabled (no login required)");
+  if (cfg.webAuth) dualPrint.printf("  Web user      : %s\n", cfg.webUser);
+  dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "enabled (no USB re-enum on mount)" : "disabled");
   printSep();
   if (!showRuntime) return;
-  Serial.println(F("  RUNTIME STATE"));
+  dualPrint.println(F("  RUNTIME STATE"));
   printSep();
-  Serial.printf("  SD card       : %s\n",  sdReady ? "OK" : "NOT FOUND");
+  dualPrint.printf("  SD card       : %s\n",  sdReady ? "OK" : "NOT FOUND");
   if (sdReady) {
     uint64_t totalMb = SD_MMC.totalBytes() / (1024*1024);
     uint64_t freeMb  = (SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024);
-    Serial.printf("  SD size       : %llu MB total, %llu MB free\n", totalMb, freeMb);
+    dualPrint.printf("  SD size       : %llu MB total, %llu MB free\n", totalMb, freeMb);
   }
-  Serial.printf("  WiFi          : %s\n",  wifiConnected ? "connected" : "not connected");
+  dualPrint.printf("  WiFi          : %s\n",  wifiConnected ? "connected" : "not connected");
   if (wifiConnected) {
-    Serial.printf("  IP address    : %s\n",  WiFi.localIP().toString().c_str());
-    Serial.printf("  WiFi RSSI     : %d dBm\n", WiFi.RSSI());
-    Serial.printf("  WiFi channel  : %d\n",  WiFi.channel());
-    Serial.printf("  BSSID         : %s\n",  WiFi.BSSIDstr().c_str());
-    Serial.printf("  Web interface : http://%s\n", WiFi.localIP().toString().c_str());
+    dualPrint.printf("  IP address    : %s\n",  WiFi.localIP().toString().c_str());
+    dualPrint.printf("  WiFi RSSI     : %d dBm\n", WiFi.RSSI());
+    dualPrint.printf("  WiFi channel  : %d\n",  WiFi.channel());
+    dualPrint.printf("  BSSID         : %s\n",  WiFi.BSSIDstr().c_str());
+    dualPrint.printf("  Web interface : http://%s\n", WiFi.localIP().toString().c_str());
     // Show hostname/FQDN and mDNS
     char lbl[32]; strlcpy(lbl, cfg.hostname, sizeof(lbl));
     if (char* d = strchr(lbl, '.')) *d = 0;
     if (strchr(cfg.hostname, '.')) {
-      Serial.printf("  FQDN (DHCP)   : %s\n", cfg.hostname);
-      Serial.printf("  mDNS address  : http://%s.local\n", lbl);
+      dualPrint.printf("  FQDN (DHCP)   : %s\n", cfg.hostname);
+      dualPrint.printf("  mDNS address  : http://%s.local\n", lbl);
     } else {
-      Serial.printf("  Hostname/mDNS : http://%s.local\n", lbl);
+      dualPrint.printf("  Hostname/mDNS : http://%s.local\n", lbl);
     }
   }
-  Serial.printf("  Mounted image : %s\n",  mountedFile.length() ? mountedFile.c_str() : "(none)");
+  dualPrint.printf("  Mounted image : %s\n",  mountedFile.length() ? mountedFile.c_str() : "(none)");
   if (isoOpen) {
-    Serial.printf("  Sectors       : %lu x 2048 B\n", mountedBlocks);
-    Serial.printf("  Raw sector    : %u B  header offset: +%u B\n", binRawSectorSize, binHeaderOffset);
-    Serial.printf("  Image size    : %.1f MB\n", (float)mountedBlocks * binRawSectorSize / (1024.0f*1024.0f));
+    dualPrint.printf("  Sectors       : %lu x 2048 B\n", mountedBlocks);
+    dualPrint.printf("  Raw sector    : %u B  header offset: +%u B\n", binRawSectorSize, binHeaderOffset);
+    dualPrint.printf("  Image size    : %.1f MB\n", (float)mountedBlocks * binRawSectorSize / (1024.0f*1024.0f));
   }
-  Serial.printf("  Media present : %s\n",  mscMediaPresent ? "yes" : "no");
+  dualPrint.printf("  Media present : %s\n",  mscMediaPresent ? "yes" : "no");
   printSep();
 }
 
 void printStatus() {
   printSep();
-  Serial.println(F("  STATUS"));
+  dualPrint.println(F("  STATUS"));
   printSep();
   // WiFi
   if (wifiConnected) {
     int rssi = WiFi.RSSI();
     const char* quality = rssi > -50 ? "Excellent" : rssi > -65 ? "Good" : rssi > -75 ? "Fair" : "Weak";
-    Serial.printf("  WiFi          : Connected  (%s, %d dBm)\n", quality, rssi);
-    Serial.printf("  IP            : %s\n", WiFi.localIP().toString().c_str());
-    Serial.printf("  Mask          : %s\n", WiFi.subnetMask().toString().c_str());
-    Serial.printf("  Gateway       : %s\n", WiFi.gatewayIP().toString().c_str());
-    Serial.printf("  DNS           : %s\n", WiFi.dnsIP().toString().c_str());
-    Serial.printf("  SSID          : %s\n", WiFi.SSID().c_str());
-    Serial.printf("  Band/Channel  : %s / Ch %d\n", WiFi.channel()<=13?"2.4 GHz":"5 GHz", WiFi.channel());
-    Serial.printf("  BSSID         : %s\n", WiFi.BSSIDstr().c_str());
+    dualPrint.printf("  WiFi          : Connected  (%s, %d dBm)\n", quality, rssi);
+    dualPrint.printf("  IP            : %s\n", WiFi.localIP().toString().c_str());
+    dualPrint.printf("  Mask          : %s\n", WiFi.subnetMask().toString().c_str());
+    dualPrint.printf("  Gateway       : %s\n", WiFi.gatewayIP().toString().c_str());
+    dualPrint.printf("  DNS           : %s\n", WiFi.dnsIP().toString().c_str());
+    dualPrint.printf("  SSID          : %s\n", WiFi.SSID().c_str());
+    dualPrint.printf("  Band/Channel  : %s / Ch %d\n", WiFi.channel()<=13?"2.4 GHz":"5 GHz", WiFi.channel());
+    dualPrint.printf("  BSSID         : %s\n", WiFi.BSSIDstr().c_str());
     // Security
-    Serial.println(F(""));
-  Serial.println(F("  ┌─ Security ─────────────────────────────────────┐"));
+    dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Security ─────────────────────────────────────┐"));
     const char* authStr = cfg.eapMode==1?"WPA2-Enterprise (PEAP)":cfg.eapMode==2?"WPA2-Enterprise (EAP-TLS)":"WPA2-Personal";
-    Serial.printf("  Auth method   : %s\n", authStr);
+    dualPrint.printf("  Auth method   : %s\n", authStr);
     if (cfg.eapMode) {
-      Serial.printf("  EAP Identity  : %s\n", strlen(cfg.eapIdentity) ? cfg.eapIdentity : "(auto from cert CN)");
+      dualPrint.printf("  EAP Identity  : %s\n", strlen(cfg.eapIdentity) ? cfg.eapIdentity : "(auto from cert CN)");
       if (cfg.eapMode == 2) {
-        Serial.printf("  Client cert   : %s\n", strlen(cfg.eapCertPath) ? cfg.eapCertPath : "(not set)");
-        Serial.printf("  Client key    : %s\n", strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
-        Serial.printf("  Key passphrase: %s\n", strlen(cfg.eapKeyPass)  ? "set" : "(none)");
+        dualPrint.printf("  Client cert   : %s\n", strlen(cfg.eapCertPath) ? cfg.eapCertPath : "(not set)");
+        dualPrint.printf("  Client key    : %s\n", strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
+        dualPrint.printf("  Key passphrase: %s\n", strlen(cfg.eapKeyPass)  ? "set" : "(none)");
         if (s_eapCertBuf) {
           // Show cert details using mbedTLS
           mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
@@ -1922,134 +2086,136 @@ void printStatus() {
             char cnBuf[64]={};
             mbedtls_x509_name* nm=&crt.subject;
             while(nm){if(nm->oid.len==3&&memcmp(nm->oid.p,"\x55\x04\x03",3)==0){memcpy(cnBuf,nm->val.p,min((int)nm->val.len,63));break;}nm=nm->next;}
-            Serial.printf("  Cert CN       : %s\n", strlen(cnBuf)?cnBuf:"(unknown)");
+            dualPrint.printf("  Cert CN       : %s\n", strlen(cnBuf)?cnBuf:"(unknown)");
             char notBefore[20]={},notAfter[20]={};
             snprintf(notBefore,sizeof(notBefore),"%04d-%02d-%02d",
               crt.valid_from.year,crt.valid_from.mon,crt.valid_from.day);
             snprintf(notAfter,sizeof(notAfter),"%04d-%02d-%02d",
               crt.valid_to.year,crt.valid_to.mon,crt.valid_to.day);
-            Serial.printf("  Cert validity : %s → %s\n", notBefore, notAfter);
-            Serial.printf("  Cert bits     : %u bit\n", (unsigned)mbedtls_pk_get_bitlen(&crt.pk));
+            dualPrint.printf("  Cert validity : %s → %s\n", notBefore, notAfter);
+            dualPrint.printf("  Cert bits     : %u bit\n", (unsigned)mbedtls_pk_get_bitlen(&crt.pk));
           }
           mbedtls_x509_crt_free(&crt);
         }
-        Serial.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none — server not verified)");
+        dualPrint.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none — server not verified)");
         if (s_eapKeyBuf) {
           const char* kfmt = strstr(s_eapKeyBuf,"BEGIN RSA PRIVATE KEY")?"PKCS#1 RSA":
                              strstr(s_eapKeyBuf,"BEGIN EC PRIVATE KEY") ?"EC":
                              strstr(s_eapKeyBuf,"BEGIN PRIVATE KEY")    ?"PKCS#8":
                              strstr(s_eapKeyBuf,"BEGIN ENCRYPTED PRIVATE KEY")?"Encrypted":"Unknown";
-          Serial.printf("  Key format    : %s\n", kfmt);
+          dualPrint.printf("  Key format    : %s\n", kfmt);
         }
       } else {
-        Serial.printf("  PEAP username : %s\n", strlen(cfg.eapUsername) ? cfg.eapUsername : "(not set)");
-        Serial.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none)");
+        dualPrint.printf("  PEAP username : %s\n", strlen(cfg.eapUsername) ? cfg.eapUsername : "(not set)");
+        dualPrint.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none)");
       }
     }
-    Serial.println(F("  └────────────────────────────────────────────────┘"));
-  Serial.println(F(""));
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
   } else {
-    Serial.println(F("  WiFi          : Not connected"));
+    dualPrint.println(F("  WiFi          : Not connected"));
   }
   // SD
-  Serial.printf("  SD card       : %s\n", sdReady ? "OK" : "NOT FOUND");
+  dualPrint.printf("  SD card       : %s\n", sdReady ? "OK" : "NOT FOUND");
   if (sdReady) {
     uint64_t totalMb = SD_MMC.totalBytes() / (1024*1024);
     uint64_t usedMb  = SD_MMC.usedBytes()  / (1024*1024);
     uint64_t freeMb  = totalMb - usedMb;
-    Serial.printf("  SD storage    : %llu MB used / %llu MB total (%llu MB free)\n",
+    dualPrint.printf("  SD storage    : %llu MB used / %llu MB total (%llu MB free)\n",
                   usedMb, totalMb, freeMb);
   }
   // Image
   if (isoOpen) {
-    Serial.printf("  Mounted image : %s\n", mountedFile.c_str());
-    Serial.printf("  Sectors       : %lu x 2048 B  (%.1f MB)\n",
+    dualPrint.printf("  Mounted image : %s\n", mountedFile.c_str());
+    dualPrint.printf("  Sectors       : %lu x 2048 B  (%.1f MB)\n",
                   mountedBlocks, (float)mountedBlocks * 2048.0f / (1024.0f*1024.0f));
-    Serial.printf("  Raw sector    : %u B  header: +%u B\n", binRawSectorSize, binHeaderOffset);
-    Serial.printf("  USB media     : %s\n", mscMediaPresent ? "present" : "not present");
+    dualPrint.printf("  Raw sector    : %u B  header: +%u B\n", binRawSectorSize, binHeaderOffset);
+    dualPrint.printf("  USB media     : %s\n", mscMediaPresent ? "present" : "not present");
   } else {
-    Serial.println(F("  Mounted image : (none)"));
+    dualPrint.println(F("  Mounted image : (none)"));
   }
   // Default
-  Serial.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
+  dualPrint.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
   // System
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ Transfer Speed Note ──────────────────────────┐"));
-  Serial.println(F("  │ USB Full Speed = 12 Mbit/s max                 │"));
-  Serial.println(F("  │ Real copy: ~600-900 KB/s (hardware limit)      │"));
-  Serial.println(F("  │ SD card speed is NOT the bottleneck.           │"));
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ Audio ────────────────────────────────────────┐"));
-  Serial.printf("  Audio module  : %s\n", cfg.audioModule ? "PCM5102 I2S — enabled" : "disabled (no hardware)");
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Transfer Speed Note ──────────────────────────┐"));
+  dualPrint.println(F("  │ USB Full Speed = 12 Mbit/s max                 │"));
+  dualPrint.println(F("  │ Real copy: ~600-900 KB/s (hardware limit)      │"));
+  dualPrint.println(F("  │ SD card speed is NOT the bottleneck.           │"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Audio ────────────────────────────────────────┐"));
+  dualPrint.printf("  Audio module  : %s\n", cfg.audioModule ? "PCM5102 I2S — enabled" : "disabled (no hardware)");
   if (cfg.audioModule) {
-    Serial.printf("  I2S pins      : BCK=%d  WS=%d  DATA=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
-    Serial.printf("  I2S state     : %s\n", i2sTx ? "initialized" : "init failed");
+    dualPrint.printf("  I2S pins      : BCK=%d  WS=%d  DATA=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
+    dualPrint.printf("  I2S state     : %s\n", i2sTx ? "initialized" : "init failed");
     const char* astStr = audioState==1?"PLAYING":audioState==2?"PAUSED":"STOPPED";
-    Serial.printf("  Playback      : %s\n", astStr);
+    dualPrint.printf("  Playback      : %s\n", astStr);
     if (audioState > 0) {
       uint8_t am,as_,af; lbaToMsf(audioCurrentLba,am,as_,af);
-      Serial.printf("  Position      : %02d:%02d:%02d  (LBA %lu)\n",am,as_,af,audioCurrentLba);
-      Serial.printf("  Track         : %d\n", subChannel.trackNum);
+      dualPrint.printf("  Position      : %02d:%02d:%02d  (LBA %lu)\n",am,as_,af,audioCurrentLba);
+      dualPrint.printf("  Track         : %d\n", subChannel.trackNum);
     }
-    Serial.printf("  Volume        : %d%%%s\n", audioVolume, audioMuted?" (MUTED)":"");
-    Serial.printf("  Audio tracks  : %d\n", audioTrackCount);
+    dualPrint.printf("  Volume        : %d%%%s\n", audioVolume, audioMuted?" (MUTED)":"");
+    dualPrint.printf("  Audio tracks  : %d\n", audioTrackCount);
   }
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ System ───────────────────────────────────────┐"));
-  Serial.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
-  Serial.printf("  Uptime        : %lu s\n", millis()/1000);
-  Serial.printf("  CPU freq      : %u MHz\n", getCpuFrequencyMhz());
-  Serial.printf("  Flash size    : %u MB\n", ESP.getFlashChipSize()/(1024*1024));
-  Serial.printf("  SDK version   : %s\n", ESP.getSdkVersion());
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ System ───────────────────────────────────────┐"));
+  dualPrint.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
+  dualPrint.printf("  Uptime        : %lu s\n", millis()/1000);
+  dualPrint.printf("  CPU freq      : %u MHz\n", getCpuFrequencyMhz());
+  dualPrint.printf("  Flash size    : %u MB\n", ESP.getFlashChipSize()/(1024*1024));
+  dualPrint.printf("  SDK version   : %s\n", ESP.getSdkVersion());
+  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
 }
 
 void printHelp() {
   printSep();
-  Serial.println(F("  COMMANDS"));
+  dualPrint.println(F("  COMMANDS"));
   printSep();
-  Serial.println(F("  set ssid <value>      Set WiFi SSID"));
-  Serial.println(F("  set pass <value>      Set WiFi password"));
-  Serial.println(F("  set dhcp on|off       Enable/disable DHCP"));
-  Serial.println(F("  set ip <addr>         Set static IP address"));
-  Serial.println(F("  set mask <mask>       Set subnet mask"));
-  Serial.println(F("  set gw <addr>         Set default gateway"));
-  Serial.println(F("  set dns <addr>        Set DNS server"));
-  Serial.println(F("  set hostname <n>      Set hostname or FQDN (e.g. espcd or espcd.falco81.net)"));
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ 802.1x Enterprise WiFi ───────────────────────┐"));
-  Serial.println(F("  set eap-mode <0|1|2>  0=off 1=PEAP 2=EAP-TLS"));
-  Serial.println(F("  set eap-id <val>      EAP outer identity"));
-  Serial.println(F("  set eap-user <val>    EAP inner username (PEAP)"));
-  Serial.println(F("  set eap-pass <val>    EAP inner password (PEAP)"));
-  Serial.println(F("  set eap-ca <path>     SD path to CA cert e.g. /wifi/ca.pem"));
-  Serial.println(F("  set eap-cert <path>   SD path to client cert (EAP-TLS)"));
-  Serial.println(F("  set eap-key <path>    SD path to client key (EAP-TLS)"));
-  Serial.println(F("  set eap-kpass <val>   Passphrase for encrypted private key"));
-  Serial.println(F("  set audio-module on|off  Enable/disable PCM5102 I2S audio module"));
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ Web UI Authentication ────────────────────────┐"));
-  Serial.println(F("  set web-auth on|off       Enable/disable HTTP Basic Auth (default: off)"));
-  Serial.println(F("  set web-user <name>       Web UI username (default: admin)"));
-  Serial.println(F("  set web-pass <password>   Web UI password (default: admin)"));
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
-  Serial.println(F(""));
-  Serial.println(F("  ┌─ Commands ─────────────────────────────────────┐"));
-  Serial.println(F("  show config           Show full configuration + runtime state"));
-  Serial.println(F("  show files [path]     List SD files recursively (default: /)"));
-  Serial.println(F("  status                Show current status (WiFi, SD, image)"));
-  Serial.println(F("  mount <file>          Mount ISO/BIN/CUE as CD-ROM"));
-  Serial.println(F("  umount                Eject current CD-ROM"));
-  Serial.println(F("  sd reinit             Reinitialize SD card"));
-  Serial.println(F("  wifi reconnect        Disconnect and reconnect WiFi"));
-  Serial.println(F("  clear config          Erase ALL NVS settings (factory reset)"));
-  Serial.println(F("  reboot                Restart ESP32"));
-  Serial.println(F("  help                  Show this help"));
-  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F("  set ssid <value>      Set WiFi SSID"));
+  dualPrint.println(F("  set pass <value>      Set WiFi password"));
+  dualPrint.println(F("  set dhcp on|off       Enable/disable DHCP"));
+  dualPrint.println(F("  set ip <addr>         Set static IP address"));
+  dualPrint.println(F("  set mask <mask>       Set subnet mask"));
+  dualPrint.println(F("  set gw <addr>         Set default gateway"));
+  dualPrint.println(F("  set dns <addr>        Set DNS server"));
+  dualPrint.println(F("  set hostname <n>      Set hostname or FQDN (e.g. espcd or espcd.falco81.net)"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ 802.1x Enterprise WiFi ───────────────────────┐"));
+  dualPrint.println(F("  set eap-mode <0|1|2>  0=off 1=PEAP 2=EAP-TLS"));
+  dualPrint.println(F("  set eap-id <val>      EAP outer identity"));
+  dualPrint.println(F("  set eap-user <val>    EAP inner username (PEAP)"));
+  dualPrint.println(F("  set eap-pass <val>    EAP inner password (PEAP)"));
+  dualPrint.println(F("  set eap-ca <path>     SD path to CA cert e.g. /wifi/ca.pem"));
+  dualPrint.println(F("  set eap-cert <path>   SD path to client cert (EAP-TLS)"));
+  dualPrint.println(F("  set eap-key <path>    SD path to client key (EAP-TLS)"));
+  dualPrint.println(F("  set eap-kpass <val>   Passphrase for encrypted private key"));
+  dualPrint.println(F("  set audio-module on|off  Enable/disable PCM5102 I2S audio module"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Web UI Authentication ────────────────────────┐"));
+  dualPrint.println(F("  set web-auth on|off       Enable/disable HTTP Basic Auth (default: off)"));
+  dualPrint.println(F("  set web-user <name>       Web UI username (default: admin)"));
+  dualPrint.println(F("  set web-pass <password>   Web UI password (default: admin)"));
+  dualPrint.println(F("  set dos-compat on|off     DOS compatibility mode (no USB re-enum on mount)"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Commands ─────────────────────────────────────┐"));
+  dualPrint.println(F("  show config           Show full configuration + runtime state"));
+  dualPrint.println(F("  show files [path]     List SD files recursively (default: /)"));
+  dualPrint.println(F("  status                Show current status (WiFi, SD, image)"));
+  dualPrint.println(F("  mount <file>          Mount ISO/BIN/CUE as CD-ROM"));
+  dualPrint.println(F("  umount                Eject current CD-ROM"));
+  dualPrint.println(F("  sd reinit             Reinitialize SD card"));
+  dualPrint.println(F("  wifi reconnect        Disconnect and reconnect WiFi"));
+  dualPrint.println(F("  clear config          Erase ALL NVS settings (factory reset)"));
+  dualPrint.println(F("  reboot                Restart ESP32"));
+  dualPrint.println(F("  help                  Show this help"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
 }
 
@@ -2059,9 +2225,9 @@ static uint32_t listDirRecursive(File dir, int depth, uint32_t &totalFiles, uint
   File f;
   while ((f = dir.openNextFile())) {
     // indent by depth
-    for (int i = 0; i < depth; i++) Serial.print("  ");
+    for (int i = 0; i < depth; i++) dualPrint.print("  ");
     if (f.isDirectory()) {
-      Serial.printf("[DIR]  %s/\n", f.name());
+      dualPrint.printf("[DIR]  %s/\n", f.name());
       listDirRecursive(f, depth + 1, totalFiles, totalBytes);
     } else {
       uint32_t sz = f.size();
@@ -2069,11 +2235,11 @@ static uint32_t listDirRecursive(File dir, int depth, uint32_t &totalFiles, uint
       totalFiles++;
       // Format size human-readable
       if (sz >= 1024*1024) {
-        Serial.printf("%-38s %8.1f MB\n", f.name(), sz / (1024.0f*1024.0f));
+        dualPrint.printf("%-38s %8.1f MB\n", f.name(), sz / (1024.0f*1024.0f));
       } else if (sz >= 1024) {
-        Serial.printf("%-38s %8.1f KB\n", f.name(), sz / 1024.0f);
+        dualPrint.printf("%-38s %8.1f KB\n", f.name(), sz / 1024.0f);
       } else {
-        Serial.printf("%-38s %8lu B\n",  f.name(), sz);
+        dualPrint.printf("%-38s %8lu B\n",  f.name(), sz);
       }
     }
     count++;
@@ -2083,34 +2249,34 @@ static uint32_t listDirRecursive(File dir, int depth, uint32_t &totalFiles, uint
 }
 
 void listSDFiles(const char* path = "/") {
-  if (!sdReady) { Serial.println(F("[ERR] SD not available.")); return; }
+  if (!sdReady) { dualPrint.println(F("[ERR] SD not available.")); return; }
   File dir = SD_MMC.open(path);
   if (!dir || !dir.isDirectory()) {
-    Serial.printf("[ERR] Cannot open directory: %s\n", path);
+    dualPrint.printf("[ERR] Cannot open directory: %s\n", path);
     if (dir) dir.close();
     return;
   }
   printSep();
-  Serial.printf("  SD CARD - %s\n", path);
+  dualPrint.printf("  SD CARD - %s\n", path);
   printSep();
   uint32_t files = 0; uint64_t bytes = 0;
   uint32_t entries = listDirRecursive(dir, 0, files, bytes);
   dir.close();
-  if (entries == 0) Serial.println(F("  (empty)"));
+  if (entries == 0) dualPrint.println(F("  (empty)"));
   printSep();
   if (files > 0) {
     if (bytes >= 1024ULL*1024*1024)
-      Serial.printf("  %lu files  /  %.2f GB total\n", files, bytes/(1024.0*1024.0*1024.0));
+      dualPrint.printf("  %lu files  /  %.2f GB total\n", files, bytes/(1024.0*1024.0*1024.0));
     else if (bytes >= 1024*1024)
-      Serial.printf("  %lu files  /  %.1f MB total\n", files, bytes/(1024.0*1024.0));
+      dualPrint.printf("  %lu files  /  %.1f MB total\n", files, bytes/(1024.0*1024.0));
     else
-      Serial.printf("  %lu files  /  %llu B total\n",  files, bytes);
+      dualPrint.printf("  %lu files  /  %llu B total\n",  files, bytes);
     printSep();
   }
 }
 
 void reinitSD() {
-  Serial.println(F("[SD]   Reinitializing..."));
+  dualPrint.println(F("[SD]   Reinitializing..."));
   closeIso(); SD_MMC.end(); delay(100);
   sdReady = initSD();
 }
@@ -2132,7 +2298,7 @@ void processCommand(String &line) {
   else if (line.equalsIgnoreCase("reboot"))         { delay(300); ESP.restart(); }
   else if (line.equalsIgnoreCase("clear config")) {
     clearConfig();
-    Serial.println(F("[INFO] Reboot to apply factory defaults."));
+    dualPrint.println(F("[INFO] Reboot to apply factory defaults."));
   }
   else if (line.equalsIgnoreCase("wifi reconnect")) {
     WiFi.disconnect(true); delay(400); startWiFi();
@@ -2173,12 +2339,13 @@ void processCommand(String &line) {
     else if (key=="eap-kpass") strlcpy(cfg.eapKeyPass,  val.c_str(), sizeof(cfg.eapKeyPass));
     else if (key=="audio-module") { String v=val; v.toLowerCase(); cfg.audioModule=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="web-auth")  { String v=val; v.toLowerCase(); cfg.webAuth=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="dos-compat") { String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="web-user")  { strlcpy(cfg.webUser, val.c_str(), sizeof(cfg.webUser)); }
     else if (key=="web-pass")  { strlcpy(cfg.webPass, val.c_str(), sizeof(cfg.webPass)); }
-    else { Serial.printf("[ERR] Unknown key: '%s'\n", key.c_str()); ok=false; }
+    else { dualPrint.printf("[ERR] Unknown key: '%s'\n", key.c_str()); ok=false; }
     if (ok) {
       saveConfig();
-      Serial.printf("[OK]  %s = %s\n", key.c_str(), val.c_str());
+      dualPrint.printf("[OK]  %s = %s\n", key.c_str(), val.c_str());
       // Verify EAP fields are readable back from NVS
       if (key.startsWith("eap")) {
         Preferences vfy; vfy.begin("cfg", true);
@@ -2193,18 +2360,18 @@ void processCommand(String &line) {
           String stored = vfy.getString(nvsk.c_str(), "");
           if (val.length() == 0) {
             // Empty value = field cleared (key removed from NVS) — OK
-            Serial.printf("[NVS]  Verified: %s cleared\n", nvsk.c_str());
+            dualPrint.printf("[NVS]  Verified: %s cleared\n", nvsk.c_str());
           } else if (stored.length() || key=="eap-mode") {
-            Serial.printf("[NVS]  Verified: %s = '%s'\n", nvsk.c_str(), stored.c_str());
+            dualPrint.printf("[NVS]  Verified: %s = '%s'\n", nvsk.c_str(), stored.c_str());
           } else {
-            Serial.printf("[NVS]  WARNING: %s not saved correctly!\n", nvsk.c_str());
+            dualPrint.printf("[NVS]  WARNING: %s not saved correctly!\n", nvsk.c_str());
           }
         }
         vfy.end();
       }
     }
   }
-  else Serial.printf("[ERR] Unknown command: '%s'  (type help)\n", line.c_str());
+  else dualPrint.printf("[ERR] Unknown command: '%s'  (type help)\n", line.c_str());
 }
 
 // =============================================================================
@@ -2219,9 +2386,9 @@ void setup() {
   rgbLed.setPixelColor(0, 0, 0, 0);
   rgbLed.show();
 
-  Serial.println();
+  dualPrint.println();
   printSep();
-  Serial.println(F("  ESP32-S3 Virtual CD-ROM + File Manager  v3.1"));
+  dualPrint.println(F("  ESP32-S3 Virtual CD-ROM + File Manager  v3.1"));
   printSep();
 
   // Load config and print everything stored in NVS
@@ -2236,14 +2403,14 @@ void setup() {
   startWiFi();
   if (wifiConnected) setupWebServer();
 
-  Serial.println(F("\n[READY] Type 'help' for available commands\n"));
+  dualPrint.println(F("\n[READY] Type 'help' for available commands\n"));
 
   // Auto-mount default image
   if (sdReady && defaultMount.length()) {
-    Serial.printf("[AUTO] Default image: %s\n", defaultMount.c_str());
+    dualPrint.printf("[AUTO] Default image: %s\n", defaultMount.c_str());
     File _f = SD_MMC.open(defaultMount.c_str());
     if (_f) { _f.close(); doMount(defaultMount); }
-    else Serial.println(F("[AUTO] File not found on SD card."));
+    else dualPrint.println(F("[AUTO] File not found on SD card."));
   }
 }
 
