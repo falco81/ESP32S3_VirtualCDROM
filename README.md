@@ -25,9 +25,12 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [Wi-Fi Configuration](#wi-fi-configuration)
 - [802.1x Enterprise Wi-Fi (EAP)](#8021x-enterprise-wi-fi-eap)
 - [DOS Compatibility Mode](#dos-compatibility-mode)
+- [DOS / Retro PC Compatibility](#dos--retro-pc-compatibility)
+  - [DOS Audio CD Player Compatibility](#dos-audio-cd-player-compatibility)
 - [Web UI Authentication](#web-ui-authentication)
 - [HTTPS / TLS](#https--tls)
 - [Audio CD Playback](#audio-cd-playback)
+- [SCSI Command Reference](#scsi-command-reference)
 - [Supported Disc Image Formats](#supported-disc-image-formats)
 - [Python Scripts](#python-scripts)
 - [API Reference](#api-reference)
@@ -42,7 +45,7 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 
 - **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; the PC sees an optical drive without any drivers
 - **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with multi-track support
-- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; SCSI PLAY AUDIO, READ SUB-CHANNEL, TOC for transparent emulation to games and players
+- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; full SCSI-2 audio command set per Pioneer OB-U0077C spec (PLAY AUDIO, READ TOC, READ SUB-CHANNEL, PAUSE/RESUME, STOP, TRACK RELATIVE)
 - **Web file manager** — upload, download, delete, create folders, drag-and-drop
 - **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with full certificate management
 - **mDNS** — device reachable at `hostname.local`; FQDN support
@@ -566,42 +569,98 @@ VALUES ('identity', 'Auth-Type', 'EAP', ':=');
 
 ## DOS Compatibility Mode
 
-When used with DOS (MSCDEX + USBASPI/USBCD1 drivers), swapping disc images normally causes the device to disappear. The standard mount procedure does a full USB re-enumeration (`tud_disconnect` / `tud_connect`) which DOS drivers loaded at boot cannot recover from — they see it as a cable disconnect.
+When **DOS Compatibility Mode** is enabled, the drive never disconnects from USB when you switch disc images. Instead:
 
-**DOS Compatibility Mode** keeps the USB drive connected at all times, exactly like a real CD-ROM drive. Only the media changes. Disc swaps are handled by:
+1. Host sends READ(10) — drive is present, media reported absent (`mediaPresent = false`)
+2. Firmware swaps the image file
+3. SCSI UNIT ATTENTION (`06h / 28h`) is signalled via the patched `tud_msc_test_unit_ready_cb`
+4. MSCDEX detects the change and re-reads the TOC — new disc appears without any USB re-enumeration
 
-1. `mediaPresent(false)` — host sees disc ejected
-2. delay ~1.5 s — host processes removal
-3. `mediaPresent(true)` — host sees new disc inserted
-4. **UNIT ATTENTION** (ASC 0x28 MEDIUM CHANGED) — host automatically re-reads the volume descriptor and directory without requiring F5/refresh
+Enable via CLI: `set dos-compat on` + `reboot`, or via the web Config tab.
 
-The web interface handles the eject→mount sequence automatically when DOS compat mode is active.
+The web UI respects DOS compat mode: the **Mount** button automatically ejects (`/api/umount`), waits 2.5 s, then mounts the new image (`/api/mount`) — all without a USB disconnect.
 
-### Enable
+---
 
-Via serial CLI:
-```
-set dos-compat on
-reboot
-```
+## DOS / Retro PC Compatibility
 
-Via web **Config tab** → DOS Compatibility Mode → DOS compatible → Save.
+### Tested Hardware
 
-### Behaviour
+The firmware has been tested on a real **DOS / Windows 98SE retro PC** — [DOSRetroPC by falco81](https://github.com/falco81/DOSRetroPC):
 
-| | Normal mode | DOS compatible mode |
+| Component | Detail |
+|---|---|
+| Motherboard | Octek Aristo Rhino 15 (Baby AT) |
+| CPU | Intel Pentium MMX 200 MHz (Socket 7, 66 MHz FSB) |
+| Chipset | Intel 430TX (North Bridge: 82439TX, South Bridge: 82371AB PIIX4) |
+| **USB** | **Intel 82371AB PIIX4 — onboard UHCI (USB 1.1)** |
+| OS | MS-DOS 7.1 / Windows 98SE |
+| CD-ROM stack | Panasonic USBASPI.EXE + USBCD1.SYS |
+| CD-ROM manager | SHSUCDX.COM (replaces MSCDEX) |
+
+### Why This Works Where USBODE Does Not
+
+[USBODE](https://github.com/danifunker/usbode) (Pi Zero 2W USB optical drive emulator) has known issues with Intel PIIX4 UHCI and the USBASPI/USBCD1 stack: the drive frequently fails to enumerate, disconnects during disc swaps, or does not respond to UNIT ATTENTION correctly.
+
+| Issue | USBODE | ESP32-S3 Virtual CD-ROM |
 |---|---|---|
-| Mount/eject | Full USB re-enumeration | mediaPresent toggle only |
-| Windows/Linux | Brief disconnect, auto-refresh | Brief disconnect, auto-refresh |
-| DOS (MSCDEX) | Device lost after swap | Disc swap works — no F5 needed |
-| Re-enum on swap | Yes (~500 ms) | No |
-| Auto-refresh | Via re-enum | Via UNIT ATTENTION 0x28 |
+| USB enumeration on PIIX4 UHCI | Unreliable | Stable |
+| UNIT ATTENTION on disc swap | Inconsistent | Correct (SCSI 06h/28h) |
+| DOS compat — no USB re-enum | Not implemented | Implemented |
+| Disc swap without reboot | Requires reboot | Works (MSCDEX re-reads TOC) |
+| Audio CD (PLAY/TOC/SUB-CH) | Partial | Full OB-U0077C spec |
 
-> Default: **disabled** (normal mode). Only enable when using with DOS. Windows and Linux work correctly in either mode.
+### DOS Driver Setup
 
-### Technical implementation
+Add to `CONFIG.SYS`:
 
-The patch in `build_exfat_libs.py` modifies `tud_msc_test_unit_ready_cb()` in `USBMSC.cpp` to deliver UNIT ATTENTION when a flag is set by the firmware. This is the standard SCSI mechanism real optical drives use to notify the OS of a disc change.
+```dos
+; ESP32-S3 Virtual CD-ROM
+; /u  = UHCI only, /w /w = startup delays (required on older chipsets)
+DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI.EXE /u /w /w
+DEVICEHIGH=C:\DRIVERS\USBCD\USBCD1.SYS /D:ESPCD0
+```
+
+Add to `AUTOEXEC.BAT`:
+
+```dos
+LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:ESPCD0 /Q
+```
+
+> **Important**: Enable **DOS Compatibility Mode** on the ESP32-S3 (`set dos-compat on`) before use. This prevents USB re-enumeration on disc swap, which would confuse the USBASPI driver stack.
+
+> **Tip**: The ESP32-S3 must be powered and connected **before** the PC boots — USBASPI only scans at init time.
+
+### DOS Audio CD Player Compatibility
+
+The firmware has been tested with **CD Player for DOS 2.25e** (by Ben Lunt / Forever Young Software):
+
+**Required for correct operation:**
+- MODE SENSE page `0x0E` (Audio Control Parameters) — read by CD Player before playback
+- MODE SELECT `15h`/`55h` — sent by CD Player to save volume settings
+- UNIT ATTENTION (`06h/28h`) — for disc detection after swap
+
+Without `MODE SENSE page 0x0E`, CD Player returns **"return error number: 3"** (MSCDEX error 3 = "Unknown command"). This is fixed in patch v8.
+
+### Disc Swap in DOS Without Rebooting
+
+With DOS Compat enabled:
+
+1. Open the ESP32-S3 web UI from another machine on the same WiFi
+2. **CD-ROM tab** → select image → **Mount**
+3. Firmware: eject → 2.5 s wait → mount → UNIT ATTENTION signalled
+4. MSCDEX/SHSUCDX detects the new disc automatically — no reboot, no driver reload
+
+Alternatively control via script from DOS (requires a network-capable DOS TCP stack or another PC):
+
+```bat
+REM ESPCD.BAT - switch virtual disc
+@ECHO OFF
+WGET http://192.168.40.110/api/umount -q -O NUL
+PING -n 4 127.0.0.1 > NUL
+WGET "http://192.168.40.110/api/mount?file=%1" -q -O NUL
+ECHO Disc: %1
+```
 
 ---
 
@@ -687,36 +746,177 @@ The ESP32-S3 includes hardware accelerators for AES, SHA and RSA — verified at
 
 ## Audio CD Playback
 
-### Bidirectional Synchronization
+The firmware implements a full Red Book-compatible audio CD subsystem: SCSI commands are handled per the **Pioneer OB-U0077C CD-ROM SCSI-2 Command Set v3.1** specification.
 
-The HTML audio player synchronises with the PC player (and vice versa) within **400 ms**:
-- PC sends STOP/PAUSE via SCSI -> firmware updates state within 13 ms -> HTML poll detects the change and redraws the UI
-- HTML PLAY/PAUSE/STOP buttons -> firmware -> PC player sees the state immediately via READ SUB-CHANNEL
+### Hardware
 
-### Enable the Module
+Connect a **GY-PCM5102 I2S DAC** module to the ESP32-S3:
 
+| ESP32-S3 GPIO | PCM5102 Pin | Signal |
+|---|---|---|
+| GPIO 14 | BCK | Bit clock |
+| GPIO 15 | LCK/WS | Word select |
+| GPIO 16 | DIN | Data |
+| 3V3 | VIN | Power |
+| GND | GND | Ground |
+| GND | FMT | I2S Philips format |
+| GND | SCK | No master clock |
+
+Enable via CLI: `set audio-module on` + `reboot`, or via the web Config tab.
+
+### Audio Data Format
+
+Red Book audio sectors are **raw 16-bit signed stereo PCM, little-endian, 44100 Hz**:
+- 2352 bytes per sector = 588 stereo samples × 4 bytes (16-bit L + 16-bit R)
+- **No header** — all 2352 bytes are usable PCM data
+- I2S configured: 44100 Hz, 16-bit, stereo, Philips format
+
+### Virtual Disc Layout (CUE/BIN)
+
+For **separate BIN files** (one `.bin` per track — e.g. Tomb Raider):
 ```
-set audio-module on
-reboot
+LBA 0          … dataTrackSectors-1   → Track 01 (data)
+LBA dataEnd    … dataEnd+len02-1      → Track 02 (audio, pregap stripped)
+LBA …          … …                    → Track 03 … 17
+LBA leadOut                           → Lead-out (reported in READ TOC as 0xAA)
 ```
 
-Or via the web Config tab.
+For **single BIN file** (all tracks in one file — ISO 9660 style):
+- Track LBAs come directly from CUE `INDEX 01` positions
+- File offset = `(lba - trackStartLba) × 2352`
 
-### How It Works
+**Pregap handling**: if a track BIN file has an internal pregap (`INDEX 01 00:02:00` in the CUE), the parser sets `pregapSectors = 150`. The audio task seeks to `(lba - trackStart + pregap) × 2352` — the pregap silence is skipped transparently.
 
-The CUE parser extracts audio tracks and their LBA positions. For **separate BIN file** layout (e.g. Tomb Raider -- one `.bin` per track), the parser computes *virtual disc LBAs*: the data track occupies LBA 0 to N-1, audio tracks follow sequentially. This is what gets reported in READ TOC so the SCSI host sees correct track positions and durations. Each BIN file is seeked to `(virtualLba - trackStart + pregap) * 2352` bytes for accurate playback.
+### Bidirectional Synchronisation
 
-A FreeRTOS audio task on core 0 reads raw PCM sectors from BIN files (2352 B/sector, skip 16 B header), applies software gain, and streams the data to I2S DMA -> PCM5102 -> line out. The PC controls playback via SCSI commands (READ TOC, PLAY AUDIO LBA/MSF/TRACK, PAUSE/RESUME, STOP, READ SUB-CHANNEL). READ TOC reports virtual disc LBAs with the standard 150-sector pregap offset so SCSI players show correct track positions and durations.
+HTML player and PC player are kept in sync via shared firmware state:
 
-Games such as Tomb Raider, Quake, and Need for Speed communicate with the firmware transparently as if it were a real optical drive.
+| Direction | Path | Latency |
+|---|---|---|
+| PC → HTML | SCSI command → `audioState` → `/api/audio/status` poll | ≤ 400 ms |
+| HTML → PC | `/api/audio/*` → `audioState` → SCSI READ SUB-CHANNEL | < 1 ms |
 
-### Without the Module
+The HTML player polls `/api/audio/status` every **400 ms** when the Audio tab is open, every **2 s** in the background. Sub-channel MSF position updates every sector (every **13 ms**) in the audio task.
 
-If the audio module is disabled: CUE tracks are still parsed, the audio task tracks position in real time (75 fps), sub-channel data is correct. PC players function correctly (see tracks, get position) but there is no sound output.
+### Without the I2S Module
+
+CUE tracks are still parsed and all SCSI commands work correctly. The audio task tracks position in real time at 75 frames/sec using `vTaskDelay`. PC games see a correctly working CD player (TOC, sub-channel, play/stop/pause) — just no analogue audio output.
 
 ### Connecting to a Mixer
 
-The PCM5102 output is line level (~2 Vrms). Connect to **line-in** (AUX), not to a microphone input. Set volume to 100 and regulate on the mixer.
+PCM5102 output is line level (~2 Vrms). Connect to **line-in** (AUX input), not microphone. Set firmware volume to 100 and regulate gain at the mixer.
+
+---
+
+## SCSI Command Reference
+
+The firmware implements the USB MSC CD-ROM profile with SCSI-2 commands per **Pioneer OB-U0077C v3.1**. Commands are handled in a patched `tud_msc_scsi_cb` via `build_exfat_libs.py --skip-full-build`.
+
+### General Commands
+
+| Code | Command | Implementation |
+|---|---|---|
+| `03h` | REQUEST SENSE | Returns extended sense data (12 bytes) |
+| `12h` | INQUIRY | Returns device type=05 (CD-ROM), vendor/product strings |
+| `15h` | MODE SELECT (6) | Accepted, ignored — volume and settings stored by host |
+| `1Ah` | MODE SENSE (6) | Page `0x0E` (Audio Control): port 0=left 0xFF, port 1=right 0xFF; page `0x3F`=same; other pages: 4-byte header |
+| `1Bh` | START/STOP UNIT | `LoEj=1,Start=0` → eject + audio stop; `Start=0` → spin down + audio stop; `Start=1` → no-op |
+| `1Eh` | PREVENT/ALLOW MEDIUM REMOVAL | Always returns success (no mechanical lock) |
+| `25h` | READ CAPACITY | Returns sector count × block size (2048 B) |
+| `28h` | READ (10) | Reads data sectors from mounted BIN with header offset applied |
+| `2Bh` | SEEK (10) | No-op — virtual drive seek is instantaneous |
+| `46h` | GET CONFIGURATION | Returns minimal 8-byte feature header |
+| `51h` | READ DISC INFORMATION | Returns 34-byte disc info (disc type=0x20, erasable=0, sessions=1) |
+| `55h` | MODE SELECT (10) | Accepted, ignored |
+| `5Ah` | MODE SENSE (10) | Page `0x0E` (Audio Control): 24-byte response with port routing and volume; other pages: 8-byte header |
+| `BBh` | SET CD-ROM SPEED (2) | No-op — accepted without error |
+| `BDh` | MECHANISM STATUS | Returns 8-byte all-zeros response |
+| `DAh` | SET CD-ROM SPEED (1) | No-op — accepted without error |
+
+### Audio Commands
+
+| Code | Command | Implementation |
+|---|---|---|
+| `42h` | READ SUB-CHANNEL | Returns 16-byte current position block (format 01h). ADR/Control=`0x10` (audio, ADR=1). Audio status: `11h`=playing, `12h`=paused, `13h`=completed (returned once), `15h`=no status. SubQ=0 returns 4-byte header only. |
+| `43h` | READ TOC | Returns track descriptors with correct LBA/MSF. Data track control=`0x14`, audio=`0x10`. Lead-out entry = `0xAA`. Supports LBA and MSF format (bit 1 of byte 1). |
+| `44h` | READ HEADER | Returns CD-ROM Data Mode + absolute address. Returns CHECK CONDITION if LBA is within an audio track. |
+| `45h` | PLAY AUDIO (10) | Play from LBA, length in sectors. Length=0 → play to disc end. |
+| `47h` | PLAY AUDIO MSF | Play from MSF start to MSF end. MSF → LBA conversion: `(M×60+S)×75+F−150`. |
+| `48h` | PLAY AUDIO TRACK INDEX | Play from starting track number to ending track number (inclusive). |
+| `49h` | PLAY AUDIO TRACK RELATIVE (10) | TRLBA = signed 32-bit offset from track start (index 1). Negative = pre-gap area. Length=0 → no-op. |
+| `4Bh` | PAUSE/RESUME | Byte 8 bit 0: `1`=resume, `0`=pause. |
+| `4Eh` | STOP PLAY/SCAN | Stops audio playback. |
+| `A5h` | PLAY AUDIO (12) | Same as `45h` but 32-bit transfer length in bytes 6–9. |
+
+### Sense Key Reference
+
+| Situation | Sense Key | ASC | ASCQ |
+|---|---|---|---|
+| Unknown command | `05h` ILLEGAL REQUEST | `20h` | `00h` |
+| LBA out of range / audio track for READ HEADER | `05h` ILLEGAL REQUEST | `21h` | `00h` |
+| Track not found (PLAY TRACK RELATIVE) | `05h` ILLEGAL REQUEST | `21h` | `00h` |
+| Media changed (DOS compat mode) | `06h` UNIT ATTENTION | `28h` | `00h` |
+
+### MODE SENSE Page 0x0E — Audio Control Parameters
+
+Returned for page code `0x0E` or `0x3F` (all pages) per OB-U0077C §2.9.6:
+
+```
+MODE SENSE(6) response — 20 bytes:
+  Byte 0:    Mode data length = 19
+  Byte 1:    Medium type = 0 (CD-ROM)
+  Byte 2:    Device specific = 0
+  Byte 3:    Block descriptor length = 0
+
+  Page 0x0E (16 bytes):
+  Byte 4:    Page code = 0x0E
+  Byte 5:    Page length = 0x0E (14)
+  Byte 6:    Immed=1, SOTC=0
+  Bytes 7–11: Reserved
+  Byte 12:   Output Port 0 channel select = 0x01 (left)
+  Byte 13:   Output Port 0 volume = 0xFF (max)
+  Byte 14:   Output Port 1 channel select = 0x02 (right)
+  Byte 15:   Output Port 1 volume = 0xFF (max)
+  Bytes 16–19: Ports 2–3 = 0 (unused)
+```
+
+> DOS audio CD players (e.g. CD Player for DOS 2.25e) read this page before playback.
+> Returning a stub response caused **MSCDEX error 3** ("Unknown command") in those applications.
+
+### READ TOC Response Layout
+
+```
+Byte 0–1:  Data Length (MSB first, excludes first 2 bytes)
+Byte 2:    First Track Number = 1
+Byte 3:    Last Track Number  = 1 + audio track count
+
+Per track (8 bytes each):
+  Byte 0:  Reserved (0)
+  Byte 1:  ADR|Control  — 0x14 data track, 0x10 audio track
+  Byte 2:  Track Number
+  Byte 3:  Reserved (0)
+  Byte 4–7: LBA (MSB first) or MSF (byte 4=0, 5=M, 6=S, 7=F)
+
+Lead-out entry: Track Number = 0xAA, address = lead-out LBA / MSF
+```
+
+### READ SUB-CHANNEL Response Layout
+
+```
+Byte 0:    Reserved (0)
+Byte 1:    Audio Status  — 11h playing / 12h paused / 13h completed / 15h none
+Byte 2–3:  Sub-channel data length = 12 (MSB first)
+
+Current Position Data Block (12 bytes, format 01h):
+  Byte 4:  Format Code = 01h
+  Byte 5:  ADR|Control = 0x10  (ADR=1 current position, Control=0 audio)
+  Byte 6:  Track Number
+  Byte 7:  Index Number
+  Byte 8:  Absolute Address MSB (0)
+  Byte 9–11: Absolute M/S/F  (LBA+150 converted to MSF)
+  Byte 12: Relative Address MSB (0)
+  Byte 13–15: Relative M/S/F  (sectors from track start)
+```
 
 ---
 
@@ -752,8 +952,19 @@ The firmware checks `#ifdef CONFIG_FATFS_EXFAT_SUPPORT` at compile time. Without
 After updating the board package in Arduino IDE run:
 
 ```bash
+# First restore original USBMSC.cpp, then re-apply all patches
+python3 build_exfat_libs.py --restore
 python3 build_exfat_libs.py --skip-full-build
 ```
+
+**Current patch version: v8.** The patch modifies `tud_msc_scsi_cb` in `USBMSC.cpp` to inject:
+- Full CD-ROM SCSI command set (READ TOC, PLAY AUDIO, READ SUB-CHANNEL, START/STOP, …)
+- MODE SENSE page `0x0E` (Audio Control Parameters) — required by DOS audio players
+- MODE SELECT `15h`/`55h` — accepted without error
+- UNIT ATTENTION (`06h/28h`) for DOS compatibility disc swap
+- `setSense()` helper, `_audioPlayedOnce` sticky audio status flag
+
+Always run `--restore` before `--skip-full-build` to avoid double-patching.
 
 ### `patch_usbmsc.py` (Windows)
 
