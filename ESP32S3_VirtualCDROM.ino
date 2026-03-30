@@ -1409,7 +1409,7 @@ bool checkAuth() {
         }
       }
       httpServer.sendHeader("Location", url, true);
-      httpServer.send(301, "text/plain", "Redirecting to HTTPS");
+      httpServer.send(302, "text/plain", "Redirecting to HTTPS");
       return false;
     }
   }
