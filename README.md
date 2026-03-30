@@ -24,6 +24,7 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [Serial CLI](#serial-cli)
 - [Wi-Fi Configuration](#wi-fi-configuration)
 - [802.1x Enterprise Wi-Fi (EAP)](#8021x-enterprise-wi-fi-eap)
+- [DOS Compatibility Mode](#dos-compatibility-mode)
 - [Web UI Authentication](#web-ui-authentication)
 - [Audio CD Playback](#audio-cd-playback)
 - [Supported Disc Image Formats](#supported-disc-image-formats)
@@ -456,6 +457,7 @@ Available at `http://cd.local` or via the device IP address.
 - **Network** -- DHCP/Static, IP/mask/gateway/DNS, Hostname with live mDNS preview
 - **802.1x Enterprise WiFi** -- EAP Mode, identity, **Scan SD** for auto-detection of `.pem/.crt/.key` files, CA cert, Client cert/key, passphrase
 - **Audio Module** -- PCM5102 I2S enable/disable dropdown
+- **DOS Compatibility Mode** -- UNIT ATTENTION instead of USB re-enum on mount/eject
 - **Web UI Authentication** -- enable/disable HTTP Basic Auth, username, password (write-only)
 - **Actions** -- Save, Reboot, Factory reset, SD unmount/mount
 
@@ -492,6 +494,7 @@ Connect any serial terminal at **115 200 baud, 8N1**.
 | `eap-ca / eap-cert / eap-key` | Paths to certificates on SD card |
 | `eap-kpass` | Passphrase for an encrypted private key |
 | `audio-module on/off` | PCM5102 I2S audio module |
+| `dos-compat on/off` | DOS compatibility mode -- no USB re-enum on mount (default: off) |
 | `web-auth on/off` | HTTP Basic Auth (default: off) |
 | `web-user <name>` | Web UI username (default: admin) |
 | `web-pass <password>` | Web UI password (default: admin) |
@@ -541,6 +544,47 @@ The EAP identity (`eap-id`) is optional in EAP-TLS mode -- the firmware extracts
 INSERT INTO radcheck (username, attribute, value, op)
 VALUES ('identity', 'Auth-Type', 'EAP', ':=');
 ```
+
+---
+
+## DOS Compatibility Mode
+
+When used with DOS (MSCDEX + USBASPI/USBCD1 drivers), swapping disc images normally causes the device to disappear. The standard mount procedure does a full USB re-enumeration (`tud_disconnect` / `tud_connect`) which DOS drivers loaded at boot cannot recover from — they see it as a cable disconnect.
+
+**DOS Compatibility Mode** keeps the USB drive connected at all times, exactly like a real CD-ROM drive. Only the media changes. Disc swaps are handled by:
+
+1. `mediaPresent(false)` — host sees disc ejected
+2. delay ~1.5 s — host processes removal
+3. `mediaPresent(true)` — host sees new disc inserted
+4. **UNIT ATTENTION** (ASC 0x28 MEDIUM CHANGED) — host automatically re-reads the volume descriptor and directory without requiring F5/refresh
+
+The web interface handles the eject→mount sequence automatically when DOS compat mode is active.
+
+### Enable
+
+Via serial CLI:
+```
+set dos-compat on
+reboot
+```
+
+Via web **Config tab** → DOS Compatibility Mode → DOS compatible → Save.
+
+### Behaviour
+
+| | Normal mode | DOS compatible mode |
+|---|---|---|
+| Mount/eject | Full USB re-enumeration | mediaPresent toggle only |
+| Windows/Linux | Brief disconnect, auto-refresh | Brief disconnect, auto-refresh |
+| DOS (MSCDEX) | Device lost after swap | Disc swap works — no F5 needed |
+| Re-enum on swap | Yes (~500 ms) | No |
+| Auto-refresh | Via re-enum | Via UNIT ATTENTION 0x28 |
+
+> Default: **disabled** (normal mode). Only enable when using with DOS. Windows and Linux work correctly in either mode.
+
+### Technical implementation
+
+The patch in `build_exfat_libs.py` modifies `tud_msc_test_unit_ready_cb()` in `USBMSC.cpp` to deliver UNIT ATTENTION when a flag is set by the firmware. This is the standard SCSI mechanism real optical drives use to notify the OS of a disc change.
 
 ---
 
@@ -757,6 +801,16 @@ The device may not be in download mode:
 2. Press and release **RESET**
 3. Release **BOOT**
 4. Run the flash script immediately
+
+### Disc swap in DOS causes device to disappear
+
+Enable DOS Compatibility Mode:
+```
+set dos-compat on
+reboot
+```
+
+This replaces the USB re-enumeration with a UNIT ATTENTION signal so MSCDEX/USBASPI can reload the TOC without losing the device.
 
 ### Forgotten web UI password
 

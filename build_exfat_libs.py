@@ -423,6 +423,32 @@ def patch_usbmsc(path):
         shutil.copy2(str(path), bak)
         print(f"  Backup created: {path.name}.bak")
 
+    # Always patch tud_msc_test_unit_ready_cb for UNIT ATTENTION support
+    tur_start = src.find('bool tud_msc_test_unit_ready_cb(')
+    if tur_start >= 0:
+        brace = src.find('{', tur_start)
+        depth = 0; tur_end = -1
+        for i in range(brace, len(src)):
+            if src[i] == '{': depth += 1
+            elif src[i] == '}': depth -= 1
+            if depth == 0: tur_end = i + 1; break
+        if tur_end > 0 and 'msc_set_unit_attention' not in src[:tur_start]:
+            new_tur = (
+                '// UNIT ATTENTION flag — declared here so visible in TUR callback\n'
+                'static volatile bool _ua_pending = false;\n'
+                'extern "C" void msc_set_unit_attention(void) { _ua_pending = true; }\n'
+                'bool tud_msc_test_unit_ready_cb(uint8_t lun) {\n'
+                '  if (_ua_pending) {\n'
+                '    _ua_pending = false;\n'
+                '    tud_msc_set_sense(lun, 0x06, 0x28, 0x00);\n'
+                '    return false;\n'
+                '  }\n'
+                '  return msc_luns[lun].media_present;\n'
+                '}\n'
+            )
+            src = src[:tur_start] + new_tur + src[tur_end:]
+            print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION')
+
     if 'CD-ROM SCSI patched v4' in src or 'scsi_audio_play' in src:
         print("  Already patched v4")
         return True
@@ -470,6 +496,21 @@ def patch_usbmsc(path):
         "{ /* CD-ROM SCSI patched v4 */\n"
         "    auto msfToLba = [](uint8_t m,uint8_t s,uint8_t f)->uint32_t{\n"
         "      return (uint32_t)m*60*75+(uint32_t)s*75+f; };\n"
+        "    // Helper: set CHECK CONDITION sense data in buffer\n"
+        "    // Static sense buffer: filled on error, returned on REQUEST SENSE\n"
+        "    static uint8_t senseData[18]={0x70,0,0,0,0,0,0,10,0,0,0,0,0,0,0,0,0,0};\n"
+        "    static bool senseValid=false;\n"
+        "    auto setSense=[&](uint8_t sk,uint8_t asc,uint8_t ascq)->int32_t{\n"
+        "      memset(senseData,0,18);\n"
+        "      senseData[0]=0x70; senseData[2]=sk; senseData[7]=10;\n"
+        "      senseData[12]=asc; senseData[13]=ascq;\n"
+        "      senseValid=true; return -1; };\n"
+        "    // REQUEST SENSE (0x03) -- always handle first\n"
+        "    if(scsi_cmd[0]==0x03){\n"
+        "      uint8_t len=(uint8_t)(bufsize<18?bufsize:18);\n"
+        "      memcpy(buffer,senseValid?senseData:(uint8_t[]){0x70,0,0,0,0,0,0,10,0,0,0,0,0,0,0,0,0,0},len);\n"
+        "      senseValid=false; return len;\n"
+        "    }\n"
         "    switch (scsi_cmd[0]) {\n"
         "      case 0x43: { /* READ TOC */\n"
         "        uint8_t msf=scsi_cmd[1]&0x02;\n"
