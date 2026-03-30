@@ -76,13 +76,26 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 
 ### SD Card (SD_MMC 1-bit mode)
 
+<table>
+<tr>
+<td><img src="doc/sd_front.png" alt="LOLIN MicroSD Card Shield V1.2.0 – front" width="200"/></td>
+<td><img src="doc/sd_back.png" alt="LOLIN MicroSD Card Shield V1.2.0 – back (pinout)" width="200"/></td>
+</tr>
+<tr>
+<td align="center">LOLIN MicroSD Shield V1.2.0 – front</td>
+<td align="center">LOLIN MicroSD Shield V1.2.0 – back (SPI pinout)</td>
+</tr>
+</table>
+
+The project uses the **LOLIN/Wemos MicroSD Card Shield** connected to the ESP32-S3 via SD_MMC peripheral in 1-bit mode (not SPI). The SPI labels on the PCB back (SCK, MISO, MOSI) correspond to the D-numbered GPIOs on the D1 Mini — use the GPIO numbers below for ESP32-S3.
+
 | ESP32-S3 | SD Module | Signal |
 |---|---|---|
-| GPIO 12 | D5 | CLK |
-| GPIO 11 | D7 (MOSI) | CMD |
-| GPIO 13 | D6 (MISO) | D0 |
-| GPIO 10 | D4 (CS) | D3 / CS |
-| 3V3 | VCC | Power |
+| GPIO 12 | CLK (SCK) | Clock |
+| GPIO 11 | CMD (MOSI) | Command |
+| GPIO 13 | D0 (MISO) | Data 0 |
+| GPIO 10 | D3/CS (TF-CS) | Chip Select |
+| 3V3 | 3V3 | Power |
 | GND | GND | Ground |
 
 ### GY-PCM5102 I2S Audio (optional)
