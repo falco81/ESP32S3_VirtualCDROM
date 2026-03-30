@@ -12,12 +12,15 @@ Key findings from development session:
   - cp has alias -i -> use shutil.copy2 instead
 
 Usage:
-  python3 build_exfat_libs.py                     # full build + patch
-  python3 build_exfat_libs.py --arduino-version 3.3.7
+  python3 build_exfat_libs.py                     # full build + patch (auto-detects version)
+  python3 build_exfat_libs.py --arduino-version 3.3.7  # force specific version
   python3 build_exfat_libs.py --test              # verify only, no changes
   python3 build_exfat_libs.py --skip-full-build   # skip build.sh (if run recently)
   python3 build_exfat_libs.py --restore           # restore originals from backups
   python3 build_exfat_libs.py --dry-run           # show what would be done
+  python3 build_exfat_libs.py --skip-usbmsc       # skip USBMSC patch
+
+Note: USBMSC.cpp patch (CD-ROM + Audio SCSI v4) is now integrated.
 """
 
 import os, sys, re, shutil, subprocess, glob, argparse
@@ -47,7 +50,8 @@ def run(cmd, cwd=None, check=True, capture=False):
 
 # ── Arguments ──────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(description="Build ESP32 libs with exFAT support")
-parser.add_argument("--arduino-version", default="3.3.7")
+parser.add_argument("--arduino-version", default=None,
+                    help="ESP32 Arduino version e.g. 3.3.7 (default: auto-detect latest)")
 parser.add_argument("--arduino15", default=None, help="Path to Arduino15 (optional)")
 parser.add_argument("--test", action="store_true",
                     help="Verify all changes only, make no modifications")
@@ -55,13 +59,21 @@ parser.add_argument("--restore", action="store_true",
                     help="Restore original files from backups")
 parser.add_argument("--dry-run", action="store_true",
                     help="Show what would be done without doing it")
+parser.add_argument("--skip-usbmsc", action="store_true",
+                    help="Skip USBMSC.cpp CD-ROM+Audio patch")
 parser.add_argument("--skip-full-build", action="store_true",
                     help="Skip build.sh (use if it was run recently)")
 args = parser.parse_args()
 
-AR_VERSION  = args.arduino_version
 BUILDER_DIR = Path("/root/esp32_exfat_build/esp32-arduino-lib-builder")
 BUILDER_URL = "https://github.com/espressif/esp32-arduino-lib-builder"
+
+def get_builder_tag(version):
+    """Map Arduino ESP32 version to lib-builder git tag.
+    The lib-builder tag matches the Arduino package version exactly."""
+    # e.g. 3.3.7 -> tags/3.3.7, 3.4.0 -> tags/3.4.0
+    return f"tags/{version}"
+
 
 print(f"\n{BOLD}{'='*60}")
 print(f"  ESP32 Arduino Lib Builder \u2014 exFAT Support")
@@ -87,18 +99,55 @@ def find_arduino15():
             return Path(matches[0])
     die("Arduino15 not found. Use --arduino15 <path>")
 
+def detect_ar_version(ar15):
+    """Auto-detect latest installed ESP32 Arduino version."""
+    hw = ar15 / "packages" / "esp32" / "hardware" / "esp32"
+    if not hw.exists():
+        return None
+    versions = sorted([v for v in os.listdir(str(hw))
+                       if (hw / v).is_dir() and v[0].isdigit()], reverse=True)
+    return versions[0] if versions else None
+
+# Auto-detect version if not specified
+_ar15_tmp = find_arduino15()  # called again below properly, just for detection
+AR_VERSION = args.arduino_version
+if AR_VERSION is None:
+    AR_VERSION = detect_ar_version(_ar15_tmp) if _ar15_tmp else "3.3.7"
+    if AR_VERSION:
+        print(f"    Auto-detected ESP32 Arduino version: {AR_VERSION}")
+    else:
+        AR_VERSION = "3.3.7"
+        warn(f"Could not auto-detect version, using default: {AR_VERSION}")
 arduino15 = find_arduino15()
 ok(f"Arduino15: {arduino15}")
 
 hw_path  = arduino15 / "packages" / "esp32" / "hardware" / "esp32" / AR_VERSION
 libs_dir = arduino15 / "packages" / "esp32" / "tools" / "esp32s3-libs"
 
-# libfatfs.a can be in two locations depending on lib-builder version
-lib_file = libs_dir / AR_VERSION / "lib" / "libfatfs.a"
-if not lib_file.exists():
-    lib_file = libs_dir / "lib" / "libfatfs.a"
 
-# Installed ffconf.h
+# Auto-detect libfatfs.a — path varies across ESP32 Arduino versions
+# 2.x: esp32-arduino-libs/<ver>/esp32s3/lib/libfatfs.a
+# 3.x: esp32-arduino-libs/<ver>/esp32s3/lib/libfatfs.a  (same but version changes)
+def find_libfatfs(libs_dir, version, target="esp32s3"):
+    """Find libfatfs.a for given version and target chip."""
+    # Try common paths in order of likelihood
+    candidates = [
+        libs_dir / version / target / "lib" / "libfatfs.a",
+        libs_dir / version / "lib" / "libfatfs.a",
+    ]
+    # Also glob for any version if exact not found
+    for c in candidates:
+        if c.exists():
+            return c
+    # Fallback: find any libfatfs.a under libs_dir
+    found = list(libs_dir.rglob("libfatfs.a"))
+    # Prefer esp32s3 variant
+    s3 = [f for f in found if target in str(f)]
+    return s3[0] if s3 else (found[0] if found else candidates[0])
+
+lib_file = find_libfatfs(libs_dir, AR_VERSION)
+
+# Auto-detect ffconf.h
 installed_ffconf = libs_dir / AR_VERSION / "include" / "fatfs" / "src" / "ffconf.h"
 if not installed_ffconf.exists():
     candidates = list(libs_dir.rglob("ffconf.h"))
@@ -129,6 +178,25 @@ if args.test:
             info(detail)
 
     # ── 1. Installed ffconf.h ─────────────────────────────────────────────
+    step("0. Checking sdkconfig.h exFAT define")
+    sdk_files = list(libs_dir.rglob("sdkconfig.h"))
+    tools_dir_t = libs_dir.parent.parent
+    for chip in ["esp32s3", "esp32"]:
+        for p in tools_dir_t.glob(f"*{chip}*/**/sdkconfig.h"):
+            if p not in sdk_files:
+                sdk_files.append(p)
+    if not sdk_files:
+        check("sdkconfig.h found", False, "-> File not found in Arduino15 tools")
+    else:
+        for sdk_h in sdk_files:
+            try:
+                txt = sdk_h.read_text(encoding="utf-8", errors="ignore")
+                has_define = "#define CONFIG_FATFS_EXFAT_SUPPORT 1" in txt
+                check(f"CONFIG_FATFS_EXFAT_SUPPORT=1 in {sdk_h.name}", has_define,
+                      str(sdk_h) if has_define else f"MISSING define in {sdk_h}")
+            except Exception as e:
+                check(f"sdkconfig.h readable", False, str(e))
+
     step("1. Checking installed ffconf.h")
 
     if installed_ffconf and installed_ffconf.exists():
@@ -231,13 +299,15 @@ if args.test:
             check(f"USBMSC: {name}", passed)
 
         any_cdrom = any(p for _, p in checks_usbmsc)
-        if "virtual cdrom" in content.lower() or "v3" in content or "patched" in content.lower():
-            check("USBMSC: patch version identified", True)
+        is_v4 = "patched v4" in content.lower() or "scsi_audio_play" in content
+        if is_v4:
+            check("USBMSC: CD-ROM + Audio SCSI patch v4", True)
         elif any_cdrom:
-            warn("USBMSC: patch applied but version tag not identified")
+            check("USBMSC: CD-ROM patch applied (older version)", True,
+                  "-> Re-run build_exfat_libs.py to upgrade to v4")
         else:
             check("USBMSC: CD-ROM patch applied", False,
-                  "-> Run patch_usbmsc.py separately")
+                  "-> Run build_exfat_libs.py to apply patch")
     else:
         check("USBMSC.cpp found", False, str(usbmsc))
 
@@ -338,6 +408,154 @@ else:
 # ── KEY STEP: Patch ffconf.h AFTER build.sh ──────────────────────────────────
 step("Patching ffconf.h (after git reset from build.sh)")
 
+def patch_usbmsc(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        src = f.read()
+
+    # Always restore from backup first
+    bak = str(path) + ".bak"
+    if os.path.exists(bak):
+        shutil.copy2(bak, str(path))
+        with open(path, 'r', encoding='utf-8') as f:
+            src = f.read()
+        print("  Restored clean backup")
+    else:
+        shutil.copy2(str(path), bak)
+        print(f"  Backup created: {path.name}.bak")
+
+    if 'CD-ROM SCSI patched v4' in src or 'scsi_audio_play' in src:
+        print("  Already patched v4")
+        return True
+
+    func_start = src.find('int32_t tud_msc_scsi_cb(')
+    if func_start < 0:
+        func_start = src.find('tud_msc_scsi_cb(')
+    if func_start < 0:
+        print("ERROR: tud_msc_scsi_cb not found"); return False
+
+    brace_start = src.find('{', func_start)
+    depth = 0
+    func_end = -1
+    for i in range(brace_start, len(src)):
+        if src[i] == '{': depth += 1
+        elif src[i] == '}':
+            depth -= 1
+            if depth == 0:
+                func_end = i + 1
+                break
+
+    func_body = src[func_start:func_end]
+    body_start = func_body.find('{')
+    print(f"  Found tud_msc_scsi_cb ({len(func_body)} bytes)")
+
+    # File-scope declarations inserted BEFORE the function (no extern "C" needed
+    # since both translation units are C++ and name mangling matches)
+    file_scope = (
+        "\n/* scsi_audio bridge — forward declarations */\n"
+        "extern void     scsi_audio_play(uint32_t, uint32_t);\n"
+        "extern void     scsi_audio_stop();\n"
+        "extern void     scsi_audio_pause();\n"
+        "extern void     scsi_audio_resume();\n"
+        "extern int      scsi_audio_state();\n"
+        "extern void     scsi_audio_subchannel(uint8_t*);\n"
+        "extern int      scsi_audio_track_count();\n"
+        "extern int      scsi_audio_track_info(int, uint32_t*, uint32_t*);\n"
+        "extern uint32_t cdromBlockCount_get();\n"
+        "extern uint32_t cdromBlockCount;\n"
+        "/* end audio bridge */\n\n"
+    )
+
+    # Switch block inserted inside the function (no extern declarations here)
+    inner = (
+        "{ /* CD-ROM SCSI patched v4 */\n"
+        "    auto msfToLba = [](uint8_t m,uint8_t s,uint8_t f)->uint32_t{\n"
+        "      return (uint32_t)m*60*75+(uint32_t)s*75+f; };\n"
+        "    switch (scsi_cmd[0]) {\n"
+        "      case 0x43: { /* READ TOC */\n"
+        "        uint8_t msf=scsi_cmd[1]&0x02;\n"
+        "        int na=scsi_audio_track_count(), tot=1+na;\n"
+        "        int resp=4+(tot+1)*8; if((uint32_t)resp>bufsize)resp=(int)bufsize;\n"
+        "        memset(buffer,0,resp); uint8_t*b=(uint8_t*)buffer;\n"
+        "        uint16_t dl=(uint16_t)(resp-2);\n"
+        "        b[0]=dl>>8;b[1]=dl&0xFF;b[2]=1;b[3]=(uint8_t)tot;\n"
+        "        int off=4; b[off+1]=0x14;b[off+2]=1;off+=8;\n"
+        "        for(int t=0;t<na&&off+8<=resp;t++){\n"
+        "          uint32_t lba=0,len=0; scsi_audio_track_info(t+2,&lba,&len);\n"
+        "          b[off+1]=0x10;b[off+2]=(uint8_t)(t+2);\n"
+        "          if(msf){uint32_t l=lba+150;\n"
+        "            b[off+5]=(uint8_t)(l/(60*75));b[off+6]=(uint8_t)((l/75)%60);b[off+7]=(uint8_t)(l%75);\n"
+        "          }else{b[off+4]=(uint8_t)(lba>>24);b[off+5]=(uint8_t)(lba>>16);\n"
+        "                b[off+6]=(uint8_t)(lba>>8);b[off+7]=(uint8_t)(lba);}\n"
+        "          off+=8;\n"
+        "        }\n"
+        "        if(off+8<=resp){\n"
+        "          uint32_t bc=cdromBlockCount;\n"
+        "          b[off+1]=0x14;b[off+2]=0xAA;\n"
+        "          b[off+4]=(uint8_t)(bc>>24);b[off+5]=(uint8_t)(bc>>16);\n"
+        "          b[off+6]=(uint8_t)(bc>>8);b[off+7]=(uint8_t)(bc);\n"
+        "        }\n"
+        "        return resp;\n"
+        "      }\n"
+        "      case 0x42: { /* READ SUB-CHANNEL */\n"
+        "        if(bufsize<16)break;\n"
+        "        memset(buffer,0,16); uint8_t*b=(uint8_t*)buffer;\n"
+        "        int st=scsi_audio_state();\n"
+        "        b[1]=(st==1)?0x11:(st==2)?0x12:0x13;\n"
+        "        b[3]=12;b[4]=0x01;b[5]=b[1];\n"
+        "        uint8_t sub[8]={}; scsi_audio_subchannel(sub);\n"
+        "        b[6]=sub[0];b[7]=sub[1];\n"
+        "        b[9]=sub[2];b[10]=sub[3];b[11]=sub[4];\n"
+        "        b[13]=sub[5];b[14]=sub[6];b[15]=sub[7];\n"
+        "        return 16;\n"
+        "      }\n"
+        "      case 0x45: { /* PLAY AUDIO LBA */\n"
+        "        uint32_t lba=((uint32_t)scsi_cmd[2]<<24)|((uint32_t)scsi_cmd[3]<<16)|\n"
+        "                     ((uint32_t)scsi_cmd[4]<<8)|scsi_cmd[5];\n"
+        "        uint16_t len=((uint16_t)scsi_cmd[7]<<8)|scsi_cmd[8];\n"
+        "        scsi_audio_play(lba,lba+len); return 0;\n"
+        "      }\n"
+        "      case 0x47: { /* PLAY AUDIO MSF */\n"
+        "        uint32_t s=msfToLba(scsi_cmd[3],scsi_cmd[4],scsi_cmd[5]);\n"
+        "        uint32_t e=msfToLba(scsi_cmd[6],scsi_cmd[7],scsi_cmd[8]);\n"
+        "        if(s>150)s-=150; if(e>150)e-=150;\n"
+        "        scsi_audio_play(s,e); return 0;\n"
+        "      }\n"
+        "      case 0x48: { /* PLAY AUDIO TRACK INDEX */\n"
+        "        uint8_t st=scsi_cmd[4],et=scsi_cmd[6];\n"
+        "        uint32_t sl=0,el=0,tmp=0;\n"
+        "        scsi_audio_track_info(st,&sl,&tmp);\n"
+        "        if(scsi_audio_track_info(et,&el,&tmp))el+=tmp;\n"
+        "        else el=cdromBlockCount;\n"
+        "        scsi_audio_play(sl,el); return 0;\n"
+        "      }\n"
+        "      case 0x4B:{if(scsi_cmd[8]&1)scsi_audio_resume();else scsi_audio_pause();return 0;}\n"
+        "      case 0x4E:{scsi_audio_stop();return 0;}\n"
+        "      case 0x46:{if(bufsize>=8){memset(buffer,0,8);((uint8_t*)buffer)[3]=4;((uint8_t*)buffer)[7]=8;return 8;}break;}\n"
+        "      case 0x51:{if(bufsize>=34){memset(buffer,0,34);\n"
+        "        ((uint8_t*)buffer)[1]=0x20;((uint8_t*)buffer)[2]=0x0E;\n"
+        "        ((uint8_t*)buffer)[3]=((uint8_t*)buffer)[4]=\n"
+        "        ((uint8_t*)buffer)[5]=((uint8_t*)buffer)[6]=1;return 34;}break;}\n"
+        "      case 0x1A:{if(bufsize>=4){memset(buffer,0,4);((uint8_t*)buffer)[0]=3;return 4;}break;}\n"
+        "      case 0x5A:{if(bufsize>=8){memset(buffer,0,8);((uint8_t*)buffer)[1]=6;return 8;}break;}\n"
+        "      case 0x1E:return 0;\n"
+        "      case 0xBD:{uint16_t l=bufsize<8?(uint16_t)bufsize:8;memset(buffer,0,l);return(int32_t)l;}\n"
+        "      default:break;\n"
+        "    }\n"
+        "  }\n"
+        "  /* end CD-ROM SCSI patched v4 */\n"
+        "  "
+    )
+
+    new_func_body = func_body[:body_start+1] + '\n  ' + inner + func_body[body_start+1:]
+    new_src = src[:func_start] + file_scope + new_func_body + src[func_end:]
+
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(new_src)
+    print("  Patched v4: CD+Audio handlers (C bridge, no extern issues)")
+    return True
+
+
+
 FFCONF_PATTERN = re.compile(r'(#define\s+FF_FS_EXFAT\s+)0')
 
 def patch_ffconf(f):
@@ -421,19 +639,61 @@ for ffconf in libs_dir.rglob('ffconf.h'):
     if '.bak' not in str(ffconf):
         patch_ffconf(ffconf)
 
-# ── USBMSC check ─────────────────────────────────────────────────────────────
-step("Checking USBMSC.cpp CD-ROM patch")
 
-if usbmsc.exists():
-    content = usbmsc.read_text(errors='replace')
-    if ('READ_TOC' in content or 'CDROM' in content or
-            'cdrom' in content.lower() or '0x43' in content):
-        ok("USBMSC.cpp already patched (CD-ROM SCSI handlers found)")
+# -- Patch sdkconfig.h (compiler define for exFAT) --
+step("Patching sdkconfig.h - compiler define for exFAT")
+
+import re as _re
+# sdkconfig.h may be in libs_dir OR directly in the tools dir
+# e.g. .../tools/esp32s3-libs/3.3.7/include/sdkconfig.h
+sdkconfig_h_files = list(libs_dir.rglob("sdkconfig.h"))
+# Also search one level up (tools/<chip>-libs/<ver>/)
+tools_dir = libs_dir.parent.parent  # packages/esp32/tools
+for chip in ["esp32s3", "esp32"]:
+    for p in tools_dir.glob(f"*{chip}*/**/sdkconfig.h"):
+        if p not in sdkconfig_h_files:
+            sdkconfig_h_files.append(p)
+if sdkconfig_h_files:
+    info(f"Found {len(sdkconfig_h_files)} sdkconfig.h file(s)")
+    for p in sdkconfig_h_files:
+        info(f"  {p}")
+patched_sdk = 0
+for sdk_h in sdkconfig_h_files:
+    if ".bak" in str(sdk_h): continue
+    try:
+        txt = sdk_h.read_text(encoding="utf-8", errors="ignore")
+    except: continue
+    if "#define CONFIG_FATFS_EXFAT_SUPPORT 1" in txt:
+        ok(f"Already has exFAT define: {sdk_h.name}"); continue
+    bak = Path(str(sdk_h) + ".bak")
+    if not bak.exists(): shutil.copy2(str(sdk_h), str(bak))
+    new_txt = _re.sub(r"#define\s+CONFIG_FATFS_EXFAT_SUPPORT\s+\S+",
+                      "#define CONFIG_FATFS_EXFAT_SUPPORT 1", txt)
+    if new_txt == txt:
+        idx = txt.rfind("#endif")
+        ins = "\n#define CONFIG_FATFS_EXFAT_SUPPORT 1\n\n"
+        new_txt = (txt[:idx] + ins + txt[idx:]) if idx >= 0 else txt + ins
+    if not args.dry_run:
+        sdk_h.write_text(new_txt, encoding="utf-8")
+    ok(f"Patched sdkconfig.h: {sdk_h}")
+    patched_sdk += 1
+if not sdkconfig_h_files:
+    warn("sdkconfig.h not found in libs_dir")
+
+# ── USBMSC patch (integrated from patch_usbmsc.py) ──────────────────────────
+if not args.skip_usbmsc:
+    step("Applying USBMSC.cpp CD-ROM + Audio SCSI patch v4")
+    if usbmsc.exists():
+        if not args.dry_run:
+            result = patch_usbmsc(usbmsc)
+            if result:
+                ok("USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v4)")
+            else:
+                warn("USBMSC.cpp: patch already applied or failed")
+        else:
+            ok(f"[dry-run] Would patch: {usbmsc}")
     else:
-        warn("USBMSC.cpp is NOT patched for CD-ROM")
-        warn("-> Run patch_usbmsc.py separately")
-else:
-    warn(f"USBMSC.cpp not found: {usbmsc}")
+        warn(f"USBMSC.cpp not found: {usbmsc}")
 
 # ── Final verification via --test ─────────────────────────────────────────────
 step("Running final verification")
@@ -450,12 +710,12 @@ else:
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 print(f"\n{BOLD}{'='*60}{RESET}")
-print(f"{BOLD}{GREEN}  Done! exFAT support installed.{RESET}")
+print(f"{BOLD}{GREEN}  Done! exFAT + USBMSC patch installed.{RESET}")
 print(f"{BOLD}{'='*60}{RESET}")
 print("""
   Next steps:
   1. Delete Arduino build cache (Windows):
-       %LOCALAPPDATA%/arduino/sketches/  <- delete folder contents
+       %LOCALAPPDATA%\\arduino\\sketches\\  <- delete folder contents
   2. Restart Arduino IDE completely
   3. Compile and upload sketch
   4. Serial monitor should show:
