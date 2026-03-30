@@ -961,11 +961,15 @@ static void audioTask(void* arg) {
       continue;
     }
 
-    // Stream sectors in chunks
+    // Stream sectors in chunks — clamp to track boundary AND end LBA
     int sectorsToRead = AUDIO_BUF_SECTORS;
     uint32_t remaining = (audioEndLba > lba) ? (audioEndLba - lba) : 0;
     if (remaining == 0) { audioState = AUDIO_STOP; continue; }
     if ((uint32_t)sectorsToRead > remaining) sectorsToRead = (int)remaining;
+    // Clamp to current track boundary — prevents reading past end of track BIN file
+    uint32_t trackRemaining = (trk->startLba + trk->lengthSectors) - lba;
+    if ((uint32_t)sectorsToRead > trackRemaining) sectorsToRead = (int)trackRemaining;
+    if (sectorsToRead <= 0) { audioCurrentLba++; continue; } // advance past boundary
 
     int bytesRead = audioFile.read(audioBuf, sectorsToRead * 2352);
     if (bytesRead <= 0) { audioState = AUDIO_STOP; continue; }
@@ -974,16 +978,17 @@ static void audioTask(void* arg) {
 
     // Write audio samples to I2S — skip 16-byte sector header per sector
     for (int s = 0; s < sectorsGot && audioState == AUDIO_PLAY; s++) {
-      uint8_t* pcm    = audioBuf + s * 2352 + 16;  // skip sync header
-      size_t   pcmLen = 2336;  // 588 stereo samples × 2ch × 2 bytes
+      // Red Book audio sectors: 2352 bytes = raw 16-bit stereo PCM, NO header
+      uint8_t* pcm    = audioBuf + s * 2352;
+      size_t   pcmLen = 2352;  // 588 stereo samples × 2ch × 2 bytes = 2352
       size_t   written = 0;
       // Apply software volume (mute = silence, otherwise scale 16-bit samples)
       if (audioMuted || audioVolume == 0) {
-        static uint8_t silence[2336] = {};
+        static uint8_t silence[2352] = {};
         i2s_channel_write(i2sTx, silence, pcmLen, &written, pdMS_TO_TICKS(100));
       } else if (audioVolume < 100) {
         // Scale in-place in a stack buffer to avoid modifying audioBuf
-        int16_t scaled[2336/2];
+        int16_t scaled[2352/2];
         int16_t* src16 = (int16_t*)pcm;
         for (int si = 0; si < (int)(pcmLen/2); si++)
           scaled[si] = (int16_t)((int32_t)src16[si] * audioVolume / 100);
@@ -1044,7 +1049,17 @@ void audioPlay(uint32_t startLba, uint32_t endLba) {
   audioCurrentLba = startLba;
   audioEndLba     = endLba;
   audioState      = AUDIO_PLAY;
-  dualPrint.printf("[AUDIO] Play LBA %lu → %lu\n", startLba, endLba);
+  // Resolve to audio track for debug
+  AudioTrack* trk = nullptr;
+  for (int i = 0; i < audioTrackCount; i++)
+    if (audioTracks[i].valid && startLba >= audioTracks[i].startLba &&
+        startLba < audioTracks[i].startLba + audioTracks[i].lengthSectors)
+      { trk = &audioTracks[i]; break; }
+  if (trk) dualPrint.printf("[AUDIO] Play LBA %lu→%lu  Track %d  File:%s\n",
+           startLba, endLba, trk->number,
+           trk->binFile.substring(trk->binFile.lastIndexOf("/")+1).c_str());
+  else     dualPrint.printf("[AUDIO] Play LBA %lu→%lu  (no audio track at start LBA!)\n",
+           startLba, endLba);
 }
 
 void audioStop() {
@@ -1085,6 +1100,7 @@ void scsi_audio_subchannel(uint8_t* buf) {
 int scsi_audio_track_count() { return (int)audioTrackCount; }
 
 int scsi_audio_track_info(int n, uint32_t* startLba, uint32_t* lenSectors) {
+  if (n == 1) return 0;  // Track 1 is data track — not an audio track
   for (int i = 0; i < audioTrackCount; i++) {
     if (audioTracks[i].number == (uint8_t)n) {
       if (startLba)   *startLba   = audioTracks[i].startLba;
