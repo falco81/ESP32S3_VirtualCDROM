@@ -434,6 +434,77 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
 
+    <!-- HTTPS -->
+    <div class="card">
+      <div class="ct">&#128274; HTTPS / TLS</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">HTTPS on port 443</label>
+        <select class="cfg-inp" id="cfgHttpsEnabled" style="width:100%" onchange="httpsToggle()">
+          <option value="0">Disabled (HTTP only)</option>
+          <option value="1">Enabled (HTTP redirects to HTTPS)</option>
+        </select>
+      </div>
+      <div id="httpsOptions" style="display:none">
+        <div class="cfg-row">
+          <label class="cfg-lbl">Scan SD for certs</label>
+          <button class="btn b" id="httpsScanBtn" onclick="httpsScanCerts()">&#128269; Scan SD</button>
+          <span class="sp" id="httpsScanSp"></span>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-lbl">Server certificate</label>
+          <select class="cfg-inp" id="cfgHttpsCert" style="flex:1">
+            <option value="">(not set)</option>
+          </select>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-lbl">Server private key</label>
+          <select class="cfg-inp" id="cfgHttpsKey" style="flex:1">
+            <option value="">(not set)</option>
+          </select>
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-lbl">Key passphrase</label>
+          <input class="cfg-inp" id="cfgHttpsKPass" type="password"
+                 placeholder="(only for encrypted keys)" autocomplete="new-password">
+        </div>
+        <div class="cfg-row">
+          <label class="cfg-lbl">HTTP port</label>
+          <input class="cfg-inp" id="cfgHttpPort" type="number" min="1" max="65535" value="80"
+                 style="width:90px" title="HTTP server port (reboot required)">
+        </div>
+        <div id="httpsPortRow" class="cfg-row">
+          <label class="cfg-lbl">HTTPS port</label>
+          <input class="cfg-inp" id="cfgHttpsPort" type="number" min="1" max="65535" value="443"
+                 style="width:90px">
+        </div>
+        <div id="tlsOptions" style="display:none">
+          <div class="cfg-row">
+            <label class="cfg-lbl">TLS protocol</label>
+            <select class="cfg-inp" id="cfgTlsMinVer" style="flex:1">
+              <option value="0">TLS 1.2 only (maximum compat)</option>
+              <option value="1">TLS 1.2 + 1.3 (recommended)</option>
+            </select>
+          </div>
+          <div class="cfg-row">
+            <label class="cfg-lbl">Cipher suites</label>
+            <select class="cfg-inp" id="cfgTlsCiphers" style="flex:1">
+              <option value="0">Auto (all supported)</option>
+              <option value="1">Strong only — ECDHE + AES-GCM</option>
+              <option value="2">Medium — ECDHE + AES-GCM/CBC</option>
+              <option value="3">All incl. legacy RSA key exchange</option>
+            </select>
+          </div>
+        </div>
+        <div style="font-size:.73rem;color:var(--muted);margin-top:4px">
+          &#9432; PEM format on SD. Port/TLS changes require reboot.
+          Generate: <code>openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 3650 -nodes -addext "subjectAltName=IP:x.x.x.x"</code>
+        </div>
+        <div style="font-size:.73rem;color:#e8a020;margin-top:6px;padding:5px 8px;background:rgba(232,160,32,.1);border-radius:4px;border-left:3px solid #e8a020">
+          &#9888; <strong>HTTPS reduces transfer speed 2&ndash;4&times;</strong> compared to HTTP (TLS + proxy overhead). Upload/download over HTTPS: ~2&ndash;4 Mbps vs HTTP ~10 Mbps. For large files (ISO, BIN) use HTTP or copy SD card directly to PC.
+        </div>
+      </div>
+    </div>
+
     <!-- Actions -->
     <div class="card">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -905,6 +976,45 @@ function cfgMdnsUpdate(v){
   if(mdnsEl) mdnsEl.textContent=label+'.local';
 }
 
+function httpsToggle(){
+  var on=$("cfgHttpsEnabled")&&$("cfgHttpsEnabled").value==="1";
+  var opts=$("httpsOptions"); if(opts) opts.style.display=on?"block":"none";
+  var tls=$("tlsOptions"); if(tls) tls.style.display=on?"block":"none";
+  var pr=$("httpsPortRow"); if(pr) pr.style.display=on?"flex":"none";
+}
+
+function httpsScanCerts(){
+  spin("httpsScanSp",true);
+  var btn=$("httpsScanBtn"); if(btn) btn.disabled=true;
+  var found=[];
+  function scanDir(path,done){
+    fetch("/api/ls?path="+encodeURIComponent(path)).then(function(r){return r.json();}).then(function(items){
+      var subs=[];
+      items.forEach(function(it){
+        if(it.dir){ subs.push(path==="/"?"/"+it.name:path+"/"+it.name); }
+        else{ var nm=it.name.toLowerCase();
+          if(nm.endsWith(".pem")||nm.endsWith(".crt")||nm.endsWith(".cer")||nm.endsWith(".key")){
+            found.push(path==="/"?"/"+it.name:path+"/"+it.name); }}
+      });
+      function nd(i){ if(i>=subs.length){done();return;} scanDir(subs[i],function(){nd(i+1);}); }
+      nd(0);
+    }).catch(function(){done();});
+  }
+  scanDir("/",function(){
+    spin("httpsScanSp",false); if(btn) btn.disabled=false;
+    found.sort();
+    ["cfgHttpsCert","cfgHttpsKey"].forEach(function(id){
+      var sel=$(id); if(!sel) return;
+      var saved=sel._savedVal||"";
+      sel.innerHTML="<option value=''>(not set)</option>";
+      found.forEach(function(f){ var o=document.createElement("option"); o.value=f; o.textContent=f; sel.appendChild(o); });
+      if(saved){ for(var i=0;i<sel.options.length;i++){ if(sel.options[i].value===saved){sel.selectedIndex=i;break;} } }
+    });
+    var sp=$("httpsScanSp"); if(sp) sp.textContent=found.length?found.length+" file(s)":" No certs found";
+    setTimeout(function(){if(sp)sp.textContent="";},3000);
+  });
+}
+
 function cfgLoad(){
   fetch('/api/config/get').then(function(r){return r.json();}).then(function(c){
     $('cfgSsid').value=c.ssid||'';
@@ -925,6 +1035,14 @@ function cfgLoad(){
     $('cfgEapKPass').value = '';  // never pre-fill password
     $('cfgAudioModule').value = c.audioModule ? '1' : '0';
     $('cfgDosCompat').value = c.dosCompat ? '1' : '0';
+    var heEl=$('cfgHttpsEnabled'); if(heEl){heEl.value=c.httpsEnabled?'1':'0'; httpsToggle();}
+    var hcEl=$('cfgHttpsCert'); if(hcEl){hcEl._savedVal=c.httpsCert||''; if(c.httpsCert){var o=document.createElement('option');o.value=c.httpsCert;o.textContent=c.httpsCert+' (saved)';hcEl.appendChild(o);hcEl.value=c.httpsCert;}}
+    var hkEl=$('cfgHttpsKey'); if(hkEl){hkEl._savedVal=c.httpsKey||''; if(c.httpsKey){var o=document.createElement('option');o.value=c.httpsKey;o.textContent=c.httpsKey+' (saved)';hkEl.appendChild(o);hkEl.value=c.httpsKey;}}
+    var hkpEl=$('cfgHttpsKPass'); if(hkpEl) hkpEl.placeholder=c.httpsKPassSet?'(passphrase set — leave empty to keep)':'(only for encrypted keys)';
+    var hpEl=$('cfgHttpPort'); if(hpEl) hpEl.value=c.httpPort||80;
+    var hpsEl=$('cfgHttpsPort'); if(hpsEl) hpsEl.value=c.httpsPort||443;
+    var tvEl=$('cfgTlsMinVer'); if(tvEl) tvEl.value=c.tlsMinVer||0;
+    var tcEl=$('cfgTlsCiphers'); if(tcEl) tcEl.value=c.tlsCiphers||0;
     $('cfgWebAuth').value = c.webAuth ? '1' : '0';
     $('cfgWebUser').value = c.webUser || 'admin';
     $('cfgWebPass').value = '';
@@ -954,6 +1072,14 @@ function cfgSave(){
   if($('cfgEapKPass').value.trim()) params.set('eapKeyPass',$('cfgEapKPass').value.trim());
   params.set('audioModule',$('cfgAudioModule').value);
   params.set('dosCompat',$('cfgDosCompat').value);
+  params.set('httpsEnabled',$('cfgHttpsEnabled')?$('cfgHttpsEnabled').value:'0');
+  params.set('httpsCert',$('cfgHttpsCert')?$('cfgHttpsCert').value:'');
+  params.set('httpsKey',$('cfgHttpsKey')?$('cfgHttpsKey').value:'');
+  var hkp=$('cfgHttpsKPass'); if(hkp&&hkp.value) params.set('httpsKPass',hkp.value);
+  var hp=$('cfgHttpPort'); if(hp) params.set('httpPort',hp.value);
+  var hps=$('cfgHttpsPort'); if(hps) params.set('httpsPort',hps.value);
+  var tv=$('cfgTlsMinVer'); if(tv) params.set('tlsMinVer',tv.value);
+  var tc=$('cfgTlsCiphers'); if(tc) params.set('tlsCiphers',tc.value);
   params.set('webAuth',$('cfgWebAuth').value);
   if($('cfgWebUser').value.trim()) params.set('webUser',$('cfgWebUser').value.trim());
   if($('cfgWebPass').value.trim()) params.set('webPass',$('cfgWebPass').value.trim());
@@ -1084,6 +1210,16 @@ function loadSysinfo(){
     siRow(sy,'Flash',s.sys_flash_mb+' MB');
     siRow(sy,'SDK',s.sys_sdk);
     dosCompatOn=s.dos_compat||false;
+    siRow(sy,'HTTP port',s.httpPort||80);
+    siRow(sy,'HTTPS',s.httpsEnabled?'<span style="color:var(--ok)">&#10003; Enabled (port 443)</span>':'<span style="color:var(--muted)">Disabled</span>');
+    if(s.httpsEnabled){
+      siRow(sy,'HTTPS port',s.httpsPort||443);
+      if(s.httpsCert) siRow(sy,'TLS cert',s.httpsCert);
+      var verNames=['TLS 1.2 only','TLS 1.2 + 1.3'];
+      var cipNames=['Auto','Strong/GCM','Medium/CBC','All/Legacy'];
+      siRow(sy,'TLS protocol',verNames[s.tlsMinVer||0]||'TLS 1.2 only');
+      siRow(sy,'TLS ciphers',cipNames[s.tlsCiphers||0]||'Auto');
+    }
     siRow(sy,'DOS compat',s.dos_compat?'<span style="color:var(--ok)">&#10003; Enabled (no USB re-enum on mount)</span>':'<span style="color:var(--muted)">Disabled</span>');
       // Audio section
       var ta=$('siAudio')&&$('siAudio').querySelector('tbody');

@@ -35,9 +35,11 @@
 #include <ESPmDNS.h>
 #include <esp_eap_client.h>
 #include <esp_wifi.h>       // for esp_wifi_set_config / esp_wifi_start
-#include <mbedtls/x509_crt.h>  // for reading CN from client cert
+#include <mbedtls/x509_crt.h>
+#include <mbedtls/base64.h>  // for reading CN from client cert
 #include <esp_log.h>             // for WPA debug logging
 #include <WebServer.h>
+#include <esp_https_server.h>   // ESP-IDF HTTPS server
 #include <SPI.h>
 #include "FS.h"
 #include "SD_MMC.h"
@@ -109,7 +111,10 @@ static volatile SubChannel subChannel = {};
 //  GLOBAL OBJECTS
 // =============================================================================
 Preferences        prefs;
-WebServer          httpServer(80);
+WebServer          httpServer(80);  // port updated at setupWebServer()
+httpd_handle_t     httpsHandle  = nullptr;  // ESP-IDF HTTPS server handle
+static SemaphoreHandle_t s_proxyMutex  = nullptr; // serialise loopback
+static WiFiClient        s_proxyClient;            // persistent loopback
 Adafruit_NeoPixel  rgbLed(1, RGB_LED_PIN, NEO_GRB + NEO_KHZ800);
 
 // =============================================================================
@@ -141,6 +146,14 @@ struct Config {
   char webUser[32];        // Web UI username (default: admin)
   char webPass[64];        // Web UI password (default: admin)
   bool dosCompat;          // true = skip USB re-enum on mount (DOS compatibility)
+  bool     httpsEnabled;       // true = enable HTTPS
+  char     httpsCertPath[64];  // SD path to TLS server certificate
+  char     httpsKeyPath[64];   // SD path to TLS server private key
+  char     httpsKeyPass[64];   // Passphrase for encrypted key
+  uint16_t httpPort;           // HTTP server port (default 80)
+  uint16_t httpsPort;          // HTTPS server port (default 443)
+  uint8_t  tlsMinVer;          // 0=TLS1.2  1=TLS1.2+1.3
+  uint8_t  tlsCiphers;         // 0=Auto 1=Strong(GCM) 2=Medium(CBC) 3=All
 };
 Config cfg;
 
@@ -170,6 +183,17 @@ void loadConfig() {
   strlcpy(cfg.webUser, prefs.getString("webUser", "admin").c_str(), sizeof(cfg.webUser));
   strlcpy(cfg.webPass, prefs.getString("webPass", "admin").c_str(), sizeof(cfg.webPass));
   cfg.dosCompat = prefs.getBool("dosCompat", false);
+  cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
+  strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
+  strlcpy(cfg.httpsKeyPath,  prefs.getString("httpsKey",  "").c_str(), sizeof(cfg.httpsKeyPath));
+  strlcpy(cfg.httpsKeyPass,  prefs.getString("httpsKPass","").c_str(), sizeof(cfg.httpsKeyPass));
+  cfg.httpPort  = (uint16_t)prefs.getUInt("httpPort",  80);
+  cfg.httpsPort = (uint16_t)prefs.getUInt("httpsPort", 443);
+  cfg.tlsMinVer = (uint8_t) prefs.getUInt("tlsMinVer", 0);
+  cfg.tlsCiphers= (uint8_t) prefs.getUInt("tlsCiphers",0);
+  cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
+  strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
+  strlcpy(cfg.httpsKeyPath,  prefs.getString("httpsKey",  "").c_str(), sizeof(cfg.httpsKeyPath));
   prefs.end();
 }
 
@@ -199,6 +223,17 @@ void saveConfig() {
   prefs.putString("webUser", cfg.webUser);
   prefs.putString("webPass", cfg.webPass);
   prefs.putBool("dosCompat", cfg.dosCompat);
+  prefs.putBool("httpsEnabled", cfg.httpsEnabled);
+  prefs.putString("httpsCert", cfg.httpsCertPath);
+  prefs.putString("httpsKey",  cfg.httpsKeyPath);
+  prefs.putString("httpsKPass",cfg.httpsKeyPass);
+  prefs.putUInt("httpPort",   cfg.httpPort  ? cfg.httpPort  : 80);
+  prefs.putUInt("httpsPort",  cfg.httpsPort ? cfg.httpsPort : 443);
+  prefs.putUInt("tlsMinVer",  cfg.tlsMinVer);
+  prefs.putUInt("tlsCiphers", cfg.tlsCiphers);
+  prefs.putBool("httpsEnabled", cfg.httpsEnabled);
+  prefs.putString("httpsCert", cfg.httpsCertPath);
+  prefs.putString("httpsKey",  cfg.httpsKeyPath);
   prefs.end();
 }
 
@@ -297,6 +332,14 @@ void clearConfig() {
   strlcpy(cfg.webUser, "admin", sizeof(cfg.webUser));
   strlcpy(cfg.webPass, "admin", sizeof(cfg.webPass));
   cfg.dosCompat = false;
+  cfg.httpsEnabled = false;
+  cfg.httpsCertPath[0] = 0;
+  cfg.httpsKeyPath[0]  = 0;
+  cfg.httpsKeyPass[0]  = 0;
+  cfg.httpPort   = 80;
+  cfg.httpsPort  = 443;
+  cfg.tlsMinVer  = 0;
+  cfg.tlsCiphers = 0;
   defaultMount = "";
   dualPrint.println(F("[OK]  All NVS configuration cleared."));
 }
@@ -1348,6 +1391,28 @@ void handleFileUpload() {
 // =============================================================================
 // Check HTTP Basic Auth — returns false and sends 401 if auth required and not provided
 bool checkAuth() {
+  // HTTP→HTTPS redirect — runs for every request via checkAuth()
+  if (cfg.httpsEnabled && httpsHandle != nullptr) {
+    bool fromProxy = (httpServer.hasHeader("X-Internal-Proxy") &&
+                      httpServer.header("X-Internal-Proxy") == "1");
+    if (!fromProxy) {
+      String host = httpServer.hostHeader();
+      if (!host.length()) host = WiFi.localIP().toString();
+      int col = host.lastIndexOf(":");
+      if (col > 0) host = host.substring(0, col);
+      String url = "https://" + host + httpServer.uri();
+      if (httpServer.args()) {
+        url += "?";
+        for (int i = 0; i < httpServer.args(); i++) {
+          if (i) url += "&";
+          url += httpServer.argName(i) + "=" + httpServer.arg(i);
+        }
+      }
+      httpServer.sendHeader("Location", url, true);
+      httpServer.send(301, "text/plain", "Redirecting to HTTPS");
+      return false;
+    }
+  }
   if (!cfg.webAuth) return true;  // auth disabled — always allow
   if (httpServer.authenticate(cfg.webUser, cfg.webPass)) return true;
   httpServer.requestAuthentication(BASIC_AUTH, "ESP32-S3 CD-ROM", "Login required");
@@ -1490,6 +1555,15 @@ void handleApiSysinfo() {
   j += ",\"sys_flash_mb\":" + String(ESP.getFlashChipSize() / (1024*1024));
   j += ",\"sys_sdk\":\""   + jsonEsc(ESP.getSdkVersion())           + "\"";
   j += ",\"dos_compat\":" + String(cfg.dosCompat ? "true" : "false");
+  j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
+  j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
+  j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
+  j += ",\"httpsKey\":\"" + jsonEsc(cfg.httpsKeyPath) + "\"";
+  j += ",\"httpPort\":" + String(cfg.httpPort ? cfg.httpPort : 80);
+  j += ",\"httpsPort\":" + String(cfg.httpsPort ? cfg.httpsPort : 443);
+  j += ",\"tlsMinVer\":" + String(cfg.tlsMinVer);
+  j += ",\"tlsCiphers\":" + String(cfg.tlsCiphers);
+  j += ",\"httpsKPassSet\":" + String(strlen(cfg.httpsKeyPass) ? "true" : "false");
   j += ",\"audio_module\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"i2s_ready\":" + String(i2sTx ? "true" : "false");
   j += ",\"audio_state\":" + String((int)audioState);
@@ -1684,6 +1758,13 @@ void handleApiGetConfig() {
   j += ",\"webAuth\":" + String(cfg.webAuth ? "true" : "false");
   j += ",\"webUser\":\"" + jsonEsc(cfg.webUser) + "\"";
     j += ",\"dosCompat\":" + String(cfg.dosCompat ? "true" : "false");
+  j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
+  j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
+  j += ",\"httpsKey\":\"" + jsonEsc(cfg.httpsKeyPath) + "\"";
+  j += ",\"httpPort\":" + String(cfg.httpPort ? cfg.httpPort : 80);
+  j += ",\"httpsPort\":" + String(cfg.httpsPort ? cfg.httpsPort : 443);
+  j += ",\"tlsMinVer\":" + String(cfg.tlsMinVer);
+  j += ",\"tlsCiphers\":" + String(cfg.tlsCiphers);
   // webPass intentionally omitted from GET response
   j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
@@ -1720,6 +1801,17 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("dosCompat"))  { String v=httpServer.arg("dosCompat");  cfg.dosCompat=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("httpsEnabled")) { String v=httpServer.arg("httpsEnabled"); cfg.httpsEnabled=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("httpsCert")) { strlcpy(cfg.httpsCertPath, httpServer.arg("httpsCert").c_str(), sizeof(cfg.httpsCertPath)); changed=true; }
+  if (httpServer.hasArg("httpsKey"))  { strlcpy(cfg.httpsKeyPath,  httpServer.arg("httpsKey").c_str(),  sizeof(cfg.httpsKeyPath));  changed=true; }
+  if (httpServer.hasArg("httpPort"))   { int v=httpServer.arg("httpPort").toInt(); if(v>0&&v<65536) cfg.httpPort=(uint16_t)v; changed=true; }
+  if (httpServer.hasArg("httpsPort"))  { int v=httpServer.arg("httpsPort").toInt(); if(v>0&&v<65536) cfg.httpsPort=(uint16_t)v; changed=true; }
+  if (httpServer.hasArg("tlsMinVer"))  { cfg.tlsMinVer=(uint8_t)constrain(httpServer.arg("tlsMinVer").toInt(),0,1); changed=true; }
+  if (httpServer.hasArg("tlsCiphers")) { cfg.tlsCiphers=(uint8_t)constrain(httpServer.arg("tlsCiphers").toInt(),0,3); changed=true; }
+  if (httpServer.hasArg("httpsKPass")){ strlcpy(cfg.httpsKeyPass, httpServer.arg("httpsKPass").c_str(), sizeof(cfg.httpsKeyPass)); changed=true; }
+  if (httpServer.hasArg("httpsEnabled")) { String v=httpServer.arg("httpsEnabled"); cfg.httpsEnabled=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("httpsCert")) { strlcpy(cfg.httpsCertPath, httpServer.arg("httpsCert").c_str(), sizeof(cfg.httpsCertPath)); changed=true; }
+  if (httpServer.hasArg("httpsKey"))  { strlcpy(cfg.httpsKeyPath,  httpServer.arg("httpsKey").c_str(),  sizeof(cfg.httpsKeyPath));  changed=true; }
   if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
   if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
@@ -1938,7 +2030,542 @@ void handleApiAudioSeek() {
   httpServer.send(404,"application/json","{\"ok\":false}");
 }
 
+// =============================================================================
+//  HTTPS SERVER (ESP-IDF httpd_ssl + loopback proxy to WebServer on port 80)
+//  Architecture:
+//    Port 443 → esp_https_server → proxy to 127.0.0.1:80 with X-Internal-Proxy header
+//    Port 80  → WebServer → if X-Internal-Proxy absent + httpsEnabled → 301 redirect
+//    Port 80  → WebServer → if X-Internal-Proxy present → serve normally
+// =============================================================================
+
+static char*       s_tlsCertBuf = nullptr;
+static char*       s_tlsKeyBuf  = nullptr;
+bool loadTlsCerts() {
+  if (!sdReady) return false;
+  if (strlen(cfg.httpsCertPath)) {
+    File f = SD_MMC.open(cfg.httpsCertPath, FILE_READ);
+    if (f) {
+      size_t sz = f.size();
+      free(s_tlsCertBuf); s_tlsCertBuf = (char*)malloc(sz + 1);
+      if (s_tlsCertBuf) { f.read((uint8_t*)s_tlsCertBuf, sz); s_tlsCertBuf[sz] = 0;
+        // Strip Windows CRLF → LF (mbedTLS requires LF only)
+        char *r = s_tlsCertBuf, *w = s_tlsCertBuf;
+        while (*r) { if (!(*r == '\r' && *(r+1) == '\n')) *w++ = *r; r++; }
+        *w = 0;
+      }
+      f.close();
+      dualPrint.printf("[HTTPS] Cert loaded: %s (%u B)\n", cfg.httpsCertPath, sz);
+    if (strstr(s_tlsCertBuf, "-----BEGIN") == nullptr)
+      dualPrint.println(F("[HTTPS] WARNING: cert does not look like PEM!"));
+    // Parse cert with mbedTLS to get key size info
+    {
+      mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
+      int ret = mbedtls_x509_crt_parse(&crt,
+        (const unsigned char*)s_tlsCertBuf, strlen(s_tlsCertBuf)+1);
+      if (ret == 0) {
+        size_t bits = mbedtls_pk_get_bitlen(&crt.pk);
+        const char* pktype = mbedtls_pk_get_name(&crt.pk);
+        dualPrint.printf("[HTTPS] Cert: %s %u-bit", pktype, (unsigned)bits);
+        if (bits > 2048) dualPrint.print(F(" WARNING: >2048-bit may fail on ESP32!"));
+        dualPrint.println();
+      } else {
+        dualPrint.printf("[HTTPS] mbedTLS parse error: -0x%04X\n", (unsigned)(-ret));
+      }
+      mbedtls_x509_crt_free(&crt);
+    }
+    } else { dualPrint.printf("[HTTPS] Cannot open cert: %s\n", cfg.httpsCertPath); return false; }
+  } else { dualPrint.println(F("[HTTPS] No cert path configured")); return false; }
+  if (strlen(cfg.httpsKeyPath)) {
+    File f = SD_MMC.open(cfg.httpsKeyPath, FILE_READ);
+    if (f) {
+      size_t sz = f.size();
+      free(s_tlsKeyBuf); s_tlsKeyBuf = (char*)malloc(sz + 1);
+      if (s_tlsKeyBuf) { f.read((uint8_t*)s_tlsKeyBuf, sz); s_tlsKeyBuf[sz] = 0;
+        char *r = s_tlsKeyBuf, *w = s_tlsKeyBuf;
+        while (*r) { if (!(*r == '\r' && *(r+1) == '\n')) *w++ = *r; r++; }
+        *w = 0;
+      }
+      f.close();
+      dualPrint.printf("[HTTPS] Key  loaded: %s (%u B)\n", cfg.httpsKeyPath, sz);
+    if (strstr(s_tlsKeyBuf, "-----BEGIN") == nullptr)
+      dualPrint.println(F("[HTTPS] WARNING: key does not look like PEM format!"));
+    if (strstr(s_tlsKeyBuf, "ENCRYPTED") != nullptr && !strlen(cfg.httpsKeyPass))
+      dualPrint.println(F("[HTTPS] WARNING: key is encrypted but no passphrase set!"));
+    } else { dualPrint.printf("[HTTPS] Cannot open key: %s\n", cfg.httpsKeyPath); return false; }
+  } else { dualPrint.println(F("[HTTPS] No key path configured")); return false; }
+  return true;
+}
+
+// Wildcard HTTPS handler: decrypt TLS then proxy to WebServer on port 80
+static esp_err_t httpsProxyHandler(httpd_req_t *req) {
+  // Serialise: one loopback request at a time, max wait 8s
+  if (!s_proxyMutex || xSemaphoreTake(s_proxyMutex, pdMS_TO_TICKS(8000)) != pdTRUE) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Proxy busy");
+    return ESP_FAIL;
+  }
+  // Reuse persistent connection or reconnect
+  if (!s_proxyClient.connected()) {
+    s_proxyClient.stop();
+    if (!s_proxyClient.connect("127.0.0.1", 80)) {
+      xSemaphoreGive(s_proxyMutex);
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Loopback failed");
+      return ESP_FAIL;
+    }
+  }
+  WiFiClient& client = s_proxyClient;
+  // Build HTTP/1.0 request with internal marker header
+  const char* method = (req->method == HTTP_GET)  ? "GET"  :
+                       (req->method == HTTP_POST)  ? "POST" :
+                       (req->method == HTTP_PUT)   ? "PUT"  : "DELETE";
+  String req_str = String(method) + " " + String(req->uri) + " HTTP/1.0\r\n";
+  req_str += "Host: localhost\r\n";
+  req_str += "X-Internal-Proxy: 1\r\n";  // skip redirect check
+  // Forward key request headers
+  char authBuf[128] = {};
+  if (httpd_req_get_hdr_value_str(req, "Authorization", authBuf, sizeof(authBuf)) == ESP_OK)
+    req_str += "Authorization: " + String(authBuf) + "\r\n";
+  char cookieBuf[256] = {};
+  if (httpd_req_get_hdr_value_str(req, "Cookie", cookieBuf, sizeof(cookieBuf)) == ESP_OK)
+    req_str += "Cookie: " + String(cookieBuf) + "\r\n";
+  // Forward Content-Type for POST
+  if (req->content_len > 0) {
+    char ctBuf[256] = "application/octet-stream";  // must fit multipart boundary
+    httpd_req_get_hdr_value_str(req, "Content-Type", ctBuf, sizeof(ctBuf));
+    req_str += "Content-Type: " + String(ctBuf) + "\r\n";
+    req_str += "Content-Length: " + String(req->content_len) + "\r\n";
+  }
+  req_str += "\r\n";
+  client.print(req_str);
+  // Forward body
+  if (req->content_len > 0) {
+    char bodyBuf[4096]; size_t rem = req->content_len;  // larger = fewer iterations
+    while (rem > 0) {
+      int got = httpd_req_recv(req, bodyBuf, min((size_t)sizeof(bodyBuf), rem));
+      if (got <= 0) break;
+      client.write((uint8_t*)bodyBuf, got); rem -= got;
+    }
+  }
+  // Wait for response
+  unsigned long t0 = millis();
+  while (!client.available() && millis() - t0 < 30000) delay(1);  // 30s for uploads
+  // Parse status line
+  String statusLine = client.readStringUntil('\n'); statusLine.trim();
+  int code = 200;
+  if (statusLine.startsWith("HTTP/")) {
+    int s1 = statusLine.indexOf(' '), s2 = statusLine.indexOf(' ', s1+1);
+    if (s1 > 0) code = statusLine.substring(s1+1, s2 > s1 ? s2 : s1+4).toInt();
+  }
+  // Parse response headers
+  String contentType = "text/plain";
+  String location = "";
+  String wwwAuth = "";    // persistent buffer for WWW-Authenticate
+  String setCookie = "";  // persistent buffer for Set-Cookie
+  while (client.available()) {
+    String hdr = client.readStringUntil('\n'); hdr.trim();
+    if (!hdr.length()) break;
+    String lhdr = hdr; lhdr.toLowerCase();
+    if (lhdr.startsWith("content-type:"))    { contentType = hdr.substring(13); contentType.trim(); }
+    if (lhdr.startsWith("location:"))         { location = hdr.substring(9); location.trim(); }
+    if (lhdr.startsWith("www-authenticate:")) { wwwAuth = hdr.substring(17); wwwAuth.trim(); }
+    if (lhdr.startsWith("set-cookie:"))       { setCookie = hdr.substring(11); setCookie.trim(); }
+  }
+  // Send response — set all headers before status
+  char statusStr[16]; snprintf(statusStr, sizeof(statusStr), "%d %s", code,
+    code==200?"OK":code==401?"Unauthorized":code==404?"Not Found":"Error");
+  httpd_resp_set_status(req, statusStr);
+  httpd_resp_set_type(req, contentType.c_str());
+  if (location.length())  httpd_resp_set_hdr(req, "Location", location.c_str());
+  if (wwwAuth.length())   httpd_resp_set_hdr(req, "WWW-Authenticate", wwwAuth.c_str());
+  if (setCookie.length()) httpd_resp_set_hdr(req, "Set-Cookie", setCookie.c_str());
+  // Stream body
+  char rbuf[4096];
+  while (client.connected() || client.available()) {
+    int n = client.read((uint8_t*)rbuf, sizeof(rbuf));
+    if (n > 0) httpd_resp_send_chunk(req, rbuf, n);
+    else if (!client.connected()) break;
+    else delay(1);
+  }
+  httpd_resp_send_chunk(req, nullptr, 0);
+  // Keep connection alive; WebServer closes on HTTP/1.0 — reconnect next time
+  xSemaphoreGive(s_proxyMutex);
+  return ESP_OK;
+}
+
+
+// =============================================================================
+//  DIRECT HTTPS UPLOAD HANDLER (bypasses loopback proxy for max speed)
+// =============================================================================
+static esp_err_t httpsUploadHandler(httpd_req_t *req) {
+  // Get target path from query string
+  char pathBuf[128] = "/";
+  if (httpd_req_get_url_query_len(req) > 0) {
+    char qbuf[256] = {};
+    httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf));
+    char rawPath[128] = {};
+    httpd_query_key_value(qbuf, "path", rawPath, sizeof(rawPath));
+    urlDecode(pathBuf, rawPath, sizeof(pathBuf));
+  }
+  // Check auth via X-Internal-Proxy trick: use the real checkAuth logic
+  // by checking Authorization header manually
+  char authBuf[128] = {};
+  if (cfg.webAuth) {
+    httpd_req_get_hdr_value_str(req, "Authorization", authBuf, sizeof(authBuf));
+    // Decode Basic auth: "Basic base64(user:pass)"
+    bool authOk = false;
+    if (strncmp(authBuf, "Basic ", 6) == 0) {
+      // Decode base64
+      const char* b64 = authBuf + 6;
+      size_t b64len = strlen(b64);
+      size_t outlen = 0;
+      unsigned char decoded[128] = {};
+      if (mbedtls_base64_decode(decoded, sizeof(decoded)-1, &outlen,
+                                 (const unsigned char*)b64, b64len) == 0) {
+        char expected[128];
+        snprintf(expected, sizeof(expected), "%s:%s", cfg.webUser, cfg.webPass);
+        authOk = (strcmp((char*)decoded, expected) == 0);
+      }
+    }
+    if (!authOk) {
+      httpd_resp_set_status(req, "401 Unauthorized");
+      httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-S3 CD-ROM\"");
+      httpd_resp_send(req, "Unauthorized", 12);
+      return ESP_OK;
+    }
+  }
+  // Parse multipart boundary from Content-Type header
+  char ctBuf[256] = {};
+  httpd_req_get_hdr_value_str(req, "Content-Type", ctBuf, sizeof(ctBuf));
+  char* bndPos = strstr(ctBuf, "boundary=");
+  if (!bndPos) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "No boundary");
+    return ESP_FAIL;
+  }
+  String boundary = "--"; boundary += (bndPos + 9);
+  boundary.trim();
+  // Read multipart body, parse headers, write file to SD
+  File outFile;
+  String fileName = "";
+  bool inBody = false;
+  bool writeError = false;
+  size_t written = 0;
+  static char buf[4096];
+  String carry = "";  // leftover data between chunks
+  size_t remaining = req->content_len;
+  while (remaining > 0 || carry.length() > 0) {
+    int toRead = min((size_t)sizeof(buf)-1, remaining);
+    int got = toRead > 0 ? httpd_req_recv(req, buf, toRead) : 0;
+    if (got < 0) break;
+    remaining -= got;
+    buf[got] = 0;
+    carry += String(buf).substring(0, got);
+    // Process line by line
+    while (true) {
+      int nl = carry.indexOf("\r\n");
+      if (nl < 0 && remaining > 0) break;  // need more data
+      String line = (nl >= 0) ? carry.substring(0, nl) : carry;
+      carry = (nl >= 0) ? carry.substring(nl + 2) : "";
+      if (line.startsWith(boundary)) {
+        if (outFile) { outFile.close(); outFile = File(); }
+        inBody = false;
+        // Don't clear fileName — needed for done log
+      } else if (!inBody && line.startsWith("Content-Disposition:")) {
+        // Extract filename
+        int fi = line.indexOf("filename=\"");
+        if (fi >= 0) {
+          int fe = line.indexOf("\"", fi + 10);
+          fileName = line.substring(fi + 10, fe);
+        }
+      } else if (!inBody && line.length() == 0 && fileName.length() > 0) {
+        // Blank line = body starts
+        String dir = String(pathBuf);
+        String fpath = (dir == "/" ? "" : dir) + "/" + fileName;
+        dualPrint.printf("[UPLOAD] Start: %s\n", fpath.c_str());
+        outFile = SD_MMC.open(fpath.c_str(), FILE_WRITE);
+        writeError = !outFile;
+        written = 0; inBody = true;
+      } else if (inBody) {
+        // Check if this is the last line before boundary (strip trailing \r\n)
+        bool isLast = carry.startsWith(boundary);
+        String data = isLast ? line : line + "\r\n";
+        if (outFile && data.length() > 0) {
+          if (outFile.write((uint8_t*)data.c_str(), data.length()) != data.length())
+            writeError = true;
+          written += data.length();
+        }
+      }
+      if (nl < 0) break;
+    }
+  }
+  if (outFile) outFile.close();
+  if (writeError) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Write error");
+    return ESP_FAIL;
+  }
+  dualPrint.printf("[UPLOAD] OK: %s  (%u B)\n", fileName.c_str(), written);
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_sendstr(req, "OK");
+  return ESP_OK;
+}
+
+
+
+// URL-decode a string in-place (e.g. %2F → /)
+static void urlDecode(char* dst, const char* src, size_t dstSize) {
+  size_t di = 0;
+  for (size_t i = 0; src[i] && di < dstSize - 1; i++) {
+    if (src[i] == '%' && src[i+1] && src[i+2]) {
+      char hex[3] = {src[i+1], src[i+2], 0};
+      dst[di++] = (char)strtol(hex, nullptr, 16);
+      i += 2;
+    } else if (src[i] == '+') {
+      dst[di++] = ' ';
+    } else {
+      dst[di++] = src[i];
+    }
+  }
+  dst[di] = 0;
+}
+// Direct HTTPS download handler — reads SD and streams directly via TLS, no proxy
+static esp_err_t httpsDownloadHandler(httpd_req_t *req) {
+  // Auth check
+  if (cfg.webAuth) {
+    char authBuf[128] = {};
+    httpd_req_get_hdr_value_str(req, "Authorization", authBuf, sizeof(authBuf));
+    bool authOk = false;
+    if (strncmp(authBuf, "Basic ", 6) == 0) {
+      size_t outlen = 0;
+      unsigned char decoded[128] = {};
+      if (mbedtls_base64_decode(decoded, sizeof(decoded)-1, &outlen,
+          (const unsigned char*)(authBuf+6), strlen(authBuf+6)) == 0) {
+        char expected[128];
+        snprintf(expected, sizeof(expected), "%s:%s", cfg.webUser, cfg.webPass);
+        authOk = (strcmp((char*)decoded, expected) == 0);
+      }
+    }
+    if (!authOk) {
+      httpd_resp_set_status(req, "401 Unauthorized");
+      httpd_resp_set_hdr(req, "WWW-Authenticate", "Basic realm=\"ESP32-S3 CD-ROM\"");
+      httpd_resp_sendstr(req, "Unauthorized");
+      return ESP_OK;
+    }
+  }
+  // Get path from query string
+  char qbuf[256] = {}; char pathBuf[128] = {};
+  if (httpd_req_get_url_query_len(req) > 0) {
+    httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf));
+    char rawPath[128] = {};
+    httpd_query_key_value(qbuf, "path", rawPath, sizeof(rawPath));
+    urlDecode(pathBuf, rawPath, sizeof(pathBuf));
+  }
+  if (!pathBuf[0]) { httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing path"); return ESP_FAIL; }
+  if (!sdReady)    { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD unavailable"); return ESP_FAIL; }
+  File f = SD_MMC.open(pathBuf, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found"); return ESP_FAIL;
+  }
+  // Extract filename for Content-Disposition
+  String path = String(pathBuf);
+  String fname = path.substring(path.lastIndexOf('/') + 1);
+  size_t fileSize = f.size();
+  dualPrint.printf("[DOWNLOAD] Start: %s  (%zu B)\n", pathBuf, fileSize);
+  // Send headers
+  char cdBuf[192];
+  snprintf(cdBuf, sizeof(cdBuf), "attachment; filename=\"%s\"", fname.c_str());
+  char szBuf[24];
+  snprintf(szBuf, sizeof(szBuf), "%zu", fileSize);
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/octet-stream");
+  httpd_resp_set_hdr(req, "Content-Disposition", cdBuf);
+  httpd_resp_set_hdr(req, "Content-Length", szBuf);
+  // Stream file directly via TLS
+  downloadActive = true;
+  static uint8_t dlBuf[8192];
+  size_t sent = 0;
+  while (sent < fileSize) {
+    size_t toRead = min((size_t)sizeof(dlBuf), fileSize - sent);
+    int rd = f.read(dlBuf, toRead);
+    if (rd <= 0) break;
+    if (httpd_resp_send_chunk(req, (char*)dlBuf, rd) != ESP_OK) break;
+    sent += rd;
+  }
+  httpd_resp_send_chunk(req, nullptr, 0);
+  downloadActive = false;
+  f.close();
+  dualPrint.printf("[DOWNLOAD] Done: %zu / %zu B sent.\n", sent, fileSize);
+  return ESP_OK;
+}
+
+static const httpd_uri_t httpsDownloadUri = {
+  "/api/download", HTTP_GET, httpsDownloadHandler, nullptr
+};
+
+static const httpd_uri_t httpsUploadUri = {
+  "/api/upload", HTTP_POST, httpsUploadHandler, nullptr
+};
+
+static const httpd_uri_t _httpsGet  = { "/*", HTTP_GET,    httpsProxyHandler, nullptr };
+static const httpd_uri_t _httpsPost = { "/*", HTTP_POST,   httpsProxyHandler, nullptr };
+static const httpd_uri_t _httpsPut  = { "/*", HTTP_PUT,    httpsProxyHandler, nullptr };
+
+
+// TLS cipher suite presets for esp_https_server
+// Note: the int* arrays must be static (NULL-terminated, valid for server lifetime)
+static const int _ciphers_strong[] = {        // ECDHE + AES-GCM only (best security)
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+  MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+  0
+};
+static const int _ciphers_medium[] = {        // ECDHE + AES-GCM + AES-CBC
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+  0
+};
+static const int _ciphers_all[] = {           // All supported incl. legacy RSA
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+  MBEDTLS_TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+  MBEDTLS_TLS_RSA_WITH_AES_128_GCM_SHA256,
+  MBEDTLS_TLS_RSA_WITH_AES_256_GCM_SHA384,
+  MBEDTLS_TLS_RSA_WITH_AES_128_CBC_SHA256,
+  MBEDTLS_TLS_RSA_WITH_AES_256_CBC_SHA256,
+  0
+};
+
+// TLS handshake callback: apply cipher suite and version settings
+static esp_err_t tlsPreConfigCb(void *ssl_params, void *user_ctx) {
+  mbedtls_ssl_config *sslcfg = (mbedtls_ssl_config *)ssl_params;
+  if (!sslcfg) return ESP_FAIL;
+  // Apply cipher suite preset
+  switch (cfg.tlsCiphers) {
+    case 1: mbedtls_ssl_conf_ciphersuites(sslcfg, _ciphers_strong); break;
+    case 2: mbedtls_ssl_conf_ciphersuites(sslcfg, _ciphers_medium); break;
+    case 3: mbedtls_ssl_conf_ciphersuites(sslcfg, _ciphers_all);    break;
+    default: break;  // 0=Auto: let mbedTLS decide
+  }
+  // Apply TLS minimum version
+  if (cfg.tlsMinVer == 0) {
+    // TLS 1.2 only
+    mbedtls_ssl_conf_min_tls_version(sslcfg, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_max_tls_version(sslcfg, MBEDTLS_SSL_VERSION_TLS1_2);
+  }
+  // tlsMinVer==1: leave default (TLS 1.2 + 1.3 if compiled in)
+  return ESP_OK;
+}
+
+bool startHttpsServer() {
+  if (httpsHandle) return true;
+  if (!loadTlsCerts()) return false;
+  if (!s_proxyMutex) s_proxyMutex = xSemaphoreCreateMutex();
+  // Log HW crypto status
+#ifdef CONFIG_MBEDTLS_HARDWARE_AES
+  #define _HW_AES "AES=ON"
+#else
+  #define _HW_AES "AES=OFF"
+#endif
+#ifdef CONFIG_MBEDTLS_HARDWARE_SHA
+  #define _HW_SHA " SHA=ON"
+#else
+  #define _HW_SHA " SHA=OFF"
+#endif
+#ifdef CONFIG_MBEDTLS_HARDWARE_MPI
+  #define _HW_RSA " RSA=ON"
+#else
+  #define _HW_RSA " RSA=OFF"
+#endif
+  dualPrint.println(F("[HTTPS] HW crypto: " _HW_AES _HW_SHA _HW_RSA));
+  // Enable verbose mbedTLS logging to diagnose handshake failures
+  esp_log_level_set("esp-tls", ESP_LOG_DEBUG);
+  esp_log_level_set("esp-tls-mbedtls", ESP_LOG_DEBUG);
+  esp_log_level_set("esp_https_server", ESP_LOG_DEBUG);
+  httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
+  // Apply configured ports
+  conf.httpd.server_port = cfg.httpsPort ? cfg.httpsPort : 443;
+  conf.httpd.uri_match_fn      = httpd_uri_match_wildcard;
+  conf.httpd.max_uri_handlers  = 4;
+  conf.httpd.stack_size        = 10240;
+  conf.httpd.lru_purge_enable  = true;
+  conf.httpd.max_open_sockets  = 2;    // max 2 concurrent TLS sessions (~64KB heap)
+  conf.httpd.backlog_conn      = 1;    // TCP backlog=1: reject excess connections early
+  conf.httpd.recv_wait_timeout = 10;
+  conf.httpd.send_wait_timeout = 10;
+  conf.session_tickets         = false;
+  // Log free heap before TLS start
+  dualPrint.printf("[HTTPS] Heap before TLS: %lu B\n", ESP.getFreeHeap());
+  // PEM: length MUST include null terminator for mbedTLS
+  // Apply TLS handshake callback for cipher/version configuration
+#ifdef ESP_TLS_SERVER_HANDSHAKE_CB
+  conf.tls_handshake_cb = tlsPreConfigCb;
+#endif
+  conf.servercert           = (const uint8_t*)s_tlsCertBuf;
+  conf.servercert_len       = strlen(s_tlsCertBuf) + 1;
+  conf.prvtkey_pem          = (const uint8_t*)s_tlsKeyBuf;
+  conf.prvtkey_len          = strlen(s_tlsKeyBuf) + 1;
+  // Note: encrypted private key passphrase requires manual decryption
+  // ESP-IDF esp_https_server does not support encrypted keys directly
+  // Use unencrypted key or decrypt with openssl before placing on SD
+  esp_err_t ret = httpd_ssl_start(&httpsHandle, &conf);
+  if (ret != ESP_OK) {
+    dualPrint.printf("[HTTPS] Failed: %s\n", esp_err_to_name(ret));
+    httpsHandle = nullptr; return false;
+  }
+  httpd_register_uri_handler(httpsHandle, &httpsDownloadUri); // direct, no proxy
+  httpd_register_uri_handler(httpsHandle, &httpsUploadUri); // direct, no proxy
+  httpd_register_uri_handler(httpsHandle, &_httpsGet);
+  httpd_register_uri_handler(httpsHandle, &_httpsPost);
+  httpd_register_uri_handler(httpsHandle, &_httpsPut);
+  dualPrint.println(F("[HTTPS] Started on port 443"));
+  return true;
+}
+
+void stopHttpsServer() {
+  if (!httpsHandle) return;
+  httpd_ssl_stop(httpsHandle);
+  httpsHandle = nullptr;
+  dualPrint.println(F("[HTTPS] Stopped"));
+}
+
+// HTTP→HTTPS redirect (called by onNotFound when httpsEnabled and no proxy header)
+void handleHttpRedirect() {
+  // Pass-through for internal proxy requests
+  // If request has X-Internal-Proxy header, serve normally via 404
+  if (httpServer.hasHeader("X-Internal-Proxy") &&
+      httpServer.header("X-Internal-Proxy") == "1") { 
+    httpServer.send(404, "text/plain", "Not found");
+    return;
+  }
+  String host = httpServer.hostHeader();
+  if (!host.length()) host = WiFi.localIP().toString();
+  // Remove port from host if present
+  int col = host.lastIndexOf(':');
+  if (col > 0 && col > host.lastIndexOf(']')) host = host.substring(0, col);
+  String url = "https://" + host + httpServer.uri();
+  if (httpServer.args()) {
+    url += "?";
+    for (int i = 0; i < httpServer.args(); i++) {
+      if (i) url += "&";
+      url += httpServer.argName(i) + "=" + httpServer.arg(i);
+    }
+  }
+  httpServer.sendHeader("Location", url, true);
+  httpServer.send(301, "text/plain", "Redirecting to HTTPS");
+}
+
 void setupWebServer() {
+  // Recreate WebServer with configured port
+  uint16_t hport = cfg.httpPort ? cfg.httpPort : 80;
+  httpServer.~WebServer();
+  new (&httpServer) WebServer(hport);
   httpServer.on("/",                 HTTP_GET,  handleRoot);
   httpServer.on("/api/status",       HTTP_GET,  handleApiStatus);
   httpServer.on("/api/log",          HTTP_GET,  handleApiLog);
@@ -1968,10 +2595,16 @@ void setupWebServer() {
   httpServer.on("/api/audio/volume", HTTP_GET,  handleApiAudioVolume);
   httpServer.on("/api/audio/mute",   HTTP_GET,  handleApiAudioMute);
   httpServer.on("/api/audio/seek",   HTTP_GET,  handleApiAudioSeek);
+  static const char* hdrs[] = {"X-Internal-Proxy", "Authorization", "Content-Type", "Host"};
+  httpServer.collectHeaders(hdrs, 4);
   httpServer.begin();
+  if (cfg.httpsEnabled) {
+    httpServer.onNotFound(handleHttpRedirect);
+    startHttpsServer();
+    dualPrint.printf("[OK]  HTTPS started at https://%s\n", WiFi.localIP().toString().c_str());
+  }
   dualPrint.printf("[OK]  HTTP server started at http://%s\n", WiFi.localIP().toString().c_str());
 }
-
 // =============================================================================
 //  UART CLI
 // =============================================================================
@@ -2014,7 +2647,18 @@ void printConfig(bool showRuntime = true) {
   dualPrint.printf("  Audio module  : %s\n",  cfg.audioModule ? "PCM5102 enabled" : "disabled");
   dualPrint.printf("  Web auth      : %s\n",  cfg.webAuth ? "enabled" : "disabled (no login required)");
   if (cfg.webAuth) dualPrint.printf("  Web user      : %s\n", cfg.webUser);
-  dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "enabled (no USB re-enum on mount)" : "disabled");
+  dualPrint.printf("  HTTPS         : %s\n", cfg.httpsEnabled ? "enabled (port 443)" : "disabled");
+  if (cfg.httpsEnabled) {
+    dualPrint.printf("  HTTPS cert    : %s\n", strlen(cfg.httpsCertPath) ? cfg.httpsCertPath : "(not set)");
+    dualPrint.printf("  HTTPS key     : %s\n", strlen(cfg.httpsKeyPath)  ? cfg.httpsKeyPath  : "(not set)");
+  dualPrint.printf("  HTTP port     : %u\n", cfg.httpPort  ? cfg.httpPort  : 80);
+  dualPrint.printf("  HTTPS port    : %u\n", cfg.httpsPort ? cfg.httpsPort : 443);
+  dualPrint.printf("  TLS version   : %s\n", cfg.tlsMinVer==0?"TLS 1.2 only":"TLS 1.2 + 1.3");
+  dualPrint.printf("  TLS ciphers   : %s\n", cfg.tlsCiphers==1?"Strong/GCM":cfg.tlsCiphers==2?"Medium/CBC":cfg.tlsCiphers==3?"All/Legacy":"Auto");
+  }
+  dualPrint.println(F(""));
+  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
+  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled" : "disabled");
   printSep();
   if (!showRuntime) return;
   dualPrint.println(F("  RUNTIME STATE"));
@@ -2161,13 +2805,32 @@ void printStatus() {
   }
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Web & HTTPS ──────────────────────────────────┐"));
+  dualPrint.printf("  Web auth      : %s\n", cfg.webAuth ? "enabled" : "disabled");
+  dualPrint.printf("  HTTPS         : %s\n", cfg.httpsEnabled ?
+                   (httpsHandle ? "enabled + running (port 443)" : "enabled (start failed)") :
+                   "disabled");
+  if (cfg.httpsEnabled) {
+    dualPrint.printf("  TLS cert      : %s\n", strlen(cfg.httpsCertPath) ? cfg.httpsCertPath : "(not set)");
+    dualPrint.printf("  TLS key       : %s\n", strlen(cfg.httpsKeyPath)  ? cfg.httpsKeyPath  : "(not set)");
+  }
+  dualPrint.printf("  HTTP port     : %u\n", cfg.httpPort  ? cfg.httpPort  : 80);
+  dualPrint.printf("  HTTPS port    : %u\n", cfg.httpsPort ? cfg.httpsPort : 443);
+  dualPrint.printf("  TLS version   : %s\n", cfg.tlsMinVer==0?"TLS 1.2 only":"TLS 1.2 + 1.3");
+  dualPrint.printf("  TLS ciphers   : %s\n", cfg.tlsCiphers==1?"Strong/GCM":cfg.tlsCiphers==2?"Medium/CBC":cfg.tlsCiphers==3?"All/Legacy":"Auto");
+  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled" : "disabled");
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F("  ┌─ System ───────────────────────────────────────┐"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ Other Settings ───────────────────────────────┐"));
+  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
   dualPrint.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
   dualPrint.printf("  Uptime        : %lu s\n", millis()/1000);
   dualPrint.printf("  CPU freq      : %u MHz\n", getCpuFrequencyMhz());
   dualPrint.printf("  Flash size    : %u MB\n", ESP.getFlashChipSize()/(1024*1024));
   dualPrint.printf("  SDK version   : %s\n", ESP.getSdkVersion());
-  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
 }
@@ -2201,7 +2864,20 @@ void printHelp() {
   dualPrint.println(F("  set web-auth on|off       Enable/disable HTTP Basic Auth (default: off)"));
   dualPrint.println(F("  set web-user <name>       Web UI username (default: admin)"));
   dualPrint.println(F("  set web-pass <password>   Web UI password (default: admin)"));
-  dualPrint.println(F("  set dos-compat on|off     DOS compatibility mode (no USB re-enum on mount)"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ DOS Compatibility ─────────────────────────────┐"));
+  dualPrint.println(F("  set dos-compat on|off     DOS mode (no USB re-enum on disc swap)"));
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+  dualPrint.println(F("  ┌─ HTTPS / TLS ───────────────────────────────────┐"));
+  dualPrint.println(F("  set https-enable on|off   Enable HTTPS on port 443"));
+  dualPrint.println(F("  set https-cert <path>     SD path to TLS server certificate (.pem)"));
+  dualPrint.println(F("  set https-key  <path>     SD path to TLS server private key (.pem)"));
+  dualPrint.println(F("  set http-port <port>      HTTP server port (default: 80, reboot required)"));
+  dualPrint.println(F("  set https-port <port>     HTTPS server port (default: 443)"));
+  dualPrint.println(F("  set tls-ver <0|1>         0=TLS1.2 only  1=TLS1.2+1.3"));
+  dualPrint.println(F("  set tls-ciphers <0-3>     0=Auto 1=Strong/GCM 2=Medium/CBC 3=All/Legacy"));
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
   dualPrint.println(F("  ┌─ Commands ─────────────────────────────────────┐"));
@@ -2339,7 +3015,15 @@ void processCommand(String &line) {
     else if (key=="eap-kpass") strlcpy(cfg.eapKeyPass,  val.c_str(), sizeof(cfg.eapKeyPass));
     else if (key=="audio-module") { String v=val; v.toLowerCase(); cfg.audioModule=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="web-auth")  { String v=val; v.toLowerCase(); cfg.webAuth=(v=="on"||v=="1"||v=="yes"); }
-    else if (key=="dos-compat") { String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="dos-compat")   { String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="https-enable")  { String v=val; v.toLowerCase(); cfg.httpsEnabled=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="https-cert")    { strlcpy(cfg.httpsCertPath, val.c_str(), sizeof(cfg.httpsCertPath)); }
+    else if (key=="https-key")     { strlcpy(cfg.httpsKeyPath,  val.c_str(), sizeof(cfg.httpsKeyPath)); }
+    else if (key=="https-kpass")   { strlcpy(cfg.httpsKeyPass,  val.c_str(), sizeof(cfg.httpsKeyPass)); }
+    else if (key=="http-port")    { cfg.httpPort  = (uint16_t)constrain(val.toInt(),1,65535); }
+    else if (key=="https-port")   { cfg.httpsPort = (uint16_t)constrain(val.toInt(),1,65535); }
+    else if (key=="tls-ver")      { cfg.tlsMinVer = (uint8_t)constrain(val.toInt(),0,1); }
+    else if (key=="tls-ciphers")  { cfg.tlsCiphers= (uint8_t)constrain(val.toInt(),0,3); }
     else if (key=="web-user")  { strlcpy(cfg.webUser, val.c_str(), sizeof(cfg.webUser)); }
     else if (key=="web-pass")  { strlcpy(cfg.webPass, val.c_str(), sizeof(cfg.webPass)); }
     else { dualPrint.printf("[ERR] Unknown key: '%s'\n", key.c_str()); ok=false; }

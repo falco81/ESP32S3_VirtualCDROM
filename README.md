@@ -26,6 +26,7 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [802.1x Enterprise Wi-Fi (EAP)](#8021x-enterprise-wi-fi-eap)
 - [DOS Compatibility Mode](#dos-compatibility-mode)
 - [Web UI Authentication](#web-ui-authentication)
+- [HTTPS / TLS](#https--tls)
 - [Audio CD Playback](#audio-cd-playback)
 - [Supported Disc Image Formats](#supported-disc-image-formats)
 - [Python Scripts](#python-scripts)
@@ -49,6 +50,8 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - **Serial CLI** — complete configuration and diagnostics at 115 200 baud
 - **exFAT SD cards** — supported after applying the `build_exfat_libs.py` patch
 - **Web UI authentication** — HTTP Basic Auth, enable/disable, username/password via web or CLI, disabled by default
+- **HTTPS / TLS** — optional encrypted HTTPS on port 443; certificate and key loaded from SD card; HTTP auto-redirects to HTTPS; ESP32-S3 hardware AES/SHA/RSA acceleration
+- **HTTPS / TLS** — optional encrypted HTTPS on port 443; certificate and key loaded from SD card; HTTP auto-redirects; hardware AES/SHA/RSA acceleration on ESP32-S3
 - **Bidirectional audio sync** — PC controls playback via SCSI, HTML syncs within 400 ms
 - **RGB LED** — boot / Wi-Fi / error state indication
 
@@ -457,6 +460,7 @@ Available at `http://cd.local` or via the device IP address.
 - **Network** -- DHCP/Static, IP/mask/gateway/DNS, Hostname with live mDNS preview
 - **802.1x Enterprise WiFi** -- EAP Mode, identity, **Scan SD** for auto-detection of `.pem/.crt/.key` files, CA cert, Client cert/key, passphrase
 - **Audio Module** -- PCM5102 I2S enable/disable dropdown
+- **HTTPS / TLS** — optional HTTPS on port 443 with certificate from SD card; HTTP auto-redirects to HTTPS; hardware AES/SHA/RSA acceleration
 - **DOS Compatibility Mode** -- UNIT ATTENTION instead of USB re-enum on mount/eject
 - **Web UI Authentication** -- enable/disable HTTP Basic Auth, username, password (write-only)
 - **Actions** -- Save, Reboot, Factory reset, SD unmount/mount
@@ -605,6 +609,68 @@ show config              # verify: Web auth: enabled
 Password is **write-only** -- the API never returns it. Changes take effect immediately, no reboot needed.
 
 ---
+
+## HTTPS / TLS
+
+The web interface can be served over HTTPS (port 443) using a certificate and private key stored on the SD card.
+
+### Enable HTTPS
+
+**Via web Config tab → HTTPS / TLS:**
+1. Set **HTTPS on port 443** → Enabled
+2. Click **Scan SD** to find `.pem` / `.crt` / `.key` files on the SD card
+3. Select **Server certificate** and **Server private key**
+4. Click **Save** → reboot
+
+**Via serial CLI:**
+```
+set https-enable on
+set https-cert /certs/server.crt
+set https-key  /certs/server.key
+reboot
+```
+
+### Generate a self-signed certificate
+
+Run in WSL / Linux:
+```bash
+openssl req -x509 -newkey rsa:2048 \
+  -keyout /tmp/server.key -out /tmp/server.crt \
+  -days 3650 -nodes \
+  -subj "/CN=192.168.1.100" \
+  -addext "subjectAltName=IP:192.168.1.100,DNS:cd.local"
+```
+
+> **Use your actual ESP32 IP address** in `-subj` and `-addext`. Modern browsers require `subjectAltName` to include the IP address or hostname used to connect.
+
+> **RSA 2048-bit only.** RSA 4096-bit causes TLS handshake failure on ESP32 due to memory constraints.
+
+Copy the files to the SD card (e.g. `/certs/`) and configure the paths in the web interface or via CLI.
+
+### Behaviour
+
+- When HTTPS is enabled, HTTP (port 80) automatically redirects all requests to `https://`.
+- Browsers will show a certificate warning for self-signed certificates — click **Advanced → Proceed** to continue.
+- Upload and download use direct TLS streaming (no proxy overhead).
+- All other API requests go through an internal loopback proxy.
+
+### Performance note
+
+HTTPS reduces transfer speed **2–4× compared to HTTP** due to TLS encryption and internal proxy overhead (ESP32-S3 hardware AES/SHA acceleration is used, but loopback TCP still adds latency):
+
+| Protocol | Upload / Download speed |
+|---|---|
+| HTTP  | ~10 Mbps (SD write limited) |
+| HTTPS | ~2–4 Mbps |
+
+For large file transfers (ISO images, BIN tracks) use HTTP or copy the SD card directly to a PC.
+
+### Hardware acceleration
+
+The ESP32-S3 includes hardware accelerators for AES, SHA and RSA — verified at startup:
+```
+[HTTPS] HW crypto: AES=ON SHA=ON RSA=ON
+```
 
 ## Audio CD Playback
 
