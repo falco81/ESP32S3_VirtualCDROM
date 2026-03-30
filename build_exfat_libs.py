@@ -449,8 +449,8 @@ def patch_usbmsc(path):
             src = src[:tur_start] + new_tur + src[tur_end:]
             print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION')
 
-    if 'CD-ROM SCSI patched v8' in src or 'scsi_audio_play' in src:
-        print("  Already patched v8")
+    if 'CD-ROM SCSI patched v9' in src or 'scsi_audio_play' in src:
+        print("  Already patched v9")
         return True
 
     func_start = src.find('int32_t tud_msc_scsi_cb(')
@@ -563,7 +563,8 @@ def patch_usbmsc(path):
         "        if(!subq){ b[2]=0;b[3]=0; return 4; } /* SubQ=0: header only */\n"
         "        /* Sub-channel data block (12 bytes) per TABLE 2-27F */\n"
         "        b[2]=0; b[3]=12; /* sub-channel data length */\n"
-        "        b[4]=0x01; /* format code: current position */\n"
+        "        uint8_t fmt=scsi_cmd[3]; /* sub-channel data format from CDB */\n"
+        "        b[4]=(fmt<=0x03)?fmt:0x01; /* return requested format code */\n"
         "        /* b[5] = ADR|Control: ADR=1 (current pos), Control=0 (audio, no pre-emph, no copy) */\n"
         "        b[5]=0x10; /* ADR=1<<4 | Control=0 */\n"
         "        uint8_t sub[8]={}; scsi_audio_subchannel(sub);\n"
@@ -587,11 +588,15 @@ def patch_usbmsc(path):
 "          uint32_t l=(uint32_t)(m*60+s)*75+f; return l>=150?l-150:0;};\n"
         "        uint32_t s=msf2lba(scsi_cmd[3],scsi_cmd[4],scsi_cmd[5]);\n"
         "        uint32_t e=msf2lba(scsi_cmd[6],scsi_cmd[7],scsi_cmd[8]);\n"
-        "        if(e==0||e<=s)e=cdromBlockCount_get();\n"
+        "        /* SCSI-2 §14.2.4: start==end → no-op; start>end → error */\n"
+        "        if(s==e) return 0;\n"
+        "        if(s>e) return setSense(0x05,0x24,0x00);\n"
+        "        if(e==0) e=cdromBlockCount_get();\n"
         "        _audioPlayedOnce=false; scsi_audio_play(s,e); return 0;\n"
         "      }\n"
-        "      case 0x48: { /* PLAY AUDIO TRACK INDEX */\n"
-        "        uint8_t st=scsi_cmd[4],et=scsi_cmd[6];\n"
+        "      case 0x48: { /* PLAY AUDIO TRACK INDEX per SCSI-2 Table 243 */\n"
+        "        /* byte4=startTrack, byte5=startIdx, byte7=endTrack, byte8=endIdx */\n"
+        "        uint8_t st=scsi_cmd[4],et=scsi_cmd[7];\n"
         "        uint32_t sl=0,el=0,tmp=0;\n"
         "        scsi_audio_track_info(st,&sl,&tmp);\n"
         "        if(scsi_audio_track_info(et,&el,&tmp))el+=tmp;\n"
@@ -640,6 +645,18 @@ def patch_usbmsc(path):
         "        else if(!start){ /* spin down = stop audio */ scsi_audio_stop(); }\n"
         "        /* start=1: spin up, no-op for virtual drive */\n"
         "        } return 0;}\n"
+        "      case 0xA9:{ /* PLAY AUDIO TRACK RELATIVE(12) per SCSI-2 Table 245 */\n"
+        "        /* bytes 2-5: TRLBA (signed), bytes 6-9: transferLen, byte 10: startTrack */\n"
+        "        int32_t trlba=(int32_t)(((uint32_t)scsi_cmd[2]<<24)|((uint32_t)scsi_cmd[3]<<16)|\n"
+        "                                ((uint32_t)scsi_cmd[4]<<8)|scsi_cmd[5]);\n"
+        "        uint32_t tlen=((uint32_t)scsi_cmd[6]<<24)|((uint32_t)scsi_cmd[7]<<16)|\n"
+        "                      ((uint32_t)scsi_cmd[8]<<8)|scsi_cmd[9];\n"
+        "        uint8_t trk=scsi_cmd[10];\n"
+        "        uint32_t tstart=0,tlenBlocks=0;\n"
+        "        if(!scsi_audio_track_info(trk,&tstart,&tlenBlocks)){return setSense(0x05,0x21,0x00);}\n"
+        "        uint32_t abs_start=(uint32_t)((int32_t)tstart+trlba);\n"
+        "        if(tlen==0) return 0;\n"
+        "        _audioPlayedOnce=false; scsi_audio_play(abs_start,abs_start+tlen); return 0;}\n"
         "      case 0xA5:{ /* PLAY AUDIO(12) - same as 45h but 32-bit len */\n"
         "        uint32_t lba=((uint32_t)scsi_cmd[2]<<24)|((uint32_t)scsi_cmd[3]<<16)|\n"
         "                     ((uint32_t)scsi_cmd[4]<<8)|scsi_cmd[5];\n"
