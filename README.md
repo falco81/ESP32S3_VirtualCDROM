@@ -31,6 +31,7 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [API Reference](#api-reference)
 - [RGB LED Status Codes](#rgb-led-status-codes)
 - [Troubleshooting](#troubleshooting)
+- [Building and Flashing Without Arduino IDE](#building-and-flashing-without-arduino-ide)
 - [Project Files](#project-files)
 
 ---
@@ -578,7 +579,9 @@ Or via the web Config tab.
 
 ### How It Works
 
-The CUE parser extracts audio tracks and their LBA positions. A FreeRTOS audio task on core 0 reads raw PCM sectors from BIN files (2352 B/sector, skip 16 B header), applies software gain, and streams the data to I2S DMA -> PCM5102 -> line out. The PC controls playback via SCSI commands (READ TOC, PLAY AUDIO LBA/MSF, PAUSE/RESUME, STOP, READ SUB-CHANNEL).
+The CUE parser extracts audio tracks and their LBA positions. For **separate BIN file** layout (e.g. Tomb Raider -- one `.bin` per track), the parser computes *virtual disc LBAs*: the data track occupies LBA 0 to N-1, audio tracks follow sequentially. This is what gets reported in READ TOC so the SCSI host sees correct track positions and durations. Each BIN file is seeked to `(virtualLba - trackStart + pregap) * 2352` bytes for accurate playback.
+
+A FreeRTOS audio task on core 0 reads raw PCM sectors from BIN files (2352 B/sector, skip 16 B header), applies software gain, and streams the data to I2S DMA -> PCM5102 -> line out. The PC controls playback via SCSI commands (READ TOC, PLAY AUDIO LBA/MSF/TRACK, PAUSE/RESUME, STOP, READ SUB-CHANNEL). READ TOC reports virtual disc LBAs with the standard 150-sector pregap offset so SCSI players show correct track positions and durations.
 
 Games such as Tomb Raider, Quake, and Need for Speed communicate with the firmware transparently as if it were a real optical drive.
 
@@ -601,7 +604,8 @@ The PCM5102 output is line level (~2 Vrms). Connect to **line-in** (AUX), not to
 | Raw MODE1/2352 | `.bin` | 2352 B | 16 |
 | Raw MODE2/2352 | `.bin` | 2352 B | 24 |
 | Raw MODE2/2336 | `.bin` | 2336 B | 8 |
-| CUE sheet | `.cue` | Per CUE | Per CUE |
+| CUE sheet (single BIN) | `.cue` | Per CUE | Per CUE |
+| CUE sheet (separate BIN per track) | `.cue` | 2352 B | 16 or 24 B |
 
 ---
 
@@ -705,6 +709,18 @@ python patch_usbmsc.py
 3. Restart Arduino IDE
 4. Recompile
 
+### SCSI player shows wrong track durations or thousands of hours total
+
+This happens when the CUE image uses separate BIN files per track (e.g. Tomb Raider). The firmware assigns virtual disc LBAs after parsing -- check serial output for confirmation:
+
+```
+[CUE] Data track sectors from file: 146011
+[CUE] Virtual disc LBAs assigned, lead-out LBA=215612
+[CUE] Track 02: LBA 146011  len 14593  (~194s)
+```
+
+If you see `LBA 0` for all audio tracks, re-flash with the latest firmware which includes the virtual LBA fix.
+
 ### Audio tab is always greyed out after page load
 
 - The tab activates within 3 seconds of page load (background poll)
@@ -727,6 +743,18 @@ Common causes:
 - EAP identity not present in RADIUS `radcheck` table
 - Certificate uses SHA-512 (not supported by ESP32 mbedTLS) -- regenerate with SHA-256
 - Encrypted private key without `eap-kpass` configured
+
+### Flash script says "Python not found" (Windows)
+
+Install Python 3 from https://www.python.org/downloads/ — during installation tick **"Add Python to PATH"**.
+
+### Flash script fails with timeout
+
+The device may not be in download mode:
+1. Hold the **BOOT** button on the ESP32-S3
+2. Press and release **RESET**
+3. Release **BOOT**
+4. Run the flash script immediately
 
 ### Forgotten web UI password
 
@@ -769,6 +797,105 @@ python3 build_exfat_libs.py --arduino15 "/mnt/c/Users/OtherName/AppData/Local/Ar
 
 ---
 
+## Building and Flashing Without Arduino IDE
+
+Once you have compiled the firmware at least once (with all patches applied), you can export the binary and distribute it so other users can flash the device without installing Arduino IDE or running any build scripts.
+
+---
+
+### Exporting the Compiled Binary from Arduino IDE
+
+After a successful compile, go to **Sketch -> Export Compiled Binary**.
+
+Arduino IDE creates a `build/` subfolder in the sketch directory. The file you need for distribution is:
+
+```
+build/esp32.esp32.esp32s3/ESP32S3_VirtualCDROM.ino.merged.bin
+```
+
+This is a **single merged image** (16 MB) containing the bootloader, partition table, boot stub and firmware at the correct offsets. Rename it to `firmware_merged.bin` for distribution.
+
+> The `merged.bin` is all you need -- no separate bootloader/partitions/boot_app0 files required.
+
+---
+
+### Flash Address
+
+| File | Address |
+|---|---|
+| `firmware_merged.bin` | `0x0000` |
+
+The merged image is pre-assembled at the correct internal offsets. Flash it to address `0x0` and you are done.
+
+---
+
+### Flashing with the Included Scripts
+
+Place `firmware_merged.bin` in the same folder as the flash scripts and run:
+
+**Windows** -- double-click `flash_windows.bat`
+
+**Linux / macOS:**
+```bash
+chmod +x flash_linux.sh
+./flash_linux.sh
+```
+
+Both scripts automatically install `esptool` via pip if it is not already available.
+
+**Important:** Always use the **LEFT** USB connector (UART/CH343) for flashing. The right connector is OTG and cannot be used for programming.
+
+---
+
+### Flashing with ESP Flash Download Tool (GUI, Windows)
+
+Download from: https://www.espressif.com/en/support/download/other-tools
+
+Settings:
+- **Chip**: ESP32-S3
+- **SPI Speed**: 80 MHz
+- **SPI Mode**: DIO
+- **Flash Size**: 16 MB (128 Mb)
+
+Add one file: `firmware_merged.bin` at address `0x0000`, then click **START**.
+
+---
+
+### Troubleshooting Flash
+
+**Port not detected:**
+- Install the CH343 driver: https://www.wch-ic.com/products/CH343.html
+- On Linux: `sudo chmod a+rw /dev/ttyUSB0`
+
+**Flash fails / timeout:**
+1. Hold the **BOOT** button on the ESP32-S3
+2. Press and release **RESET**
+3. Release **BOOT**
+4. Run the flash script immediately -- the device is now in download mode
+
+**After flashing:**
+1. Disconnect the UART cable
+2. Connect the OTG USB cable (right connector) to your target PC
+3. Open `http://espcd.local` in a browser
+4. Configure Wi-Fi in the Config tab
+
+---
+
+### GitHub Release Structure
+
+When publishing a release, include:
+```
+release/
+├── firmware_merged.bin   <- complete firmware image (single file, 16 MB)
+├── flash_windows.bat     <- Windows flash script (double-click)
+└── flash_linux.sh        <- Linux/macOS flash script
+```
+
+Upload the folder as a `.zip` file attached to the GitHub Release.
+
+---
+
+
 ## Project Files
 
 | File | Description |
@@ -778,6 +905,8 @@ python3 build_exfat_libs.py --arduino15 "/mnt/c/Users/OtherName/AppData/Local/Ar
 | `partitions.csv` | Custom partition table (6 MB app) |
 | `build_exfat_libs.py` | exFAT + USBMSC patch script -- run in WSL |
 | `patch_usbmsc.py` | Standalone USBMSC patch -- run on Windows |
+| `flash_windows.bat` | Windows flash script -- double-click to flash |
+| `flash_linux.sh` | Linux/macOS flash script |
 | `doc/arduino_ide_settings.png` | Arduino IDE settings screenshot |
 | `doc/esp32s3.png` | ESP32-S3 DevKitC-1 board photo |
 | `doc/GY-PCM5102.png` | GY-PCM5102 I2S module photo |
