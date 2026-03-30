@@ -43,8 +43,8 @@
 #include "SD_MMC.h"
 #include <Adafruit_NeoPixel.h>
 #include "USB.h"
-#include "soc/usb_serial_jtag_reg.h"  // disable USB-Serial/JTAG peripheral
 #include "USBMSC.h"
+#include <driver/i2s_std.h>       // PCM5102 audio output
 extern "C" { bool tud_disconnect(void); bool tud_connect(void); }
 
 // =============================================================================
@@ -56,7 +56,55 @@ extern "C" { bool tud_disconnect(void); bool tud_connect(void); }
 #define SD_MISO_PIN  13
 #define RGB_LED_PIN  48
 
+// I2S pins for PCM5102 module
+#define I2S_BCK_PIN   14    // Bit clock  (PCM5102 BCK)
+#define I2S_WS_PIN    15    // Word select (PCM5102 LCK)
+#define I2S_DATA_PIN  16    // Data out   (PCM5102 DIN)
+
 // =============================================================================
+//  AUDIO TRACK TABLE
+//  Populated by parseCue() when a CUE sheet is mounted.
+//  Audio sectors are raw 16-bit signed stereo LE at 44100 Hz, 2352 B/sector.
+//  The first 16 bytes of each sector are the sync/address header (ignored).
+// =============================================================================
+#define MAX_AUDIO_TRACKS 16
+
+struct AudioTrack {
+  uint8_t  number;          // Track number (1-based)
+  uint32_t startLba;        // First LBA of this track (relative to whole disc)
+  uint32_t lengthSectors;   // Track length in sectors
+  String   binFile;         // Full SD path to the .bin file for this track
+  bool     valid;
+};
+
+// Global audio track table — filled by parseCue, cleared on umount
+static AudioTrack audioTracks[MAX_AUDIO_TRACKS];
+static uint8_t    audioTrackCount = 0;
+static uint32_t   dataTrackEndLba = 0;  // LBA where data track ends
+
+// ── Playback state (accessed from SCSI callbacks and audio task) ──
+// All writes from a single core; reads from SCSI callback (core 0) are
+// safe because volatile + atomic uint32 reads are single-cycle on Xtensa.
+enum AudioPlayState { AUDIO_STOP = 0, AUDIO_PLAY = 1, AUDIO_PAUSE = 2 };
+volatile AudioPlayState audioState     = AUDIO_STOP;
+volatile uint32_t       audioCurrentLba = 0;   // current playback position
+volatile uint32_t       audioEndLba     = 0;   // stop when reaching this LBA
+static  TaskHandle_t    audioTaskHandle = nullptr;
+static  i2s_chan_handle_t i2sTx         = nullptr;
+static  int             audioVolume     = 80;  // 0-100, software gain
+static  bool            audioMuted      = false;
+
+// ── Sub-channel data (updated by audio task, read by SCSI READ SUB-CHANNEL) ──
+// MSF = Minutes:Seconds:Frames  (1 frame = 1 sector = 1/75 s)
+struct SubChannel {
+  uint8_t trackNum;
+  uint8_t indexNum;
+  uint8_t absM, absS, absF;   // absolute position on disc
+  uint8_t relM, relS, relF;   // position within current track
+};
+static volatile SubChannel subChannel = {};
+
+// ══════════════════════════════════════════════════════════════════
 //  GLOBAL OBJECTS
 // =============================================================================
 Preferences        prefs;
@@ -87,6 +135,10 @@ struct Config {
   char eapCertPath[64];    // SD path to client cert  e.g. /wifi/client.crt
   char eapKeyPath[64];     // SD path to client key   e.g. /wifi/client.key
   char eapKeyPass[64];     // Passphrase for encrypted private key (optional)
+  bool audioModule;        // true = PCM5102 I2S module connected and enabled
+  bool webAuth;            // true = HTTP Basic Auth enabled
+  char webUser[32];        // Web UI username (default: admin)
+  char webPass[64];        // Web UI password (default: admin)
 };
 Config cfg;
 
@@ -111,6 +163,10 @@ void loadConfig() {
   strlcpy(cfg.eapCertPath, prefs.getString("eapCert",  "").c_str(), sizeof(cfg.eapCertPath));
   strlcpy(cfg.eapKeyPath,  prefs.getString("eapKey",   "").c_str(), sizeof(cfg.eapKeyPath));
   strlcpy(cfg.eapKeyPass,  prefs.getString("eapKPass", "").c_str(), sizeof(cfg.eapKeyPass));
+  cfg.audioModule = prefs.getBool("audioMod", false);
+  cfg.webAuth = prefs.getBool("webAuth", false);
+  strlcpy(cfg.webUser, prefs.getString("webUser", "admin").c_str(), sizeof(cfg.webUser));
+  strlcpy(cfg.webPass, prefs.getString("webPass", "admin").c_str(), sizeof(cfg.webPass));
   prefs.end();
 }
 
@@ -135,6 +191,10 @@ void saveConfig() {
   PPUT("eapKey",   cfg.eapKeyPath);
   PPUT("eapKPass", cfg.eapKeyPass);
   #undef PPUT
+  prefs.putBool("audioMod", cfg.audioModule);
+  prefs.putBool("webAuth", cfg.webAuth);
+  prefs.putString("webUser", cfg.webUser);
+  prefs.putString("webPass", cfg.webPass);
   prefs.end();
 }
 
@@ -159,6 +219,10 @@ void clearConfig() {
   memset(cfg.eapCertPath,  0, sizeof(cfg.eapCertPath));
   memset(cfg.eapKeyPath,   0, sizeof(cfg.eapKeyPath));
   memset(cfg.eapKeyPass,   0, sizeof(cfg.eapKeyPass));
+  cfg.audioModule = false;
+  cfg.webAuth = false;
+  strlcpy(cfg.webUser, "admin", sizeof(cfg.webUser));
+  strlcpy(cfg.webPass, "admin", sizeof(cfg.webPass));
   defaultMount = "";
   Serial.println(F("[OK]  All NVS configuration cleared."));
 }
@@ -180,10 +244,8 @@ bool     mscMediaPresent = false;
 uint32_t mscBlockCount   = 0;
 uint16_t mscBlockSize    = 2048;
 
-// C-linkage block count for USBMSC.cpp READ TOC patch
-extern "C" {
-  uint32_t cdromBlockCount = 0;
-}
+// Block count shared with USBMSC.cpp patch (plain C++ — both TUs are C++)
+uint32_t cdromBlockCount = 0;
 
 bool initSD() {
   Serial.println(F("[SD]   Initializing SD_MMC (SDMMC hardware, 1-bit mode)"));
@@ -229,6 +291,21 @@ static uint8_t  binHeaderOffset  = 16;
 static uint16_t binRawSectorSize = 2352;
 static uint16_t binUserDataSize  = 2048;
 
+// Convert MSF string "MM:SS:FF" to LBA (sectors from start of disc)
+static uint32_t msfToLba(const String &msf) {
+  int m = msf.substring(0, 2).toInt();
+  int s = msf.substring(3, 5).toInt();
+  int f = msf.substring(6, 8).toInt();
+  return (uint32_t)(m * 60 * 75 + s * 75 + f);
+}
+
+// Convert absolute LBA to MSF components
+static void lbaToMsf(uint32_t lba, uint8_t &m, uint8_t &s, uint8_t &f) {
+  f = lba % 75; lba /= 75;
+  s = lba % 60; lba /= 60;
+  m = (uint8_t)lba;
+}
+
 String parseCue(const String &cuePath) {
   File cue = SD_MMC.open(cuePath.c_str(), FILE_READ);
   if (!cue) { Serial.printf("[CUE] Cannot open: %s\n", cuePath.c_str()); return ""; }
@@ -237,35 +314,138 @@ String parseCue(const String &cuePath) {
   int slash = dir.lastIndexOf('/');
   dir = (slash >= 0) ? dir.substring(0, slash) : "/";
 
+  // Clear audio track table
+  audioTrackCount = 0;
+  dataTrackEndLba = 0;
+  for (int i = 0; i < MAX_AUDIO_TRACKS; i++) audioTracks[i].valid = false;
+
   String dataTrackBin = "";
   String currentFile  = "";
   bool   foundData    = false;
-  binHeaderOffset = 16;  // default
+  binHeaderOffset = 16;
+
+  // Track parsing state
+  int     currentTrackNum  = 0;
+  bool    currentIsAudio   = false;
+  bool    currentIsData    = false;
+  String  pendingIndex01   = "";
+  uint32_t currentStartLba = 0;
+  uint32_t dataTrackLba    = 0;
+  uint32_t dataTrackSectors = 0;
+
+  // We need two passes: first to collect all INDEX 01 positions,
+  // then to compute lengths. Store intermediate info:
+  struct RawTrack { int num; bool audio; String file; uint32_t startLba; };
+  static RawTrack raw[MAX_AUDIO_TRACKS + 2];
+  int rawCount = 0;
 
   while (cue.available()) {
     String line = cue.readStringUntil('\n');
     line.trim();
+    String up = line; up.toUpperCase();
 
-    if (line.startsWith("FILE") || line.startsWith("file")) {
+    if (up.startsWith("FILE")) {
       int q1 = line.indexOf('"'), q2 = line.lastIndexOf('"');
       if (q1 >= 0 && q2 > q1) currentFile = line.substring(q1+1, q2);
     }
-
-    if ((line.startsWith("TRACK") || line.startsWith("track")) && currentFile.length()) {
-      String up = line; up.toUpperCase();
-      if ((up.indexOf("MODE1") >= 0 || up.indexOf("MODE2") >= 0) && !foundData) {
+    else if (up.startsWith("TRACK") && currentFile.length()) {
+      currentTrackNum = line.substring(6, 8).toInt();
+      currentIsAudio  = (up.indexOf("AUDIO") >= 0);
+      currentIsData   = (up.indexOf("MODE") >= 0);
+      if (currentIsData && !foundData) {
         dataTrackBin = (dir == "/") ? "/" + currentFile : dir + "/" + currentFile;
-        if      (up.indexOf("MODE1/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2352 -> header offset=16")); }
-        else if (up.indexOf("MODE2/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=24; binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2352 -> header offset=24")); }
-        else if (up.indexOf("MODE2/2336") >= 0) { binRawSectorSize=2336; binHeaderOffset=8;  binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2336 -> header offset=8")); }
-        else if (up.indexOf("MODE1/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2048 -> header offset=0")); }
-        else { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; Serial.printf("[CUE] Unknown mode in '%s' -> assuming MODE1/2352\n", line.c_str()); }
+        if      (up.indexOf("MODE1/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2352 -> offset=16")); }
+        else if (up.indexOf("MODE2/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=24; binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2352 -> offset=24")); }
+        else if (up.indexOf("MODE2/2336") >= 0) { binRawSectorSize=2336; binHeaderOffset=8;  binUserDataSize=2048; Serial.println(F("[CUE] MODE2/2336 -> offset=8")); }
+        else if (up.indexOf("MODE1/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; Serial.println(F("[CUE] MODE1/2048 -> offset=0")); }
+        else { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; }
         foundData = true;
-        Serial.printf("[CUE] Data track: %s\n", dataTrackBin.c_str());
+        Serial.printf("[CUE] Data track %d: %s\n", currentTrackNum, dataTrackBin.c_str());
       }
+    }
+    else if (up.startsWith("INDEX 01") && currentTrackNum > 0 && rawCount < MAX_AUDIO_TRACKS + 1) {
+      String msfStr = line.substring(9); msfStr.trim();
+      uint32_t lba = msfToLba(msfStr);
+      String fp = (dir == "/") ? "/" + currentFile : dir + "/" + currentFile;
+      raw[rawCount++] = { currentTrackNum, currentIsAudio, fp, lba };
     }
   }
   cue.close();
+
+  // Detect CUE layout type:
+  // Type A — single BIN file, all tracks share it, INDEX 01 = absolute disc LBA
+  // Type B — separate BIN per track, INDEX 01 is relative to that file (always ~LBA 150)
+  //          → length must come from individual file sizes, not LBA differences
+  bool separateFiles = false;
+  if (rawCount >= 2) {
+    // If two consecutive tracks have the same or near-equal startLba, they are separate files
+    for (int i = 0; i < rawCount - 1; i++) {
+      if (raw[i].startLba == raw[i+1].startLba || raw[i].file != raw[i+1].file) {
+        // Different files — Type B
+        if (raw[i].file != raw[i+1].file) { separateFiles = true; break; }
+      }
+    }
+  }
+
+  for (int i = 0; i < rawCount; i++) {
+    if (raw[i].audio) {
+      if (audioTrackCount < MAX_AUDIO_TRACKS) {
+        AudioTrack &at = audioTracks[audioTrackCount++];
+        at.number   = (uint8_t)raw[i].num;
+        at.binFile  = raw[i].file;
+        at.valid    = true;
+
+        if (separateFiles) {
+          // Each track in its own file — startLba within the file is from INDEX 01,
+          // but for playback we always read from byte 0 of the file (sector 0).
+          // INDEX 01 offset (e.g. 00:02:00 = 150 sectors pregap) is included in the file.
+          at.startLba = raw[i].startLba;  // pregap offset inside the file
+          // Length = total sectors in file
+          File af = SD_MMC.open(at.binFile.c_str());
+          if (af) {
+            uint64_t sz = af.size(); af.close();
+            at.lengthSectors = (uint32_t)(sz / 2352);
+          } else {
+            at.lengthSectors = 0;
+          }
+        } else {
+          // Single BIN — INDEX 01 is absolute disc LBA
+          at.startLba = raw[i].startLba;
+          uint32_t nextLba = (i + 1 < rawCount) ? raw[i+1].startLba : 0xFFFFFFFF;
+          at.lengthSectors = (nextLba != 0xFFFFFFFF) ? (nextLba - at.startLba) : 0;
+        }
+
+        Serial.printf("[CUE] Audio track %02d: LBA %lu  len %lu  (%s)\n",
+                      at.number, at.startLba, at.lengthSectors, at.binFile.c_str());
+      }
+    } else {
+      dataTrackLba = raw[i].startLba;
+      if (!separateFiles) {
+        uint32_t nextLba = (i + 1 < rawCount) ? raw[i+1].startLba : 0xFFFFFFFF;
+        if (nextLba != 0xFFFFFFFF) {
+          dataTrackSectors = nextLba - raw[i].startLba;
+          dataTrackEndLba  = raw[i].startLba + dataTrackSectors;
+        }
+      }
+    }
+  }
+
+  // Last track in single-BIN: length from file size
+  if (!separateFiles && audioTrackCount > 0) {
+    AudioTrack &last = audioTracks[audioTrackCount - 1];
+    if (last.lengthSectors == 0) {
+      File af = SD_MMC.open(last.binFile.c_str());
+      if (af) {
+        uint64_t sz = af.size(); af.close();
+        last.lengthSectors = (uint32_t)(sz / 2352) - last.startLba;
+      }
+    }
+  }
+
+  if (audioTrackCount > 0)
+    Serial.printf("[CUE] %d audio track(s) found  (layout: %s)\n",
+                  audioTrackCount, separateFiles ? "separate BIN files" : "single BIN");
+
   if (!foundData) Serial.println(F("[CUE] No data track found!"));
   return dataTrackBin;
 }
@@ -338,11 +518,13 @@ bool doMount(const String &filename) {
 }
 
 void doUmount() {
+  audioStop();
   mscMediaPresent = false;
   msc.mediaPresent(false);
   closeIso();
   mountedFile = ""; mountedBlocks = 0;
   mscBlockCount = 0; cdromBlockCount = 0;
+  audioTrackCount = 0; dataTrackEndLba = 0;
   msc.begin(1, 2048);
   tud_disconnect(); delay(300); tud_connect();
   Serial.println(F("[OK]  CD-ROM ejected."));
@@ -426,18 +608,6 @@ static int32_t mscWriteCb(uint32_t lba, uint32_t offset, uint8_t *buf, uint32_t 
 
 static void mscFlushCb(void) {}
 
-// Disable the USB Serial/JTAG peripheral so it does not enumerate on the host.
-// On ESP32-S3 both the JTAG controller and the USB OTG (TinyUSB) share one
-// physical USB port. The JTAG controller is active from power-on by default.
-// Clearing USB_PAD_ENABLE disconnects it from the D+/D- pads immediately,
-// preventing the host from ever seeing the JTAG device.
-// This must run as early as possible — called from setup() before USB.begin().
-static void disableUsbJtag() {
-  // Clear USB_SERIAL_JTAG_USB_PAD_ENABLE bit — detaches JTAG from USB pads
-  REG_CLR_BIT(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_USB_PAD_ENABLE);
-  Serial.println(F("[USB]  JTAG peripheral disabled (USB pads released to OTG)."));
-}
-
 void initUSBMSC() {
   msc.vendorID("ESP32-S3");
   msc.productID("VirtualCDROM");
@@ -445,24 +615,264 @@ void initUSBMSC() {
   msc.onRead(mscReadCb);
   msc.onWrite(mscWriteCb);
   msc.isWritable(false);
-  msc.begin(1, 2048);
+  msc.begin(1, 2048);       // dummy - updated on mount
   msc.mediaPresent(false);
-  disableUsbJtag();  // Detach JTAG from USB pads before USB.begin()
   USB.begin();
-  // Immediately disconnect — keep D+ low until a disc image is ready.
-  // Without this the host (especially Windows 9x) sees an empty MSC device,
-  // then a disconnect/reconnect once the ISO mounts, causing re-enumeration chaos.
-  delay(50);
-  tud_disconnect();
-  Serial.println(F("[OK]  USB MSC initialized (disconnected until disc ready)."));
+  Serial.println(F("[OK]  USB MSC CD-ROM initialized (no disc)."));
 }
 
-// Call once after a disc image has been mounted to present the drive to the host.
-void usbConnect() {
-  tud_disconnect(); delay(200);
-  tud_connect();
-  Serial.println(F("[USB]  Connected to host."));
+
+// =============================================================================
+//  I2S / PCM5102 AUDIO
+// =============================================================================
+
+// Initialize I2S peripheral for PCM5102
+// 44100 Hz, 16-bit signed, stereo, I2S Philips standard
+void initI2S() {
+  if (!cfg.audioModule) {
+    Serial.println(F("[I2S]  Audio module disabled — I2S not initialized."));
+    return;
+  }
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  chan_cfg.auto_clear = true;
+  if (i2s_new_channel(&chan_cfg, &i2sTx, nullptr) != ESP_OK) {
+    Serial.println(F("[I2S]  Failed to create channel!")); return;
+  }
+  i2s_std_config_t std_cfg = {
+    .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
+    .gpio_cfg = {
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_BCK_PIN,
+      .ws   = (gpio_num_t)I2S_WS_PIN,
+      .dout = (gpio_num_t)I2S_DATA_PIN,
+      .din  = I2S_GPIO_UNUSED,
+      .invert_flags = { .mclk_inv=false, .bclk_inv=false, .ws_inv=false }
+    }
+  };
+  if (i2s_channel_init_std_mode(i2sTx, &std_cfg) != ESP_OK) {
+    Serial.println(F("[I2S]  Failed to init STD mode!")); return;
+  }
+  i2s_channel_enable(i2sTx);
+  Serial.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
+                I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
 }
+
+// ── Audio playback FreeRTOS task ────────────────────────────────
+// Runs on core 0, reads 2352-byte raw sectors from SD, strips the
+// 16-byte sync header, writes 2336 bytes (= 2 channels × 16-bit × 588 samples)
+// to the I2S DMA ring buffer.
+#define AUDIO_BUF_SECTORS 4   // read this many sectors per iteration (~9 KB)
+static uint8_t audioBuf[2352 * AUDIO_BUF_SECTORS];
+
+static void audioTask(void* arg) {
+  File audioFile;
+  String openedFile;
+
+  while (true) {
+    // Wait for play command
+    if (audioState != AUDIO_PLAY) {
+      if (audioFile) { audioFile.close(); openedFile = ""; }
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    uint32_t lba = audioCurrentLba;
+
+    // Find which audio track this LBA belongs to
+    AudioTrack* trk = nullptr;
+    for (int i = 0; i < audioTrackCount; i++) {
+      if (audioTracks[i].valid &&
+          lba >= audioTracks[i].startLba &&
+          lba <  audioTracks[i].startLba + audioTracks[i].lengthSectors) {
+        trk = &audioTracks[i];
+        break;
+      }
+    }
+
+    if (!trk) {
+      // No audio track at this LBA — stop
+      audioState = AUDIO_STOP;
+      if (audioFile) { audioFile.close(); openedFile = ""; }
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Open BIN file if different from current
+    // If I2S module not enabled, advance position in real-time (no sound)
+    // Check audioState each tick so PC STOP/PAUSE via SCSI is reflected immediately
+    if (!i2sTx) {
+      if (audioState != AUDIO_PLAY) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        continue;
+      }
+      audioCurrentLba++;
+      uint8_t am,as_,af,rm,rs,rf;
+      lbaToMsf(audioCurrentLba,am,as_,af);
+      uint32_t rel=audioCurrentLba-trk->startLba;
+      lbaToMsf(rel,rm,rs,rf);
+      subChannel.trackNum=trk->number;subChannel.indexNum=1;
+      subChannel.absM=am;subChannel.absS=as_;subChannel.absF=af;
+      subChannel.relM=rm;subChannel.relS=rs;subChannel.relF=rf;
+      if(audioEndLba>0&&audioCurrentLba>=audioEndLba) audioState=AUDIO_STOP;
+      vTaskDelay(pdMS_TO_TICKS(13));  // ~75 frames/s real-time pace
+      continue;
+    }
+    if (!audioFile || openedFile != trk->binFile) {
+      if (audioFile) audioFile.close();
+      audioFile  = SD_MMC.open(trk->binFile.c_str(), FILE_READ);
+      openedFile = trk->binFile;
+      if (!audioFile) {
+        Serial.printf("[AUDIO] Cannot open: %s\n", trk->binFile.c_str());
+        audioState = AUDIO_STOP;
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue;
+      }
+    }
+
+    // Seek to LBA position in the BIN file
+    uint64_t fileOffset = (uint64_t)lba * 2352;
+    if (!audioFile.seek(fileOffset)) {
+      audioState = AUDIO_STOP;
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Stream sectors in chunks
+    int sectorsToRead = AUDIO_BUF_SECTORS;
+    uint32_t remaining = (audioEndLba > lba) ? (audioEndLba - lba) : 0;
+    if (remaining == 0) { audioState = AUDIO_STOP; continue; }
+    if ((uint32_t)sectorsToRead > remaining) sectorsToRead = (int)remaining;
+
+    int bytesRead = audioFile.read(audioBuf, sectorsToRead * 2352);
+    if (bytesRead <= 0) { audioState = AUDIO_STOP; continue; }
+
+    int sectorsGot = bytesRead / 2352;
+
+    // Write audio samples to I2S — skip 16-byte sector header per sector
+    for (int s = 0; s < sectorsGot && audioState == AUDIO_PLAY; s++) {
+      uint8_t* pcm    = audioBuf + s * 2352 + 16;  // skip sync header
+      size_t   pcmLen = 2336;  // 588 stereo samples × 2ch × 2 bytes
+      size_t   written = 0;
+      // Apply software volume (mute = silence, otherwise scale 16-bit samples)
+      if (audioMuted || audioVolume == 0) {
+        static uint8_t silence[2336] = {};
+        i2s_channel_write(i2sTx, silence, pcmLen, &written, pdMS_TO_TICKS(100));
+      } else if (audioVolume < 100) {
+        // Scale in-place in a stack buffer to avoid modifying audioBuf
+        int16_t scaled[2336/2];
+        int16_t* src16 = (int16_t*)pcm;
+        for (int si = 0; si < (int)(pcmLen/2); si++)
+          scaled[si] = (int16_t)((int32_t)src16[si] * audioVolume / 100);
+        i2s_channel_write(i2sTx, scaled, pcmLen, &written, pdMS_TO_TICKS(100));
+      } else {
+        i2s_channel_write(i2sTx, pcm, pcmLen, &written, pdMS_TO_TICKS(100));
+      }
+
+      // Update playback position and sub-channel
+      lba++;
+      audioCurrentLba = lba;
+
+      // Compute sub-channel MSF
+      uint8_t am, as_, af;
+      lbaToMsf(lba, am, as_, af);
+      uint32_t relLba = lba - trk->startLba;
+      uint8_t rm, rs, rf;
+      lbaToMsf(relLba, rm, rs, rf);
+
+      // Atomic-ish update of sub-channel struct
+      subChannel.trackNum = trk->number;
+      subChannel.indexNum = 1;
+      subChannel.absM = am; subChannel.absS = as_; subChannel.absF = af;
+      subChannel.relM = rm; subChannel.relS = rs; subChannel.relF = rf;
+    }
+
+    audioCurrentLba = lba;
+
+    // Check if we've reached end LBA
+    if (audioEndLba > 0 && audioCurrentLba >= audioEndLba) {
+      audioState = AUDIO_STOP;
+    }
+
+    // Yield briefly to allow Wi-Fi/HTTP to run
+    vTaskDelay(1);
+  }
+  vTaskDelete(nullptr);
+}
+
+void startAudioTask() {
+  if (audioTaskHandle) return;
+  xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 5, &audioTaskHandle, 0);
+  Serial.println(F("[AUDIO] Task started on core 0."));
+}
+
+// ── Playback control helpers ─────────────────────────────────────
+// Find audio track by 1-based track number
+static AudioTrack* findAudioTrack(uint8_t num) {
+  for (int i = 0; i < audioTrackCount; i++)
+    if (audioTracks[i].valid && audioTracks[i].number == num)
+      return &audioTracks[i];
+  return nullptr;
+}
+
+void audioPlay(uint32_t startLba, uint32_t endLba) {
+  audioState      = AUDIO_STOP;  // pause task momentarily
+  vTaskDelay(pdMS_TO_TICKS(5));
+  audioCurrentLba = startLba;
+  audioEndLba     = endLba;
+  audioState      = AUDIO_PLAY;
+  Serial.printf("[AUDIO] Play LBA %lu → %lu\n", startLba, endLba);
+}
+
+void audioStop() {
+  audioState = AUDIO_STOP;
+  // Flush I2S with silence (only if module enabled)
+  if (i2sTx && cfg.audioModule) {
+    static uint8_t silence[512] = {};
+    size_t w;
+    for (int i = 0; i < 4; i++) i2s_channel_write(i2sTx, silence, sizeof(silence), &w, 10);
+  }
+  Serial.println(F("[AUDIO] Stop."));
+}
+
+void audioPause() { audioState = AUDIO_PAUSE; Serial.println(F("[AUDIO] Pause.")); }
+void audioResume(){ audioState = AUDIO_PLAY;  Serial.println(F("[AUDIO] Resume.")); }
+
+// =============================================================================
+//  BRIDGE FUNCTIONS FOR USBMSC.cpp SCSI PATCH
+//  Plain C++ functions — USBMSC.cpp and this file are both C++,
+//  so C++ name mangling matches automatically. No extern "C" needed.
+// =============================================================================
+void scsi_audio_play(uint32_t startLba, uint32_t endLba) {
+  audioPlay(startLba, endLba);
+}
+void scsi_audio_stop()   { audioStop(); }
+void scsi_audio_pause()  { audioPause(); }
+void scsi_audio_resume() { audioResume(); }
+
+int scsi_audio_state() { return (int)audioState; }
+
+void scsi_audio_subchannel(uint8_t* buf) {
+  buf[0] = subChannel.trackNum;
+  buf[1] = subChannel.indexNum;
+  buf[2] = subChannel.absM; buf[3] = subChannel.absS; buf[4] = subChannel.absF;
+  buf[5] = subChannel.relM; buf[6] = subChannel.relS; buf[7] = subChannel.relF;
+}
+
+int scsi_audio_track_count() { return (int)audioTrackCount; }
+
+int scsi_audio_track_info(int n, uint32_t* startLba, uint32_t* lenSectors) {
+  for (int i = 0; i < audioTrackCount; i++) {
+    if (audioTracks[i].number == (uint8_t)n) {
+      if (startLba)   *startLba   = audioTracks[i].startLba;
+      if (lenSectors) *lenSectors = audioTracks[i].lengthSectors;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+uint32_t cdromBlockCount_get() { return cdromBlockCount; }
 
 // =============================================================================
 //  WIFI
@@ -721,6 +1131,7 @@ bool   uploadOk       = false;
 bool   downloadActive = false;
 
 void handleFileUpload() {
+  if (!checkAuth()) return;
   HTTPUpload &upload = httpServer.upload();
   if (upload.status == UPLOAD_FILE_START) {
     String dir = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "/";
@@ -752,11 +1163,21 @@ void handleFileUpload() {
 // =============================================================================
 //  API HANDLERS
 // =============================================================================
+// Check HTTP Basic Auth — returns false and sends 401 if auth required and not provided
+bool checkAuth() {
+  if (!cfg.webAuth) return true;  // auth disabled — always allow
+  if (httpServer.authenticate(cfg.webUser, cfg.webPass)) return true;
+  httpServer.requestAuthentication(BASIC_AUTH, "ESP32-S3 CD-ROM", "Login required");
+  return false;
+}
+
 void handleRoot() {
+  if (!checkAuth()) return;
   httpServer.send_P(200, "text/html; charset=utf-8", HTML_PAGE);
 }
 
 void handleApiStatus() {
+  if (!checkAuth()) return;
   String j = "{\"mounted\":";
   j += (isoOpen && mountedFile.length()) ? "true" : "false";
   j += ",\"file\":\"" + jsonEsc(mountedFile.c_str()) + "\"";
@@ -769,6 +1190,7 @@ void handleApiStatus() {
 }
 
 void handleApiSysinfo() {
+  if (!checkAuth()) return;
   String j = "{";
 
   // WiFi
@@ -856,6 +1278,12 @@ void handleApiSysinfo() {
   j += ",\"sys_cpu_mhz\":" + String(getCpuFrequencyMhz());
   j += ",\"sys_flash_mb\":" + String(ESP.getFlashChipSize() / (1024*1024));
   j += ",\"sys_sdk\":\""   + jsonEsc(ESP.getSdkVersion())           + "\"";
+  j += ",\"audio_module\":" + String(cfg.audioModule ? "true" : "false");
+  j += ",\"i2s_ready\":" + String(i2sTx ? "true" : "false");
+  j += ",\"audio_state\":" + String((int)audioState);
+  j += ",\"audio_volume\":" + String(audioVolume);
+  j += ",\"audio_muted\":" + String(audioMuted ? "true" : "false");
+  j += ",\"audio_tracks\":" + String(audioTrackCount);
 
   j += "}";
   httpServer.send(200, "application/json", j);
@@ -880,6 +1308,7 @@ void collectIsos(File &dir, const String &base, String &json, bool &first) {
 }
 
 void handleApiIsos() {
+  if (!checkAuth()) return;
   if (!sdReady) { httpServer.send(200, "application/json", "[]"); return; }
   File root = SD_MMC.open("/");
   if (!root) { httpServer.send(200, "application/json", "[]"); return; }
@@ -890,6 +1319,7 @@ void handleApiIsos() {
 }
 
 void handleApiLs() {
+  if (!checkAuth()) return;
   String path = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "/";
   Serial.printf("[API]  GET /api/ls path=%s\n", path.c_str());
   if (!sdReady) { httpServer.send(200, "application/json", "[]"); return; }
@@ -911,6 +1341,7 @@ void handleApiLs() {
 }
 
 void handleApiMount() {
+  if (!checkAuth()) return;
   if (!httpServer.hasArg("file")) { httpServer.send(400, "text/plain", "Missing 'file'"); return; }
   String f = httpServer.arg("file");
   if (doMount(f)) httpServer.send(200, "text/plain", "OK: Mounted: " + f);
@@ -918,6 +1349,7 @@ void handleApiMount() {
 }
 
 void handleApiUmount() {
+  if (!checkAuth()) return;
   doUmount();
   httpServer.send(200, "text/plain", "OK: Ejected.");
 }
@@ -926,6 +1358,7 @@ void handleApiUmount() {
 // Safe SD card unmount -- ejects disc image, then deinits SD_MMC so the card
 // can be physically removed without filesystem corruption.
 void handleApiSdUnmount() {
+  if (!checkAuth()) return;
   // Refuse if a file transfer is actively in progress
   if (uploadActive) {
     Serial.println(F("[SD]   Unmount blocked: upload in progress."));
@@ -962,6 +1395,7 @@ void handleApiSdUnmount() {
 
 // Remount SD card after physical insertion.
 void handleApiSdMount() {
+  if (!checkAuth()) return;
   if (sdReady) {
     SD_MMC.end(); delay(100);
   }
@@ -975,6 +1409,7 @@ void handleApiSdMount() {
 }
 
 void handleApiSetDefault() {
+  if (!checkAuth()) return;
   String target = httpServer.hasArg("file") ? httpServer.arg("file") : mountedFile;
   if (!target.length()) { httpServer.send(400, "text/plain", "Nothing mounted"); return; }
   defaultMount = target;
@@ -986,6 +1421,7 @@ void handleApiSetDefault() {
 }
 
 void handleApiClearDefault() {
+  if (!checkAuth()) return;
   defaultMount = "";
   prefs.begin("cfg", false);
   prefs.putString("defmount", "");
@@ -996,6 +1432,7 @@ void handleApiClearDefault() {
 
 
 void handleApiWifiScan() {
+  if (!checkAuth()) return;
   int n = WiFi.scanNetworks();
   String j = "[";
   for (int i = 0; i < n; i++) {
@@ -1015,6 +1452,7 @@ void handleApiWifiScan() {
 }
 
 void handleApiGetConfig() {
+  if (!checkAuth()) return;
   String j = "{";
   j += "\"ssid\":\""  + jsonEsc(cfg.ssid)  + "\"";
   j += ",\"dhcp\":"   + String(cfg.dhcp ? "true" : "false");
@@ -1030,11 +1468,18 @@ void handleApiGetConfig() {
   j += ",\"eapCertPath\":\"" + jsonEsc(cfg.eapCertPath) + "\"";
   j += ",\"eapKeyPath\":\"" + jsonEsc(cfg.eapKeyPath) + "\"";
   j += ",\"eapKeyPass\":\"" + String(strlen(cfg.eapKeyPass) ? "set" : "") + "\"";
+  j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
+  j += ",\"webAuth\":" + String(cfg.webAuth ? "true" : "false");
+  j += ",\"webUser\":\"" + jsonEsc(cfg.webUser) + "\"";
+  // webPass intentionally omitted from GET response
+  j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
+  j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
   j += "}";
   httpServer.send(200, "application/json", j);
 }
 
 void handleApiSaveConfig() {
+  if (!checkAuth()) return;
   bool changed = false;
   if (httpServer.hasArg("ssid")) {
     strlcpy(cfg.ssid, httpServer.arg("ssid").c_str(), sizeof(cfg.ssid)); changed = true;
@@ -1059,6 +1504,15 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("eapCertPath")){ strlcpy(cfg.eapCertPath, httpServer.arg("eapCertPath").c_str(), sizeof(cfg.eapCertPath)); changed = true; }
   if (httpServer.hasArg("eapKeyPath")) { strlcpy(cfg.eapKeyPath,  httpServer.arg("eapKeyPath").c_str(),  sizeof(cfg.eapKeyPath));  changed = true; }
   if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
+  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
+  if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
+  if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
+  if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
+  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
   if (changed) {
     saveConfig();
@@ -1070,12 +1524,14 @@ void handleApiSaveConfig() {
 }
 
 void handleApiReboot() {
+  if (!checkAuth()) return;
   httpServer.send(200, "text/plain", "OK: Rebooting...");
   delay(500);
   ESP.restart();
 }
 
 void handleApiFactoryReset() {
+  if (!checkAuth()) return;
   clearConfig();
   httpServer.send(200, "text/plain", "OK: Factory reset done. Rebooting...");
   delay(500);
@@ -1083,6 +1539,7 @@ void handleApiFactoryReset() {
 }
 
 void handleApiDownload() {
+  if (!checkAuth()) return;
   if (!sdReady) { httpServer.send(503, "text/plain", "SD not available."); return; }
   if (!httpServer.hasArg("path")) { httpServer.send(400, "text/plain", "Missing 'path'"); return; }
   String path = normPath(httpServer.arg("path"));
@@ -1139,6 +1596,7 @@ void handleApiDownload() {
 }
 
 void handleApiMkdir() {
+  if (!checkAuth()) return;
   if (!sdReady) { httpServer.send(503, "text/plain", "SD not available."); return; }
   if (!httpServer.hasArg("path")) { httpServer.send(400, "text/plain", "Missing 'path'"); return; }
   String path = normPath(httpServer.arg("path"));
@@ -1147,6 +1605,7 @@ void handleApiMkdir() {
 }
 
 void handleApiDelete() {
+  if (!checkAuth()) return;
   if (!sdReady) { httpServer.send(503, "text/plain", "SD not available."); return; }
   if (!httpServer.hasArg("path")) { httpServer.send(400, "text/plain", "Missing 'path'"); return; }
   String path = normPath(httpServer.arg("path"));
@@ -1156,8 +1615,113 @@ void handleApiDelete() {
 }
 
 void handleApiUploadDone() {
+  if (!checkAuth()) return;
   if (uploadOk) httpServer.send(200, "text/plain", "OK");
   else          httpServer.send(500, "text/plain", "ERROR: upload failed");
+}
+
+// =============================================================================
+//  AUDIO API HANDLERS
+// =============================================================================
+void handleApiAudioStatus() {
+  if (!checkAuth()) return;
+  String j = "{";
+  j += "\"state\":" + String((int)audioState);
+  j += ",\"lba\":"  + String(audioCurrentLba);
+  j += ",\"end_lba\":" + String(audioEndLba);
+  j += ",\"volume\":" + String(audioVolume);
+  j += ",\"muted\":"  + String(audioMuted ? "true" : "false");
+  j += ",\"track_count\":" + String(audioTrackCount);
+  j += ",\"sub\":{";
+  j += "\"track\":"  + String(subChannel.trackNum);
+  j += ",\"absM\":"  + String(subChannel.absM);
+  j += ",\"absS\":"  + String(subChannel.absS);
+  j += ",\"absF\":"  + String(subChannel.absF);
+  j += ",\"relM\":"  + String(subChannel.relM);
+  j += ",\"relS\":"  + String(subChannel.relS);
+  j += ",\"relF\":"  + String(subChannel.relF);
+  j += "}";
+  j += ",\"tracks\":[";
+  for (int i = 0; i < audioTrackCount; i++) {
+    if (i) j += ",";
+    j += "{\"num\":" + String(audioTracks[i].number);
+    j += ",\"lba\":"  + String(audioTracks[i].startLba);
+    j += ",\"len\":"  + String(audioTracks[i].lengthSectors);
+    String fname = audioTracks[i].binFile;
+    int sl = fname.lastIndexOf('/'); if (sl >= 0) fname = fname.substring(sl+1);
+    int dot = fname.lastIndexOf('.'); if (dot > 0) fname = fname.substring(0, dot);
+    j += ",\"title\":\"" + jsonEsc(fname.c_str()) + "\"";
+    j += "}";
+  }
+  j += "]}";
+  httpServer.send(200, "application/json", j);
+}
+
+void handleApiAudioPlay() {
+  if (!checkAuth()) return;
+  if (httpServer.hasArg("track")) {
+    int tn = httpServer.arg("track").toInt();
+    for (int i = 0; i < audioTrackCount; i++) {
+      if (audioTracks[i].number == tn) {
+        uint32_t end = audioTracks[i].startLba + audioTracks[i].lengthSectors;
+        audioPlay(audioTracks[i].startLba, end);
+        httpServer.send(200,"application/json",
+          "{\"ok\":true,\"track\":" + String(tn) + "}");
+        return;
+      }
+    }
+    httpServer.send(404,"application/json","{\"ok\":false,\"err\":\"track not found\"}");
+  } else if (httpServer.hasArg("lba")) {
+    uint32_t lba = httpServer.arg("lba").toInt();
+    uint32_t end = httpServer.hasArg("end") ? httpServer.arg("end").toInt() : lba+75*3;
+    audioPlay(lba, end);
+    httpServer.send(200,"application/json","{\"ok\":true}");
+  } else {
+    httpServer.send(400,"application/json","{\"ok\":false}");
+  }
+}
+
+void handleApiAudioStop()   {
+  if (!checkAuth()) return; audioStop();   httpServer.send(200,"application/json","{\"ok\":true}"); }
+void handleApiAudioPause()  {
+  if (!checkAuth()) return; audioPause();  httpServer.send(200,"application/json","{\"ok\":true}"); }
+void handleApiAudioResume() {
+  if (!checkAuth()) return; audioResume(); httpServer.send(200,"application/json","{\"ok\":true}"); }
+
+void handleApiAudioVolume() {
+  if (!checkAuth()) return;
+  if (httpServer.hasArg("v")) {
+    int v = httpServer.arg("v").toInt();
+    if (v < 0) v = 0; if (v > 100) v = 100;
+    audioVolume = v; audioMuted = false;
+  }
+  httpServer.send(200,"application/json",
+    "{\"ok\":true,\"volume\":" + String(audioVolume) + "}");
+}
+
+void handleApiAudioMute() {
+  if (!checkAuth()) return;
+  if (httpServer.hasArg("m")) audioMuted = (httpServer.arg("m") == "1");
+  else audioMuted = !audioMuted;
+  httpServer.send(200,"application/json",
+    "{\"ok\":true,\"muted\":" + String(audioMuted?"true":"false") + "}");
+}
+
+void handleApiAudioSeek() {
+  if (!checkAuth()) return;
+  if (!httpServer.hasArg("track") || !httpServer.hasArg("rel"))
+    { httpServer.send(400,"application/json","{\"ok\":false}"); return; }
+  int tn = httpServer.arg("track").toInt();
+  float rel = httpServer.arg("rel").toFloat();
+  if (rel < 0) rel = 0; if (rel > 1) rel = 1;
+  for (int i = 0; i < audioTrackCount; i++) {
+    if (audioTracks[i].number == tn) {
+      audioCurrentLba = audioTracks[i].startLba +
+                        (uint32_t)(rel * audioTracks[i].lengthSectors);
+      httpServer.send(200,"application/json","{\"ok\":true}"); return;
+    }
+  }
+  httpServer.send(404,"application/json","{\"ok\":false}");
 }
 
 void setupWebServer() {
@@ -1181,6 +1745,14 @@ void setupWebServer() {
   httpServer.on("/api/mkdir",        HTTP_GET,  handleApiMkdir);
   httpServer.on("/api/delete",       HTTP_GET,  handleApiDelete);
   httpServer.on("/api/upload",       HTTP_POST, handleApiUploadDone, handleFileUpload);
+  httpServer.on("/api/audio/status", HTTP_GET,  handleApiAudioStatus);
+  httpServer.on("/api/audio/play",   HTTP_GET,  handleApiAudioPlay);
+  httpServer.on("/api/audio/stop",   HTTP_GET,  handleApiAudioStop);
+  httpServer.on("/api/audio/pause",  HTTP_GET,  handleApiAudioPause);
+  httpServer.on("/api/audio/resume", HTTP_GET,  handleApiAudioResume);
+  httpServer.on("/api/audio/volume", HTTP_GET,  handleApiAudioVolume);
+  httpServer.on("/api/audio/mute",   HTTP_GET,  handleApiAudioMute);
+  httpServer.on("/api/audio/seek",   HTTP_GET,  handleApiAudioSeek);
   httpServer.begin();
   Serial.printf("[OK]  HTTP server started at http://%s\n", WiFi.localIP().toString().c_str());
 }
@@ -1224,6 +1796,9 @@ void printConfig(bool showRuntime = true) {
     }
   }
   Serial.printf("  Default image : %s\n",  defaultMount.length() ? defaultMount.c_str() : "(none)");
+  Serial.printf("  Audio module  : %s\n",  cfg.audioModule ? "PCM5102 enabled" : "disabled");
+  Serial.printf("  Web auth      : %s\n",  cfg.webAuth ? "enabled" : "disabled (no login required)");
+  if (cfg.webAuth) Serial.printf("  Web user      : %s\n", cfg.webUser);
   printSep();
   if (!showRuntime) return;
   Serial.println(F("  RUNTIME STATE"));
@@ -1278,7 +1853,8 @@ void printStatus() {
     Serial.printf("  Band/Channel  : %s / Ch %d\n", WiFi.channel()<=13?"2.4 GHz":"5 GHz", WiFi.channel());
     Serial.printf("  BSSID         : %s\n", WiFi.BSSIDstr().c_str());
     // Security
-    Serial.println(F("  ── Security ──────────────────────────────"));
+    Serial.println(F(""));
+  Serial.println(F("  ┌─ Security ─────────────────────────────────────┐"));
     const char* authStr = cfg.eapMode==1?"WPA2-Enterprise (PEAP)":cfg.eapMode==2?"WPA2-Enterprise (EAP-TLS)":"WPA2-Personal";
     Serial.printf("  Auth method   : %s\n", authStr);
     if (cfg.eapMode) {
@@ -1318,7 +1894,8 @@ void printStatus() {
         Serial.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none)");
       }
     }
-    Serial.println(F("  ─────────────────────────────────────────"));
+    Serial.println(F("  └────────────────────────────────────────────────┘"));
+  Serial.println(F(""));
   } else {
     Serial.println(F("  WiFi          : Not connected"));
   }
@@ -1344,17 +1921,37 @@ void printStatus() {
   // Default
   Serial.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
   // System
-  Serial.println(F("  ------------------------------------------------"));
-  Serial.println(F("  TRANSFER SPEED NOTE"));
-  Serial.println(F("  USB Full Speed (ESP32-S3) = 12 Mbit/s max"));
-  Serial.println(F("  Real copy speed: ~600-900 KB/s  (hardware limit)"));
-  Serial.println(F("  SD card speed is NOT the bottleneck."));
-  Serial.println(F("  ------------------------------------------------"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ Transfer Speed Note ──────────────────────────┐"));
+  Serial.println(F("  │ USB Full Speed = 12 Mbit/s max                 │"));
+  Serial.println(F("  │ Real copy: ~600-900 KB/s (hardware limit)      │"));
+  Serial.println(F("  │ SD card speed is NOT the bottleneck.           │"));
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ Audio ────────────────────────────────────────┐"));
+  Serial.printf("  Audio module  : %s\n", cfg.audioModule ? "PCM5102 I2S — enabled" : "disabled (no hardware)");
+  if (cfg.audioModule) {
+    Serial.printf("  I2S pins      : BCK=%d  WS=%d  DATA=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
+    Serial.printf("  I2S state     : %s\n", i2sTx ? "initialized" : "init failed");
+    const char* astStr = audioState==1?"PLAYING":audioState==2?"PAUSED":"STOPPED";
+    Serial.printf("  Playback      : %s\n", astStr);
+    if (audioState > 0) {
+      uint8_t am,as_,af; lbaToMsf(audioCurrentLba,am,as_,af);
+      Serial.printf("  Position      : %02d:%02d:%02d  (LBA %lu)\n",am,as_,af,audioCurrentLba);
+      Serial.printf("  Track         : %d\n", subChannel.trackNum);
+    }
+    Serial.printf("  Volume        : %d%%%s\n", audioVolume, audioMuted?" (MUTED)":"");
+    Serial.printf("  Audio tracks  : %d\n", audioTrackCount);
+  }
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ System ───────────────────────────────────────┐"));
   Serial.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
   Serial.printf("  Uptime        : %lu s\n", millis()/1000);
   Serial.printf("  CPU freq      : %u MHz\n", getCpuFrequencyMhz());
   Serial.printf("  Flash size    : %u MB\n", ESP.getFlashChipSize()/(1024*1024));
   Serial.printf("  SDK version   : %s\n", ESP.getSdkVersion());
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
 }
 
@@ -1369,8 +1966,9 @@ void printHelp() {
   Serial.println(F("  set mask <mask>       Set subnet mask"));
   Serial.println(F("  set gw <addr>         Set default gateway"));
   Serial.println(F("  set dns <addr>        Set DNS server"));
-  Serial.println(F("  set hostname <n>   Set hostname or FQDN (e.g. espcd or espcd.falco81.net)"));
-  Serial.println(F("  -- 802.1x Enterprise WiFi --"));
+  Serial.println(F("  set hostname <n>      Set hostname or FQDN (e.g. espcd or espcd.falco81.net)"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ 802.1x Enterprise WiFi ───────────────────────┐"));
   Serial.println(F("  set eap-mode <0|1|2>  0=off 1=PEAP 2=EAP-TLS"));
   Serial.println(F("  set eap-id <val>      EAP outer identity"));
   Serial.println(F("  set eap-user <val>    EAP inner username (PEAP)"));
@@ -1379,6 +1977,16 @@ void printHelp() {
   Serial.println(F("  set eap-cert <path>   SD path to client cert (EAP-TLS)"));
   Serial.println(F("  set eap-key <path>    SD path to client key (EAP-TLS)"));
   Serial.println(F("  set eap-kpass <val>   Passphrase for encrypted private key"));
+  Serial.println(F("  set audio-module on|off  Enable/disable PCM5102 I2S audio module"));
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ Web UI Authentication ────────────────────────┐"));
+  Serial.println(F("  set web-auth on|off       Enable/disable HTTP Basic Auth (default: off)"));
+  Serial.println(F("  set web-user <name>       Web UI username (default: admin)"));
+  Serial.println(F("  set web-pass <password>   Web UI password (default: admin)"));
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
+  Serial.println(F(""));
+  Serial.println(F("  ┌─ Commands ─────────────────────────────────────┐"));
   Serial.println(F("  show config           Show full configuration + runtime state"));
   Serial.println(F("  show files [path]     List SD files recursively (default: /)"));
   Serial.println(F("  status                Show current status (WiFi, SD, image)"));
@@ -1389,6 +1997,7 @@ void printHelp() {
   Serial.println(F("  clear config          Erase ALL NVS settings (factory reset)"));
   Serial.println(F("  reboot                Restart ESP32"));
   Serial.println(F("  help                  Show this help"));
+  Serial.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
 }
 
@@ -1510,6 +2119,10 @@ void processCommand(String &line) {
     else if (key=="eap-cert")  strlcpy(cfg.eapCertPath,  val.c_str(), sizeof(cfg.eapCertPath));
     else if (key=="eap-key")   strlcpy(cfg.eapKeyPath,   val.c_str(), sizeof(cfg.eapKeyPath));
     else if (key=="eap-kpass") strlcpy(cfg.eapKeyPass,  val.c_str(), sizeof(cfg.eapKeyPass));
+    else if (key=="audio-module") { String v=val; v.toLowerCase(); cfg.audioModule=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="web-auth")  { String v=val; v.toLowerCase(); cfg.webAuth=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="web-user")  { strlcpy(cfg.webUser, val.c_str(), sizeof(cfg.webUser)); }
+    else if (key=="web-pass")  { strlcpy(cfg.webPass, val.c_str(), sizeof(cfg.webPass)); }
     else { Serial.printf("[ERR] Unknown key: '%s'\n", key.c_str()); ok=false; }
     if (ok) {
       saveConfig();
@@ -1564,6 +2177,8 @@ void setup() {
   printConfig(false);  // NVS settings only (runtime not yet available)
   printHelp();
 
+  initI2S();
+  startAudioTask();
   initUSBMSC();
   sdReady = initSD();
   startWiFi();
@@ -1571,18 +2186,12 @@ void setup() {
 
   Serial.println(F("\n[READY] Type 'help' for available commands\n"));
 
-  // Auto-mount default image, then connect USB.
-  // If no default image, connect USB anyway (host will see empty drive).
+  // Auto-mount default image
   if (sdReady && defaultMount.length()) {
     Serial.printf("[AUTO] Default image: %s\n", defaultMount.c_str());
     File _f = SD_MMC.open(defaultMount.c_str());
     if (_f) { _f.close(); doMount(defaultMount); }
-    else {
-      Serial.println(F("[AUTO] File not found on SD card."));
-      usbConnect();  // connect with no disc rather than staying invisible
-    }
-  } else {
-    usbConnect();  // no default image configured — connect empty drive
+    else Serial.println(F("[AUTO] File not found on SD card."));
   }
 }
 

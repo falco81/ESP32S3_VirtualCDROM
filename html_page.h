@@ -25,6 +25,7 @@ h1{color:var(--blue);font-size:clamp(1rem,2.5vw,1.4rem)}
 .tabs{display:flex;gap:4px;border-bottom:1px solid var(--border)}
 .tab{padding:clamp(5px,1vw,9px) clamp(10px,2vw,20px);cursor:pointer;color:var(--tx2);border:1px solid transparent;border-bottom:none;border-radius:6px 6px 0 0;font-size:clamp(.75rem,1.5vw,.9rem);user-select:none;position:relative;bottom:-1px}
 .tab.active{color:var(--tx);background:var(--surface);border-color:var(--border)}
+.tab.disabled{opacity:.4;cursor:default;pointer-events:none}
 .panel{display:none;flex:1;flex-direction:column;gap:clamp(6px,1vw,12px);min-height:0}
 .panel.active{display:flex}
 .card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:clamp(8px,1.5vw,16px)}
@@ -42,18 +43,19 @@ h1{color:var(--blue);font-size:clamp(1rem,2.5vw,1.4rem)}
 .gr{background:var(--gray);color:var(--tx);border:1px solid var(--border)}.gr:hover{background:var(--grhi)}
 .yw{background:#7d4e17;color:#e3b341;border:1px solid #9e6a03}.yw:hover{background:#9e6a03}
 .tbl-wrap{overflow-y:auto;overflow-x:hidden;flex:1;min-height:0}
-table{width:100%;table-layout:fixed;border-collapse:collapse;font-size:clamp(.72rem,1.4vw,.88rem)}
-th,td{padding:clamp(4px,.8vw,8px) clamp(6px,1vw,10px);vertical-align:middle}
+table{width:100%;table-layout:auto;border-collapse:collapse;font-size:clamp(.72rem,1.4vw,.88rem)}
+th,td{vertical-align:middle;padding:clamp(4px,.8vw,8px) clamp(6px,1vw,10px);vertical-align:middle}
 th{text-align:left;color:var(--tx2);border-bottom:1px solid var(--border2);font-weight:normal;position:sticky;top:0;background:var(--surface);z-index:1}
 td{border-bottom:1px solid var(--bg)}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--border2)}
-td.ic,th.ic{width:32px;min-width:32px}
-td.nm{color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;max-width:0;width:auto}
+td.ic,th.ic{width:28px;min-width:28px;text-align:center;font-size:1rem}
+td.nm{color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 td.nm.d{color:#79c0ff;cursor:pointer}td.nm.d:hover{text-decoration:underline}
 td.sz,th.sz{color:var(--tx2);text-align:right;white-space:nowrap;width:100px}
-td.ac,th.ac{text-align:right;white-space:nowrap;width:130px}
-td.ac .btn{margin-left:3px}
+td.ac,th.ac{text-align:right;white-space:nowrap;min-width:100px;vertical-align:middle}
+td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
+#mkModal.show{display:flex!important}
 .bc{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:clamp(6px,1vw,10px);font-size:clamp(.7rem,1.3vw,.85rem)}
 .bcp{color:var(--blue);cursor:pointer}.bcp:hover{text-decoration:underline}
 .bcs{color:var(--tx3)}
@@ -74,7 +76,7 @@ td.ac .btn{margin-left:3px}
 .si-tbl tr:last-child td{border-bottom:none}
 .si-tbl td:first-child{color:var(--tx2);white-space:nowrap;width:1%;padding-right:clamp(12px,2vw,24px)}
 .si-tbl td:last-child{color:var(--tx)}
-.cfg-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}.cfg-lbl{color:var(--tx2);font-size:clamp(.7rem,1.3vw,.82rem);white-space:nowrap;width:100px;min-width:100px}.cfg-inp{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--rs);color:var(--tx);padding:clamp(4px,.7vw,7px) 10px;font-family:inherit;font-size:clamp(.75rem,1.4vw,.88rem)}.cfg-inp:focus{outline:none;border-color:var(--blue)}.si-ok{color:var(--green)!important}.si-err{color:var(--red)!important}.si-warn{color:#e3b341!important}
+.cfg-row{display:flex;align-items:center;gap:10px;margin-bottom:8px}.cfg-lbl{color:var(--tx2);font-size:clamp(.7rem,1.3vw,.82rem);white-space:nowrap;width:140px;min-width:140px}.cfg-inp{flex:1;background:var(--bg);border:1px solid var(--border);border-radius:var(--rs);color:var(--tx);padding:clamp(4px,.7vw,7px) 10px;font-family:inherit;font-size:clamp(.75rem,1.4vw,.88rem)}.cfg-inp:focus{outline:none;border-color:var(--blue)}.si-ok{color:var(--green)!important}.si-err{color:var(--red)!important}.si-warn{color:#e3b341!important}
 .si-bar{height:6px;background:var(--border2);border-radius:3px;overflow:hidden;margin-top:3px}
 .si-bar-i{height:100%;border-radius:3px;background:var(--bbg)}
 @keyframes spin{to{transform:rotate(360deg)}}
@@ -92,6 +94,29 @@ td.ac .btn{margin-left:3px}
 .tknob{width:11px;height:11px;background:var(--tx);border-radius:50%;position:absolute;top:2px;left:2px;transition:.2s}
 .tog.on .tknob{left:17px}
 @media(max-width:600px){td.sz{display:none}.mname{font-size:.8rem}}
+
+.ap{background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border:1px solid #e94560;border-radius:10px;padding:14px 16px;margin-top:8px;display:none}
+.ap.show{display:block}
+.ap-title{font-size:.78rem;color:var(--muted);margin-bottom:10px;letter-spacing:.05em;text-transform:uppercase}
+.ap-track{font-size:1rem;font-weight:600;color:#e94560;min-height:1.4em;margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ap-time{font-size:.78rem;color:var(--tx2);margin-bottom:10px;display:flex;justify-content:space-between}
+.ap-prog{width:100%;height:6px;background:#0f3460;border-radius:3px;cursor:pointer;margin-bottom:12px;position:relative}
+.ap-prog-fill{height:100%;background:linear-gradient(90deg,#e94560,#f5a623);border-radius:3px;pointer-events:none;transition:width .5s linear}
+.ap-btns{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.ap-btn{background:#0f3460;border:1px solid #1e4080;border-radius:6px;color:#e0e0e0;padding:6px 12px;cursor:pointer;font-size:1rem;line-height:1;transition:background .15s,transform .1s}
+.ap-btn:hover{background:#1e4080}
+.ap-btn:active{transform:scale(.93)}
+.ap-btn.active{background:#e94560;border-color:#e94560;color:#fff}
+.ap-vol{display:flex;align-items:center;gap:8px;margin-top:6px}
+.ap-vol-slider{flex:1;-webkit-appearance:none;height:4px;border-radius:2px;background:#0f3460;outline:none;cursor:pointer}
+.ap-vol-slider::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:#e94560;cursor:pointer}
+.ap-tracklist{margin-top:10px;max-height:140px;overflow-y:auto;border-top:1px solid #1e4080;padding-top:8px}
+.ap-trow{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:5px;cursor:pointer;font-size:.8rem;transition:background .1s}
+.ap-trow:hover{background:#1e4080}
+.ap-trow.playing{background:#e9456022;border-left:3px solid #e94560}
+.ap-tnum{color:var(--muted);min-width:22px;text-align:right}
+.ap-tname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ap-tdur{color:var(--muted);font-size:.75rem}
 </style>
 </head>
 <body>
@@ -101,10 +126,11 @@ td.ac .btn{margin-left:3px}
 </div>
 <div class="tabs">
   <div class="tab active" id="t0" onclick="showTab(0)">&#128249; CD-ROM</div>
-  <div class="tab" id="t1" onclick="showTab(1)">&#128193; File Manager</div>
-  <div class="tab" id="t2" onclick="showTab(2)">&#128203; Log</div>
-  <div class="tab" id="t3" onclick="showTab(3)">&#128268; Status</div>
-  <div class="tab" id="t4" onclick="showTab(4)">&#9881; Config</div>
+  <div class="tab" id="t1" onclick="showTab(1)">&#127925; Audio</div>
+  <div class="tab" id="t2" onclick="showTab(2)">&#128193; File Manager</div>
+  <div class="tab" id="t3" onclick="showTab(3)">&#128203; Log</div>
+  <div class="tab" id="t4" onclick="showTab(4)">&#128268; Status</div>
+  <div class="tab" id="t5" onclick="showTab(5)">&#9881; Config</div>
 </div>
 
 <div class="panel active" id="p0">
@@ -143,6 +169,39 @@ td.ac .btn{margin-left:3px}
 </div>
 
 <div class="panel" id="p1">
+  <div class="card" style="flex:1">
+    <div class="ap" id="audioPlayer" style="display:block;background:transparent;border:none;padding:0">
+      <div class="ct" style="margin-bottom:12px">&#127925; Audio CD Player</div>
+      <div class="ap-track" id="apTrackName">&#8212;</div>
+      <div class="ap-time">
+        <span id="apTimeRel">0:00</span>
+        <span id="apTimeAbs">0:00</span>
+        <span id="apTimeTotal">&#8212;</span>
+      </div>
+      <div class="ap-prog" id="apProg" onclick="apSeek(event)">
+        <div class="ap-prog-fill" id="apProgFill" style="width:0%"></div>
+      </div>
+      <div class="ap-btns">
+        <button class="ap-btn" onclick="apPrev()" title="Previous track">&#9198;</button>
+        <button class="ap-btn" id="apBtnPlay" onclick="apPlayPause()" title="Play/Pause">&#9654;</button>
+        <button class="ap-btn" onclick="apStop()" title="Stop">&#9632;</button>
+        <button class="ap-btn" onclick="apNext()" title="Next track">&#9197;</button>
+        <button class="ap-btn" id="apBtnMute" onclick="apToggleMute()" title="Mute">&#128266;</button>
+        <span style="flex:1"></span>
+        <span id="apStateBadge" style="font-size:.72rem;padding:3px 8px;border-radius:4px;background:#0f3460;color:var(--muted)">STOPPED</span>
+      </div>
+      <div class="ap-vol">
+        <span style="font-size:.85rem">&#128265;</span>
+        <input class="ap-vol-slider" id="apVol" type="range" min="0" max="100" value="80"
+               oninput="apSetVolume(this.value)" title="Volume">
+        <span style="font-size:.78rem;color:var(--tx2);min-width:28px;text-align:right" id="apVolLabel">80</span>
+      </div>
+      <div class="ap-tracklist" id="apTrackList" style="max-height:300px"></div>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="p2">
   <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
     <div class="bc" id="fmBc"></div>
     <div class="tb">
@@ -168,7 +227,7 @@ td.ac .btn{margin-left:3px}
   </div>
 </div>
 
-<div class="panel" id="p2">
+<div class="panel" id="p3">
   <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
     <div class="ct" style="display:flex;align-items:center;justify-content:space-between">
       <span>&#128203; Event log</span>
@@ -178,7 +237,7 @@ td.ac .btn{margin-left:3px}
   </div>
 </div>
 
-<div class="panel" id="p3">
+<div class="panel" id="p4">
   <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
     <button class="btn b" onclick="loadSysinfo()" id="siBtn">&#8635; Refresh</button>
     <span class="sp" id="siSp"></span>
@@ -192,16 +251,22 @@ td.ac .btn{margin-left:3px}
       <table class="si-tbl" id="siWifi"></table>
     </div>
 
-    <!-- SD card -->
+    <!-- SD Card -->
     <div class="card">
       <div class="ct">&#128190; SD Card</div>
       <table class="si-tbl" id="siSd"></table>
     </div>
 
-    <!-- Mounted image -->
+    <!-- Disc Image -->
     <div class="card">
-      <div class="ct">&#128249; Disc Image</div>
+      <div class="ct">&#128191; Disc Image</div>
       <table class="si-tbl" id="siImg"></table>
+    </div>
+
+    <!-- Audio -->
+    <div class="card">
+      <div class="ct">&#127925; Audio</div>
+      <table class="si-tbl" id="siAudio"><tbody></tbody></table>
     </div>
 
     <!-- System -->
@@ -213,7 +278,7 @@ td.ac .btn{margin-left:3px}
   </div>
 </div>
 
-<div class="panel" id="p4">
+<div class="panel" id="p5">
   <div style="display:flex;flex-direction:column;gap:clamp(6px,1vw,12px);overflow-y:auto;flex:1;min-height:0">
 
     <!-- WiFi Configuration -->
@@ -232,140 +297,138 @@ td.ac .btn{margin-left:3px}
       <div class="cfg-row"><label class="cfg-lbl">Password</label><input class="cfg-inp" id="cfgPass" type="password" placeholder="Leave empty to keep current" autocomplete="new-password"></div>
     </div>
 
-    <!-- IP Configuration -->
+    <!-- Network: DHCP / Static IP -->
     <div class="card">
-      <div class="ct">&#127760; IP Configuration</div>
-      <div class="cfg-row" style="margin-bottom:10px">
-        <label class="cfg-lbl">Mode</label>
-        <div style="display:flex;gap:12px;align-items:center">
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(.72rem,1.4vw,.86rem)">
-            <input type="radio" name="dhcpMode" id="rDhcp" value="dhcp" onchange="cfgDhcpToggle()"> DHCP
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(.72rem,1.4vw,.86rem)">
-            <input type="radio" name="dhcpMode" id="rStatic" value="static" onchange="cfgDhcpToggle()"> Static
-          </label>
+      <div class="ct">&#127760; Network</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">IP mode</label>
+        <label style="margin-right:16px"><input type="radio" name="ipmode" id="rDhcp" value="dhcp" checked onchange="cfgDhcpToggle()"> DHCP</label>
+        <label><input type="radio" name="ipmode" id="rStatic" value="static" onchange="cfgDhcpToggle()"> Static IP</label>
+      </div>
+      <div id="staticFields" style="display:none">
+        <div class="cfg-row"><label class="cfg-lbl">IP address</label><input class="cfg-inp" id="cfgIp" type="text" placeholder="192.168.1.100"></div>
+        <div class="cfg-row"><label class="cfg-lbl">Subnet mask</label><input class="cfg-inp" id="cfgMask" type="text" placeholder="255.255.255.0"></div>
+        <div class="cfg-row"><label class="cfg-lbl">Gateway</label><input class="cfg-inp" id="cfgGw" type="text" placeholder="192.168.1.1"></div>
+        <div class="cfg-row"><label class="cfg-lbl">DNS</label><input class="cfg-inp" id="cfgDns" type="text" placeholder="8.8.8.8"></div>
+      </div>
+      <div class="cfg-row"><label class="cfg-lbl">Hostname / FQDN</label>
+        <div style="display:flex;align-items:center;gap:8px;width:100%">
+          <input class="cfg-inp" id="cfgHostname" type="text" placeholder="espcd or espcd.corp.net" style="flex:1" oninput="cfgMdnsUpdate(this.value)">
+          <a id="cfgMdnsLink" href="#" target="_blank" style="font-size:.75rem;color:var(--accent);white-space:nowrap"></a>
+        </div>
+        <div style="font-size:.73rem;color:var(--muted);margin-top:3px">
+          FQDN: <span id="cfgFqdnPreview" style="color:var(--tx)"></span> &nbsp;&middot;&nbsp; mDNS: <span id="cfgMdnsPreview" style="color:var(--accent)"></span>
         </div>
       </div>
-      <div id="staticFields">
-        <div class="cfg-row"><label class="cfg-lbl">IP Address</label><input class="cfg-inp" id="cfgIp"   type="text" placeholder="192.168.1.100"></div>
-        <div class="cfg-row"><label class="cfg-lbl">Subnet Mask</label><input class="cfg-inp" id="cfgMask" type="text" placeholder="255.255.255.0"></div>
-        <div class="cfg-row"><label class="cfg-lbl">Gateway</label><input class="cfg-inp" id="cfgGw"   type="text" placeholder="192.168.1.1"></div>
-        <div class="cfg-row"><label class="cfg-lbl">DNS Server</label><input class="cfg-inp" id="cfgDns"  type="text" placeholder="8.8.8.8"></div>
-      </div>
     </div>
 
-    <!-- Hostname / mDNS -->
+    <!-- 802.1x Enterprise WiFi -->
     <div class="card">
-      <div class="ct">&#127968; Hostname &amp; mDNS</div>
-      <div class="cfg-row">
-        <label class="cfg-lbl">Hostname</label>
-        <input class="cfg-inp" id="cfgHostname" type="text" placeholder="espcd or espcd.falco81.net" autocomplete="off" maxlength="63" oninput="cfgMdnsUpdate(this.value)">
-      </div>
-      <div style="font-size:.78rem;color:var(--muted);margin-top:-4px;margin-bottom:6px;padding-left:0">
-        DHCP hostname: <b id="cfgFqdnPreview" style="color:var(--accent)">espcd</b> &nbsp;&middot;&nbsp; mDNS: <span id="cfgMdnsPreview" style="color:var(--accent);font-weight:600">espcd.local</span>
-      </div>
-    </div>
-
-    <!-- 802.1x Enterprise -->
-    <div class="card">
-      <div class="ct">&#128274; 802.1x Enterprise WiFi</div>
+      <div class="ct">&#128275; 802.1x Enterprise WiFi</div>
       <div class="cfg-row">
         <label class="cfg-lbl">EAP Mode</label>
         <select class="cfg-inp" id="cfgEapMode" onchange="cfgEapModeToggle()">
           <option value="0">Disabled (WPA2-Personal)</option>
-          <option value="1">PEAP / TTLS (username + password)</option>
+          <option value="1">PEAP (username + password)</option>
           <option value="2">EAP-TLS (certificate)</option>
         </select>
       </div>
       <div id="eapFields" style="display:none">
-        <div class="cfg-row"><label class="cfg-lbl">Identity</label>
-          <input class="cfg-inp" id="cfgEapId" type="text" placeholder="user@domain.com" autocomplete="off">
+        <div class="cfg-row"><label class="cfg-lbl">EAP Identity</label>
+          <input class="cfg-inp" id="cfgEapId" type="text" placeholder="user@corp.net (optional for TLS)">
         </div>
         <div id="eapPeapFields">
-          <div class="cfg-row"><label class="cfg-lbl">Username</label>
-            <input class="cfg-inp" id="cfgEapUser" type="text" placeholder="username" autocomplete="off">
-          </div>
-          <div class="cfg-row"><label class="cfg-lbl">Password</label>
-            <input class="cfg-inp" id="cfgEapPass" type="password" placeholder="password" autocomplete="new-password">
-          </div>
-        </div>
-        <div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-          <span style="font-size:.78rem;color:var(--muted)">Certificate files on SD card:</span>
-          <button class="btn b" onclick="eapScanSD()" id="eapScanBtn" style="font-size:.75rem;padding:3px 10px">&#128269; Scan SD</button>
-          <span class="sp" id="eapScanSp"></span>
-        </div>
-        <div class="cfg-row" style="margin-top:6px"><label class="cfg-lbl">CA cert</label>
-          <div style="display:flex;gap:6px;width:100%">
-            <select class="cfg-inp" id="cfgEapCa" style="flex:1">
-              <option value="">(none — disable server verification)</option>
-            </select>
-          </div>
+          <div class="cfg-row"><label class="cfg-lbl">Username</label><input class="cfg-inp" id="cfgEapUser" type="text"></div>
+          <div class="cfg-row"><label class="cfg-lbl">Password</label><input class="cfg-inp" id="cfgEapPass" type="password" placeholder="(leave empty to keep current)"></div>
         </div>
         <div id="eapTlsFields">
+          <div class="cfg-row">
+            <label class="cfg-lbl">Scan SD for certs</label>
+            <button class="btn b" onclick="cfgScanCerts()" id="scanCertBtn">&#128269; Scan SD</button>
+            <span class="sp" id="certSp"></span>
+          </div>
+          <div class="cfg-row"><label class="cfg-lbl">CA cert (optional)</label>
+            <select class="cfg-inp" id="cfgEapCa"><option value="">(none &#8212; skip server verify)</option></select>
+          </div>
           <div class="cfg-row"><label class="cfg-lbl">Client cert</label>
-            <select class="cfg-inp" id="cfgEapCert" style="width:100%">
-              <option value="">(select after SD scan)</option>
-            </select>
+            <select class="cfg-inp" id="cfgEapCert"><option value="">(not set)</option></select>
           </div>
           <div class="cfg-row"><label class="cfg-lbl">Client key</label>
-            <select class="cfg-inp" id="cfgEapKey" style="width:100%" onchange="eapCheckKeyFormat()">
-              <option value="">(select after SD scan)</option>
-            </select>
+            <select class="cfg-inp" id="cfgEapKey"><option value="">(not set)</option></select>
           </div>
           <div class="cfg-row"><label class="cfg-lbl">Key passphrase</label>
             <input class="cfg-inp" id="cfgEapKPass" type="password"
-              placeholder="(only for encrypted keys)" autocomplete="new-password">
+                   placeholder="(only for encrypted keys)" autocomplete="new-password">
+          <div id="eapKeyWarning" style="display:none;font-size:.75rem;color:#f5a623;margin-top:4px">
+            &#9888; This appears to be a private key — set Key passphrase if it is encrypted.
           </div>
-          <div id="eapKeyWarning" style="display:none;font-size:.75rem;color:#e74c3c;margin-top:4px;padding:6px 8px;background:rgba(231,76,60,.1);border-radius:4px;border-left:3px solid #e74c3c">
-            &#9888; Key must be <b>PKCS#1 RSA format</b> (BEGIN RSA PRIVATE KEY).<br>
-            If your key shows <i>BEGIN PRIVATE KEY</i> (PKCS#8), convert it first:<br>
-            <code style="font-size:.72rem">openssl pkey -traditional -in client.key -out client_rsa.key</code>
           </div>
-        </div>
-        <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-          &#9432; Click <b>Scan SD</b> to auto-detect .pem/.crt/.key files anywhere on SD card.
-          Max ~16 KB per file.
+          <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+            &#9432; Click <b>Scan SD</b> to detect .pem/.crt/.key files on the card.
+          </div>
         </div>
       </div>
     </div>
 
-    <!-- Save / Actions -->
+    <!-- Audio Module -->
     <div class="card">
-      <div class="ct">&#128190; Actions</div>
-      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
-        <button class="btn g"  onclick="cfgSave()" id="cfgSaveBtn">&#128190; Save &amp; apply</button>
-        <button class="btn b"  onclick="cfgReboot()" id="cfgRebootBtn">&#8635; Reboot</button>
-        <button class="btn r"  onclick="cfgFactory()" id="cfgFactoryBtn">&#9888; Factory reset</button>
-        <span class="sp" id="cfgActSp"></span>
+      <div class="ct">&#127925; Audio Module</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">PCM5102 I2S module</label>
+        <select class="cfg-inp" id="cfgAudioModule" style="width:100%">
+          <option value="0">Disabled (no hardware connected)</option>
+          <option value="1">GY-PCM5102 I2S &#8212; GPIO 14/15/16</option>
+        </select>
       </div>
-      <div id="cfgActMsg" style="font-size:clamp(.72rem,1.4vw,.85rem);display:none"></div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; Requires reboot. BCK&#8594;GPIO14 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
+      </div>
     </div>
 
-    <!-- SD Card management -->
+    <!-- Web UI Authentication -->
     <div class="card">
-      <div class="ct">&#128190; SD Card</div>
-      <p style="font-size:clamp(.72rem,1.4vw,.86rem);color:var(--tx2);margin-bottom:12px">
-        Safely unmount the card before physical removal, then insert it back and press Mount.
-      </p>
+      <div class="ct">&#128272; Web UI Authentication</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">HTTP Basic Auth</label>
+        <select class="cfg-inp" id="cfgWebAuth" onchange="webAuthToggle()">
+          <option value="0">Disabled (no login required)</option>
+          <option value="1">Enabled &#8212; require username &amp; password</option>
+        </select>
+      </div>
+      <div id="webAuthFields" style="display:none">
+        <div class="cfg-row" style="margin-top:8px">
+          <label class="cfg-lbl">Username</label>
+          <input class="cfg-inp" id="cfgWebUser" type="text" maxlength="31"
+                 autocomplete="username" placeholder="admin">
+        </div>
+        <div class="cfg-row" style="margin-top:8px">
+          <label class="cfg-lbl">New password</label>
+          <input class="cfg-inp" id="cfgWebPass" type="password" maxlength="63"
+                 autocomplete="new-password" placeholder="(leave empty to keep current)">
+        </div>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; Default: <b>admin / admin</b>. Changes take effect immediately. Password is write-only.
+      </div>
+    </div>
+
+    <!-- Actions -->
+    <div class="card">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-        <button class="btn yw" id="sdUmBtn" onclick="sdSafeUnmount()">&#9888; Safe unmount SD</button>
-        <button class="btn g"  id="sdMtBtn" onclick="sdRemount()">&#8635; Mount SD</button>
+        <button class="btn b" id="cfgSaveBtn" onclick="cfgSave()">&#10003; Save &amp; apply</button>
+        <button class="btn yw" onclick="cfgReboot()">&#8635; Reboot</button>
+        <button class="btn gr" onclick="cfgFactory()" style="margin-left:auto">&#9888; Factory reset</button>
+        <span class="sp" id="cfgActSp"></span>
+        <span id="cfgActMsg" style="font-size:.8rem"></span>
+      </div>
+      <div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn gr" onclick="sdSafeUnmount()" id="sdUmBtn">&#9014; Unmount SD</button>
+        <button class="btn b" onclick="sdRemount()" id="sdMtBtn">&#8679; Mount SD</button>
+        <span id="sdCfgMsg" style="font-size:.8rem;color:var(--muted)"></span>
         <span class="sp" id="sdCfgSp"></span>
       </div>
-      <div id="sdCfgMsg" style="margin-top:10px;font-size:clamp(.72rem,1.4vw,.85rem);display:none"></div>
     </div>
 
-  </div>
-</div>
-
-<div class="mbg" id="mkModal">
-  <div class="md">
-    <h3>&#128193; New folder</h3>
-    <input type="text" id="mkName" placeholder="Folder name" onkeydown="if(event.key==='Enter')doMkdir()">
-    <div class="mdb">
-      <button class="btn gr" onclick="closeMkdir()">Cancel</button>
-      <button class="btn g" onclick="doMkdir()">Create</button>
-    </div>
   </div>
 </div>
 
@@ -380,7 +443,167 @@ function mkTd(cls,t){var td=document.createElement('td');td.className=cls;if(t)t
 function cmp(a,b){return a.name.localeCompare(b.name);}
 
 var curTab=0;
-function showTab(n){curTab=n;for(var i=0;i<5;i++){$('t'+i).classList.toggle('active',i===n);$('p'+i).classList.toggle('active',i===n);}if(n===0)cdLoadDir(cdPath);if(n===1)fmLoadDir(fmPath);if(n===3)loadSysinfo();if(n===4)cfgLoad();}
+// ══════════════════════════════════════════════════════
+//  AUDIO PLAYER
+// ══════════════════════════════════════════════════════
+var apState=0, apTrack=0, apTracks=[], apPollTimer=null, apVolume=80, apMuted=false;
+
+function apFmt(m,s,f){return m+':'+(s<10?'0':'')+s;}
+function apSectToMs(sects){var t=Math.floor(sects/75);return apFmt(Math.floor(t/60),t%60,0);}
+
+function apLoad(status){
+  if(!status||!status.tracks) return;
+  apTracks = status.tracks;
+  apState  = status.state;
+  apVolume = status.volume;
+  apMuted  = status.muted;
+
+  // Enable/disable Audio tab based on whether there are audio tracks
+  var hasAudio = apTracks.length > 0;
+  var t5 = $('t5');
+  if(t5){
+    t5.classList.toggle('disabled', !hasAudio);
+    // If tab was active but disc changed to no audio, go back to tab 0
+    if(!hasAudio && curTab===1) showTab(0);
+    // If audio appeared and we're on tab 0, don't auto-switch — user decides
+  }
+
+  // Update volume UI
+  $('apVol').value     = apVolume;
+  $('apVolLabel').textContent = apVolume;
+  $('apBtnMute').classList.toggle('active', apMuted);
+  $('apBtnMute').textContent  = apMuted ? '\u{1F507}' : '\u{1F50A}';
+
+  // Update play button
+  $('apBtnPlay').textContent = (apState===1)?'\u23F8':'\u25B6';
+  $('apBtnPlay').classList.toggle('active', apState===1);
+
+  // State badge
+  var badges={0:'STOPPED',1:'PLAYING',2:'PAUSED'};
+  var badgeCols={0:'#333',1:'#e94560',2:'#f5a623'};
+  var sb=$('apStateBadge');
+  sb.textContent=badges[apState]||'?';
+  sb.style.background=badgeCols[apState]||'#333';
+  sb.style.color=apState?'#fff':'var(--muted)';
+
+  // Current track info
+  var sub=status.sub||{};
+  var curTrk=apTracks.find(function(t){return t.num===sub.track;});
+  if(curTrk){
+    apTrack=curTrk.num;
+    $('apTrackName').textContent='Track '+curTrk.num+'  '+curTrk.title;
+    $('apTimeRel').textContent=apFmt(sub.relM,sub.relS,sub.relF);
+    $('apTimeAbs').textContent=apFmt(sub.absM,sub.absS,sub.absF);
+    $('apTimeTotal').textContent=apSectToMs(curTrk.len);
+    var prog=curTrk.len>0?(sub.relM*60*75+sub.relS*75+sub.relF)/curTrk.len*100:0;
+    $('apProgFill').style.width=Math.min(100,prog)+'%';
+  } else if(apTracks.length>0){
+    $('apTrackName').textContent='Track '+apTracks[0].num+'  '+apTracks[0].title;
+    $('apTimeRel').textContent='0:00';
+    $('apTimeAbs').textContent='0:00';
+    $('apTimeTotal').textContent=apSectToMs(apTracks[0].len);
+    $('apProgFill').style.width='0%';
+  }
+
+  // Track list
+  var tl=$('apTrackList');
+  if(tl.children.length!==apTracks.length){
+    tl.innerHTML='';
+    apTracks.forEach(function(t){
+      var row=document.createElement('div');
+      row.className='ap-trow';
+      row.id='aptr'+t.num;
+      row.innerHTML='<span class="ap-tnum">'+t.num+'</span>'+
+        '<span class="ap-tname">'+t.title+'</span>'+
+        '<span class="ap-tdur">'+apSectToMs(t.len)+'</span>';
+      row.onclick=(function(n){return function(){apPlayTrack(n);};})(t.num);
+      tl.appendChild(row);
+    });
+  }
+  // Highlight current track row
+  apTracks.forEach(function(t){
+    var row=$('aptr'+t.num);
+    if(row) row.classList.toggle('playing', t.num===sub.track&&apState>0);
+  });
+}
+
+function apPoll(){
+  fetch('/api/audio/status').then(function(r){return r.json();}).then(apLoad).catch(function(){});
+}
+
+function apStartPoll(){
+  if(!apPollTimer) apPollTimer=setInterval(apPoll,400);
+  apPoll();
+}
+function apStopPoll(){
+  // Keep a slow background poll (3s) so PC-driven changes are still detected
+  // and the tab state badge / enable stays current
+  if(apPollTimer){ clearInterval(apPollTimer); apPollTimer=null; }
+  if(!apBgTimer)  apBgTimer=setInterval(apBgPoll,2000);
+}
+var apBgTimer=null;
+function apBgPoll(){
+  // Lightweight background poll — just update tab state, don't repaint tracklist
+  fetch('/api/audio/status').then(function(r){return r.json();}).then(function(s){
+    if(!s) return;
+    // Update tab enable/disable
+    var hasAudio=s.track_count>0;
+    var t5=$('t1');
+    if(t5) t5.classList.toggle('disabled',!hasAudio);
+    // If on audio tab, do full repaint
+    if(hasAudio){
+      if(apTracks.length===0) apLoad(s);
+      else if(curTab===1) apLoad(s);
+    }
+  }).catch(function(){});
+}
+
+function apPlayTrack(n){
+  fetch('/api/audio/play?track='+n).then(function(){apPoll();});
+}
+function apPlayPause(){
+  if(apState===1) fetch('/api/audio/pause').then(function(){apPoll();});
+  else if(apState===2) fetch('/api/audio/resume').then(function(){apPoll();});
+  else {
+    var t=apTracks.find(function(t){return t.num===apTrack;})||apTracks[0];
+    if(t) apPlayTrack(t.num);
+  }
+}
+function apStop(){ fetch('/api/audio/stop').then(function(){apPoll();}); }
+function apNext(){
+  var idx=apTracks.findIndex(function(t){return t.num===apTrack;});
+  if(idx<apTracks.length-1) apPlayTrack(apTracks[idx+1].num);
+}
+function apPrev(){
+  var idx=apTracks.findIndex(function(t){return t.num===apTrack;});
+  if(idx>0) apPlayTrack(apTracks[idx-1].num);
+  else if(idx===0) apSeekRel(0);
+}
+function apToggleMute(){
+  fetch('/api/audio/mute').then(function(){apPoll();});
+}
+function apSetVolume(v){
+  apVolume=parseInt(v);
+  $('apVolLabel').textContent=v;
+  fetch('/api/audio/volume?v='+v);
+}
+function apSeek(evt){
+  var rect=$('apProg').getBoundingClientRect();
+  var rel=(evt.clientX-rect.left)/rect.width;
+  if(rel<0)rel=0;if(rel>1)rel=1;
+  var t=apTracks.find(function(t){return t.num===apTrack;})||apTracks[0];
+  if(!t) return;
+  fetch('/api/audio/seek?track='+t.num+'&rel='+rel.toFixed(4));
+}
+function apSeekRel(rel){
+  var t=apTracks.find(function(t){return t.num===apTrack;})||apTracks[0];
+  if(t) fetch('/api/audio/seek?track='+t.num+'&rel='+rel);
+}
+
+function webAuthToggle(){
+  $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
+}
+function showTab(n){curTab=n;for(var i=0;i<6;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===4)loadSysinfo();if(n===5)cfgLoad();}
 
 function cfgMsg(id,txt,isOk){var el=$(id);el.style.display='block';el.style.color=isOk?'var(--green)':'var(--red)';el.textContent=txt;}
 
@@ -438,6 +661,77 @@ function cfgPickSsid(){
   }
 }
 
+function cfgScanCerts(){
+  spin('certSp',true);
+  var certBtn=$('scanCertBtn');
+  if(certBtn) certBtn.disabled=true;
+  var found=[];
+
+  function scanDir(path, done){
+    fetch('/api/ls?path='+encodeURIComponent(path)).then(function(r){return r.json();}).then(function(items){
+      var subdirs=[];
+      items.forEach(function(it){
+        if(it.dir){
+          subdirs.push(path==='/'?'/'+it.name:path+'/'+it.name);
+        } else {
+          var nm=it.name.toLowerCase();
+          if(nm.endsWith('.pem')||nm.endsWith('.crt')||nm.endsWith('.cer')||nm.endsWith('.key')){
+            var full=(path==='/'?'/'+it.name:path+'/'+it.name);
+            found.push(full);
+          }
+        }
+      });
+      // Recurse into subdirs sequentially
+      function nextDir(i){
+        if(i>=subdirs.length){done();return;}
+        scanDir(subdirs[i],function(){nextDir(i+1);});
+      }
+      nextDir(0);
+    }).catch(function(){done();});
+  }
+
+  scanDir('/',function(){
+    spin('certSp',false);
+    if(certBtn) certBtn.disabled=false;
+    found.sort();
+
+    // Populate CA cert select (includes "none" option)
+    var ca=$('cfgEapCa');
+    ca.innerHTML='<option value="">(none &#8212; skip server verify)</option>';
+    found.forEach(function(f){
+      var o=document.createElement('option');
+      o.value=f; o.textContent=f;
+      ca.appendChild(o);
+    });
+
+    // Populate client cert select
+    var cert=$('cfgEapCert');
+    cert.innerHTML='<option value="">(not set)</option>';
+    found.forEach(function(f){
+      var o=document.createElement('option');
+      o.value=f; o.textContent=f;
+      cert.appendChild(o);
+    });
+
+    // Populate key select
+    var key=$('cfgEapKey');
+    key.innerHTML='<option value="">(not set)</option>';
+    found.forEach(function(f){
+      var o=document.createElement('option');
+      o.value=f; o.textContent=f;
+      key.appendChild(o);
+    });
+
+    // Restore previously saved paths
+    eapRestoreSaved();
+
+    // Show count feedback
+    var sp=$('certSp');
+    if(sp) sp.textContent=found.length?('Found '+found.length+' file(s)'):'No cert files found';
+    setTimeout(function(){if(sp)sp.textContent='';},4000);
+  });
+}
+
 function eapRestoreSaved(){
   // After scan, try to restore previously saved paths into selects
   ['cfgEapCa','cfgEapCert','cfgEapKey'].forEach(function(id){
@@ -487,7 +781,7 @@ function eapPopulateSelects(allFiles){
 }
 
 function eapScanSD(){
-  spin('eapScanSp',true); $('eapScanBtn').disabled=true;
+  spin('certSp',true); var _b=$('scanCertBtn');if(_b)_b.disabled=true;
   var allFiles=[];
 
   function scanDir(path, done){
@@ -511,7 +805,7 @@ function eapScanSD(){
   }
 
   scanDir('/',function(){
-    spin('eapScanSp',false); $('eapScanBtn').disabled=false;
+    spin('certSp',false); var _b2=$('scanCertBtn');if(_b2)_b2.disabled=false;
     eapPopulateSelects(allFiles);
     var certFiles=allFiles.filter(function(f){
       return ['.pem','.crt','.cer','.key'].some(function(e){return f.toLowerCase().endsWith(e);});
@@ -532,8 +826,7 @@ function cfgEapModeToggle(){
 function eapCheckKeyFormat(){
   var sel=$('cfgEapKey');
   var val=sel?sel.value:'';
-  var warn=$('eapKeyWarning');
-  if(!warn) return;
+  var warn=$('eapKeyWarning'); if(!warn) return;
   // Show warning if .key file is selected (we can't check format here, just remind)
   warn.style.display=(val&&val.toLowerCase().endsWith('.key'))?'block':'none';
 }
@@ -566,6 +859,11 @@ function cfgLoad(){
     $('cfgEapCert')._savedVal = c.eapCertPath || '';
     $('cfgEapKey')._savedVal  = c.eapKeyPath  || '';
     $('cfgEapKPass').value = '';  // never pre-fill password
+    $('cfgAudioModule').value = c.audioModule ? '1' : '0';
+    $('cfgWebAuth').value = c.webAuth ? '1' : '0';
+    $('cfgWebUser').value = c.webUser || 'admin';
+    $('cfgWebPass').value = '';
+    webAuthToggle();
     eapRestoreSaved();
     if(c.dhcp){$('rDhcp').checked=true;}else{$('rStatic').checked=true;}
     cfgDhcpToggle();
@@ -589,6 +887,10 @@ function cfgSave(){
   params.set('eapCertPath',$('cfgEapCert').value||'');
   params.set('eapKeyPath',$('cfgEapKey').value||'');
   if($('cfgEapKPass').value.trim()) params.set('eapKeyPass',$('cfgEapKPass').value.trim());
+  params.set('audioModule',$('cfgAudioModule').value);
+  params.set('webAuth',$('cfgWebAuth').value);
+  if($('cfgWebUser').value.trim()) params.set('webUser',$('cfgWebUser').value.trim());
+  if($('cfgWebPass').value.trim()) params.set('webPass',$('cfgWebPass').value.trim());
   if(!dhcp){
     params.set('ip',$('cfgIp').value.trim());
     params.set('mask',$('cfgMask').value.trim());
@@ -605,18 +907,20 @@ function cfgSave(){
 
 function cfgReboot(){
   if(!confirm('Reboot the ESP32?'))return;
-  spin('cfgActSp',true);$('cfgRebootBtn').disabled=true;
+  spin('cfgActSp',true);
   fetch('/api/reboot').then(function(r){return r.text();}).then(function(m){
+    spin('cfgActSp',false);
     cfgMsg('cfgActMsg','Rebooting... reconnect in ~5s',true);log(m);
-  }).catch(function(){cfgMsg('cfgActMsg','Rebooting...',true);});
+  }).catch(function(){spin('cfgActSp',false);cfgMsg('cfgActMsg','Rebooting...',true);});
 }
 
 function cfgFactory(){
   if(!confirm('Factory reset will erase ALL settings and reboot. Continue?'))return;
-  spin('cfgActSp',true);$('cfgFactoryBtn').disabled=true;
+  spin('cfgActSp',true);
   fetch('/api/factory').then(function(r){return r.text();}).then(function(m){
+    spin('cfgActSp',false);
     cfgMsg('cfgActMsg','Factory reset done. Rebooting...',true);log(m);
-  }).catch(function(){cfgMsg('cfgActMsg','Rebooting...',true);});
+  }).catch(function(){spin('cfgActSp',false);cfgMsg('cfgActMsg','Rebooting...',true);});
 }
 
 function sdCfgMsg(txt,ok){var el=$('sdCfgMsg');el.style.display='block';el.style.color=ok?'var(--green)':'var(--red)';el.textContent=txt;}
@@ -633,7 +937,7 @@ function sdRemount(){
   fetch('/api/sd/mount').then(function(r){return r.text();}).then(function(m){
     spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;
     sdCfgMsg(m, m.indexOf('OK')===0);
-    log(m);loadStatus();cdLoadDir('/');fmLoadDir('/');
+    log(m);loadStatus();cdLoadDir('/');fmLoadDir('/');apBgTimer=setInterval(apBgPoll,2000);apBgPoll();setTimeout(apBgPoll,600);setTimeout(apBgPoll,1500);apPoll();
   }).catch(function(){spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;sdCfgMsg('ERROR: request failed',false);});
 }
 
@@ -713,6 +1017,20 @@ function loadSysinfo(){
     siRow(sy,'CPU',s.sys_cpu_mhz+' MHz');
     siRow(sy,'Flash',s.sys_flash_mb+' MB');
     siRow(sy,'SDK',s.sys_sdk);
+      // Audio section
+      var ta=$('siAudio')&&$('siAudio').querySelector('tbody');
+      if(ta){
+        ta.innerHTML='';
+        var audioModLabel=s.audio_module?'<span style="color:var(--ok)">&#10003; PCM5102 enabled</span>':'<span style="color:var(--muted)">disabled</span>';
+        siRow(ta,'Module',audioModLabel);
+        if(s.audio_module){
+          siRow(ta,'I2S',s.i2s_ready?'<span style="color:var(--ok)">initialized</span>':'<span style="color:#e74c3c">init failed</span>');
+          var astL={0:'STOPPED',1:'<span style="color:var(--ok)">PLAYING</span>',2:'<span style="color:#f5a623">PAUSED</span>'};
+          siRow(ta,'Playback',astL[s.audio_state]||'?');
+          siRow(ta,'Volume',s.audio_muted?'<span style="color:var(--muted)">MUTED</span>':(s.audio_volume||0)+'%');
+          siRow(ta,'Audio tracks',(s.audio_tracks||0)+'');
+        }
+      }
     siRow(sy,'USB note','Full Speed 12 Mbit/s &rarr; ~600-900 KB/s real throughput');
 
   }).catch(function(){spin('siSp',false);$('siBtn').disabled=false;log('ERROR: sysinfo fetch failed.');});
@@ -772,7 +1090,7 @@ function cdLoadDir(path){
       var tdS=mkTd('sz',item.dir?'':fmtSz(item.size));
       var tdA=mkTd('ac','');
       if(!item.dir){
-        var mb=document.createElement('button');mb.className='btn g';mb.textContent=isCue?'▶ Mount disc':'▶ Mount';
+        var mb=document.createElement('button');mb.className='btn g';mb.style.whiteSpace='nowrap';mb.textContent=isCue?'▶ Mount disc':'▶ Mount';
         mb.onclick=(function(p){return function(){doMount(p);};})(fp);tdA.appendChild(mb);
       }
       tr.append(tdI,tdN,tdS,tdA);tb.appendChild(tr);shown++;
@@ -802,8 +1120,8 @@ function fmLoadDir(path){
       var tdN=document.createElement('td');tdN.className='nm'+(item.dir?' d':'');tdN.textContent=item.name;
       if(item.dir)tdN.onclick=(function(p){return function(){fmLoadDir(p);};})(fp);
       var tdA=mkTd('ac','');
-      if(isImg){var mb=document.createElement('button');mb.className='btn g';mb.textContent='▶';mb.onclick=(function(p){return function(){doMount(p);};})(fp);tdA.appendChild(mb);}
-      if(!item.dir){var dlb=document.createElement('a');dlb.className='btn gr';dlb.textContent='⬇';dlb.href='/api/download?path='+encodeURIComponent(fp);dlb.download=item.name;dlb.style.textDecoration='none';dlb.title='Download';tdA.appendChild(dlb);}var db=document.createElement('button');db.className='btn r';db.textContent='🗑';
+      if(isImg){var mb=document.createElement('button');mb.className='btn g';mb.style.whiteSpace='nowrap';mb.textContent='▶';mb.onclick=(function(p){return function(){doMount(p);};})(fp);tdA.appendChild(mb);}
+      if(!item.dir){var dlb=document.createElement('a');dlb.className='btn gr';dlb.textContent='⬇';dlb.href='/api/download?path='+encodeURIComponent(fp);dlb.download=item.name;dlb.style.textDecoration='none';dlb.style.display='inline-flex';dlb.style.alignItems='center';dlb.title='Download';tdA.appendChild(dlb);}var db=document.createElement('button');db.className='btn r';db.textContent='🗑';
       db.onclick=(function(p,d){return function(){doDelete(p,d);};})(fp,item.dir);
       tdA.appendChild(db);tr.append(mkTd('ic',icon),tdN,mkTd('sz',item.dir?'':fmtSz(item.size)),tdA);tb.appendChild(tr);
     });
@@ -843,10 +1161,40 @@ function renderBc(elId,path,fn){
   },'');
 }
 
+function sdUnmount(){
+  spin('sdCfgSp',true);
+  fetch('/api/sd/unmount').then(function(r){return r.text();}).then(function(m){
+    spin('sdCfgSp',false);
+    var ok=m.indexOf('OK')===0;
+    var el=$('sdCfgMsg');el.textContent=m;el.style.color=ok?'var(--ok)':'var(--err)';
+    log(m);
+  }).catch(function(){spin('sdCfgSp',false);});
+}
+function sdMount(){
+  spin('sdCfgSp',true);
+  fetch('/api/sd/mount').then(function(r){return r.text();}).then(function(m){
+    spin('sdCfgSp',false);
+    var ok=m.indexOf('OK')===0;
+    var el=$('sdCfgMsg');el.textContent=m;el.style.color=ok?'var(--ok)':'var(--err)';
+    log(m);
+    if(ok){cdLoadDir('/');fmLoadDir('/');}
+  }).catch(function(){spin('sdCfgSp',false);});
+}
+
 loadStatus();cdLoadDir('/');fmLoadDir('/');setInterval(loadStatus,5000);
 
 function clearLog(){$('log').textContent='Log cleared.\n';}
 </script>
+<div id="mkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div class="ct" style="margin-bottom:12px">&#128193; New Folder</div>
+    <input id="mkName" type="text" class="cfg-inp" style="width:100%;margin-bottom:12px" placeholder="Folder name" onkeydown="if(event.key==='Enter')doMkdir();if(event.key==='Escape')closeMkdir();">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="closeMkdir()">Cancel</button>
+      <button class="btn b" onclick="doMkdir()">&#10003; Create</button>
+    </div>
+  </div>
+</div>
 </body>
 </html>
 )RAWHTML";
