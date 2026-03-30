@@ -1,6 +1,6 @@
 # ESP32-S3 Virtual CD-ROM Drive + File Manager
 
-A firmware project for the ESP32-S3 microcontroller that emulates a USB CD-ROM drive while serving a full-featured web-based file manager over Wi-Fi. Disc images stored on an SD card are presented to the host PC as a standard read-only optical drive — no drivers required.
+Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored on an SD card are presented to the host PC as a standard optical drive — no drivers required. The device also acts as a Wi-Fi file manager and supports audio track playback from CUE images via an I2S DAC module.
 
 ---
 
@@ -8,35 +8,47 @@ A firmware project for the ESP32-S3 microcontroller that emulates a USB CD-ROM d
 
 - [Features](#features)
 - [Hardware Requirements](#hardware-requirements)
-- [Wiring Diagram](#wiring-diagram)
-- [Arduino IDE Settings](#arduino-ide-settings)
-- [Required Libraries](#required-libraries)
-- [First-Time Setup](#first-time-setup)
-- [Serial CLI Reference](#serial-cli-reference)
+- [Wiring](#wiring)
+- [Complete Setup from Scratch](#complete-setup-from-scratch)
+  - [1. Install Arduino IDE](#1-install-arduino-ide)
+  - [2. Install ESP32 Board Package](#2-install-esp32-board-package)
+  - [3. Install Libraries](#3-install-libraries)
+  - [4. Arduino IDE Settings](#4-arduino-ide-settings)
+  - [5. Install WSL with AlmaLinux](#5-install-wsl-with-almalinux)
+  - [6. Install Tools in AlmaLinux](#6-install-tools-in-almalinux)
+  - [7. Run build_exfat_libs.py](#7-run-build_exfat_libspy)
+  - [8. Compile and Upload Firmware](#8-compile-and-upload-firmware)
+  - [9. First Boot and Configuration](#9-first-boot-and-configuration)
+- [Arduino IDE Settings Reference](#arduino-ide-settings-reference)
 - [Web Interface](#web-interface)
+- [Serial CLI](#serial-cli)
 - [Wi-Fi Configuration](#wi-fi-configuration)
 - [802.1x Enterprise Wi-Fi (EAP)](#8021x-enterprise-wi-fi-eap)
+- [Web UI Authentication](#web-ui-authentication)
+- [Audio CD Playback](#audio-cd-playback)
 - [Supported Disc Image Formats](#supported-disc-image-formats)
-- [Python Utility Scripts](#python-utility-scripts)
-  - [build_exfat_libs.py — exFAT Support](#build_exfat_libspy--exfat-support)
-  - [patch_usbmsc.py — CD-ROM SCSI Commands](#patch_usbmscpy--cd-rom-scsi-commands)
+- [Python Scripts](#python-scripts)
 - [API Reference](#api-reference)
 - [RGB LED Status Codes](#rgb-led-status-codes)
 - [Troubleshooting](#troubleshooting)
+- [Project Files](#project-files)
 
 ---
 
 ## Features
 
-- **USB CD-ROM emulation** — presents as a USB Mass Storage Class device with CD-ROM SCSI profile; the host PC sees a read-only optical drive
-- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`) with all standard sector layouts, and CUE sheet parsing (`.cue`) for multi-track images
-- **Web file manager** — upload, download, delete, create directories, and drag-and-drop via a single-page browser application served directly from the ESP32
-- **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, and WPA2-Enterprise EAP-TLS with full certificate management
-- **mDNS** — device reachable at `hostname.local` on the local network; supports full FQDN for DHCP clients
-- **NVS configuration persistence** — all settings survive reboot; stored in the ESP32 non-volatile storage partition
-- **Serial CLI** — complete configuration and diagnostic interface at 115 200 baud via the USB-UART bridge
-- **exFAT SD cards** — supported after applying the `build_exfat_libs.py` patch to the Arduino ESP32 toolchain
-- **RGB LED** — boot, connected, and error state indication via the onboard WS2812B LED
+- **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; the PC sees an optical drive without any drivers
+- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with multi-track support
+- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; SCSI PLAY AUDIO, READ SUB-CHANNEL, TOC for transparent emulation to games and players
+- **Web file manager** — upload, download, delete, create folders, drag-and-drop
+- **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with full certificate management
+- **mDNS** — device reachable at `hostname.local`; FQDN support
+- **NVS persistence** — all settings survive reboot
+- **Serial CLI** — complete configuration and diagnostics at 115 200 baud
+- **exFAT SD cards** — supported after applying the `build_exfat_libs.py` patch
+- **Web UI authentication** — HTTP Basic Auth, enable/disable, username/password via web or CLI, disabled by default
+- **Bidirectional audio sync** — PC controls playback via SCSI, HTML syncs within 400 ms
+- **RGB LED** — boot / Wi-Fi / error state indication
 
 ---
 
@@ -44,246 +56,539 @@ A firmware project for the ESP32-S3 microcontroller that emulates a USB CD-ROM d
 
 | Component | Notes |
 |---|---|
-| ESP32-S3 development board | Any variant with OTG USB and 16 MB flash recommended; tested on ESP32-S3 DevKitC-1 N16R8 |
-| MicroSD card module (SPI/SD_MMC) | 3.3 V logic — **do not use 5 V modules without a level shifter** |
-| MicroSD card | FAT32 or exFAT (exFAT requires the `build_exfat_libs.py` script) |
-| USB-A to USB-C cable (×2) | One for UART programming/serial, one OTG to the target host PC |
-| USB-C to USB-A OTG adapter | For connecting the OTG port to a standard PC port |
+| ESP32-S3 DevKitC-1 N16R8 | 16 MB flash, 8 MB OPI PSRAM — tested on this variant |
+| MicroSD card + module | 3.3 V logic — **do not use 5 V modules without a level shifter** |
+| USB-A to USB-C cable x2 | One for UART/programming, one OTG to the target PC |
+| GY-PCM5102 I2S module | Optional — for audio track playback from CUE images |
 
-The MicroSD module is connected to the ESP32-S3 using SD_MMC in **1-bit mode** to avoid pin conflicts with the USB OTG peripheral. The four required signals are: CLK, CMD (MOSI), D0 (MISO), and D3/CS.
-
-> **Important:** The SD module's VCC pin must be connected to **3.3 V**, not 5 V. Most bare SD card breakout boards accept 3.3 V logic and power directly. Modules with onboard 5 V regulators may need the 3.3 V rail bypassed.
+![ESP32-S3 DevKitC-1 N16R8](doc/esp32s3.png)
 
 ---
 
-## Wiring Diagram
+## Wiring
 
-![Wiring Diagram](doc/wiring.svg)
+### SD Card (SD_MMC 1-bit mode)
 
+```
+ESP32-S3 GPIO12  ->  CLK  (D5)
+ESP32-S3 GPIO11  ->  CMD  (D7 / MOSI)
+ESP32-S3 GPIO13  ->  D0   (D6 / MISO)
+ESP32-S3 GPIO10  ->  CS   (D4 / D3)
+ESP32-S3 3V3     ->  VCC
+ESP32-S3 GND     ->  GND
+```
+
+### GY-PCM5102 I2S Audio (optional)
+
+![GY-PCM5102](doc/GY-PCM5102.png)
+
+```
+ESP32-S3 GPIO14  ->  BCK  (Bit Clock)
+ESP32-S3 GPIO15  ->  LCK  (Word Select / WS)
+ESP32-S3 GPIO16  ->  DIN  (Data In)
+ESP32-S3 3V3     ->  VCC
+ESP32-S3 GND     ->  GND
+GND              ->  FMT  (I2S Philips format -- connect to GND)
+GND              ->  SCK  (no master clock -- connect to GND)
+```
+
+> **Important:** The SD module must be powered from **3.3 V**, not 5 V. The ESP32-S3 DevKitC-1 has **two** USB connectors -- the left one is UART (programming and serial monitor), the right one is USB OTG (virtual CD-ROM for the target PC). Never swap them.
 
 ---
 
-## Arduino IDE Settings
+## Complete Setup from Scratch
 
-Open **Tools** menu and set all of the following before compiling:
+### 1. Install Arduino IDE
+
+1. Download **Arduino IDE 2.x** from https://www.arduino.cc/en/software
+2. Run the installer with default settings
+3. Launch Arduino IDE
+
+---
+
+### 2. Install ESP32 Board Package
+
+1. Open **File -> Preferences**
+2. Add to **Additional boards manager URLs**:
+   ```
+   https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+   ```
+3. Click OK
+4. Open **Tools -> Board -> Boards Manager**
+5. Search for `esp32`
+6. Install **esp32 by Espressif Systems** version **3.3.7**
+
+   > Download takes 5-15 minutes (~500 MB of toolchain).
+
+---
+
+### 3. Install Libraries
+
+Open **Sketch -> Include Library -> Manage Libraries** and install:
+
+- **Adafruit NeoPixel** (search "neopixel", author Adafruit)
+
+All other dependencies are part of the ESP32 Arduino core and do not require separate installation.
+
+---
+
+### 4. Arduino IDE Settings
+
+Copy the project files into one folder:
+```
+ESP32S3_VirtualCDROM.ino
+html_page.h
+partitions.csv
+```
+
+Open `ESP32S3_VirtualCDROM.ino` in Arduino IDE and configure in the **Tools** menu:
 
 | Setting | Value |
 |---|---|
-| Board | ESP32S3 Dev Module |
-| USB Mode | USB-OTG (TinyUSB) |
-| USB CDC On Boot | Disabled |
-| Flash Size | 16MB (N16R8) |
-| Partition Scheme | Huge APP (3MB No OTA / 1MB SPIFFS) |
-| PSRAM | OPI PSRAM |
+| Board | **ESP32S3 Dev Module** |
+| USB CDC On Boot | **Disabled** |
+| CPU Frequency | 240MHz (WiFi) |
+| Flash Mode | QIO 80MHz |
+| Flash Size | **16MB (128Mb)** |
+| Partition Scheme | **Custom** |
+| PSRAM | **OPI PSRAM** |
 | Upload Mode | UART0 / Hardware CDC |
 | Upload Speed | 921600 |
+| USB Mode | **USB-OTG (TinyUSB)** |
 
-> **USB Mode** must be **USB-OTG (TinyUSB)**, not "Hardware CDC". The OTG port is used for the virtual CD-ROM; the UART bridge (CH343 or CP2102) handles programming and the serial monitor.
+![Arduino IDE Settings](doc/arduino_ide_settings.png)
 
----
+> **Critical:** Board must be `ESP32S3 Dev Module`, **never** `ESP32-S3-USB-OTG` -- that one has 8 MB flash hardcoded and the sketch will not fit. Flash Size must be **16MB (128Mb)** for the Custom partition scheme to work. USB Mode must be **USB-OTG (TinyUSB)** for the virtual CD-ROM.
 
-## Required Libraries
-
-Install via the Arduino Library Manager (**Sketch → Include Library → Manage Libraries**):
-
-- **Adafruit NeoPixel** — RGB LED control
-
-All other dependencies (`WiFi`, `ESPmDNS`, `WebServer`, `SD_MMC`, `USB`, `USBMSC`, `Preferences`, `mbedtls`) are part of the ESP32 Arduino core and do not require separate installation.
+The `partitions.csv` file from the project folder provides a 6 MB application partition. With `Partition Scheme: Custom` Arduino IDE will find and use it automatically.
 
 ---
 
-## First-Time Setup
+### 5. Install WSL with AlmaLinux
 
-1. Wire the hardware as described above.
-2. Apply the two Python patches (see [Python Utility Scripts](#python-utility-scripts)).
-3. Open `ESP32S3_VirtualCDROM.ino` in the Arduino IDE. The file `html_page.h` must be in the same folder.
-4. Select the board and settings listed above.
-5. Upload the sketch.
-6. Open the Serial Monitor at **115 200 baud**.
-7. At the `>` prompt, configure Wi-Fi:
-   ```
-   set ssid YourNetworkName
-   set pass YourPassword
-   wifi reconnect
-   ```
-8. The device prints its IP address and mDNS hostname on successful connection. Open `http://esp32cdrom.local` (or the IP address) in a browser to reach the web interface.
-9. Place disc images (`.iso`, `.bin`/`.cue`) on the SD card. Use the web File Manager or the `mount` command to mount an image.
+The `build_exfat_libs.py` script requires a Linux environment to compile ESP-IDF. The recommended distribution is **AlmaLinux 9** (RHEL-compatible, stable, proven with this project).
+
+#### 5.1 Enable WSL on Windows
+
+Open **PowerShell as Administrator** (right-click Start -> Windows PowerShell (Admin)):
+
+```powershell
+wsl --install --no-distribution
+```
+
+Restart if Windows prompts you to. Verify WSL is working:
+```powershell
+wsl --status
+```
+
+#### 5.2 Install AlmaLinux 9
+
+```powershell
+wsl --list --online
+wsl --install -d AlmaLinux-9
+```
+
+Alternatively install **AlmaLinux 9** directly from the Microsoft Store.
+
+On first launch set a username and password (the WSL account, unrelated to Windows).
+
+#### 5.3 Launch WSL
+
+```powershell
+wsl -d AlmaLinux-9
+```
+
+or simply `wsl` if AlmaLinux is the default distribution.
+
+#### 5.4 Verify Access to Windows Files
+
+Drive C: is accessible in WSL as `/mnt/c`:
+
+```bash
+ls /mnt/c/Users/
+ls /mnt/c/Users/Administrator/AppData/Local/Arduino15/
+```
 
 ---
 
-## Serial CLI Reference
+### 6. Install Tools in AlmaLinux
 
-Connect any serial terminal to the UART bridge at **115 200 baud, 8N1**. Commands are case-insensitive. Pressing Enter sends a command.
+```bash
+# Update the system
+sudo dnf update -y
 
-### General Commands
+# Core build tools (gcc, make, etc.)
+sudo dnf groupinstall -y "Development Tools"
 
-| Command | Description |
+# Packages required for the ESP-IDF build
+sudo dnf install -y \
+    git python3 python3-pip cmake ninja-build ccache \
+    wget flex bison gperf openssl-devel ncurses-devel \
+    libffi-devel zlib-devel binutils file
+
+# Python packages
+pip3 install --user pyserial
+
+# Verify
+git --version      # 2.x
+cmake --version    # 3.x
+ninja --version    # 1.x
+python3 --version  # 3.x
+```
+
+> The ESP-IDF toolchain (xtensa-esp-elf compiler, etc.) is downloaded automatically on the first run of `build.sh`. No manual toolchain installation is needed.
+
+#### Troubleshooting AlmaLinux
+
+If `sudo` does not work:
+```bash
+su -
+usermod -aG wheel your_username
+exit
+# Log out and back in to WSL
+```
+
+If `dnf` reports repository errors:
+```bash
+sudo dnf clean all
+sudo dnf makecache
+```
+
+---
+
+### 7. Run build_exfat_libs.py
+
+This script does everything automatically. Run it in the **WSL/AlmaLinux terminal**.
+
+#### Preparation -- copy the script to WSL
+
+```bash
+cp /mnt/c/Users/Administrator/Downloads/build_exfat_libs.py ~/
+cd ~
+```
+
+#### First run (full build -- takes 1 to 3 hours)
+
+```bash
+python3 build_exfat_libs.py
+```
+
+Expected console output:
+
+```
+============================================================
+  ESP32 Arduino Lib Builder -- exFAT Support
+============================================================
+
+>>> Locating Arduino15
+    Auto-detected ESP32 Arduino version: 3.3.7
+  + Arduino15: /mnt/c/Users/Administrator/AppData/Local/Arduino15
+
+>>> Cloning esp32-arduino-lib-builder...
+>>> Running build.sh -t esp32s3 ...   (1-3 hours on first run)
+  + build.sh completed
+
+>>> Patching ffconf.h
+  + Patched: ffconf.h (FF_FS_EXFAT: 0 -> 1)
+
+>>> Recompiling fatfs target (~10 seconds)
+  + fatfs compiled
+
+>>> Installing libfatfs.a to Arduino15
+  + Installed: .../esp32s3-libs/3.3.7/lib/libfatfs.a
+
+>>> Patching sdkconfig.h (5 files)
+  + Patched: dio_opi, dio_qspi, opi_opi, qio_opi, qio_qspi
+
+>>> Applying USBMSC.cpp CD-ROM + Audio SCSI patch v4
+  + USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v4)
+
+  RESULT: PASS -- all checks passed (18/18)
+```
+
+#### Subsequent runs (quick mode -- ~10 seconds)
+
+After the full build has been done once, or after updating the board package in Arduino IDE:
+
+```bash
+python3 build_exfat_libs.py --skip-full-build
+```
+
+#### Verify without making changes
+
+```bash
+python3 build_exfat_libs.py --test
+# Output: RESULT: PASS -- all checks passed (18/18)
+```
+
+#### Restore original files
+
+```bash
+python3 build_exfat_libs.py --restore
+```
+
+#### All flags
+
+| Flag | Description |
 |---|---|
-| `help` | Print the command list |
-| `show config` | Print the full configuration stored in NVS plus runtime state |
-| `status` | Print current Wi-Fi, SD, disc image, and security status |
-| `show files [path]` | Recursively list SD card contents; default path is `/` |
-| `reboot` | Restart the ESP32 |
-| `clear config` | Erase all NVS settings and restore defaults |
+| *(none)* | Full build + all patches |
+| `--skip-full-build` | Skip build.sh, only patch and install (~10s) |
+| `--skip-usbmsc` | Skip USBMSC.cpp patch |
+| `--arduino-version X.X.X` | Force a specific version instead of auto-detect |
+| `--arduino15 /path` | Override auto-detected Arduino15 path |
+| `--test` | Verify current state, no changes made |
+| `--dry-run` | Show what would happen, no changes made |
+| `--restore` | Restore all files from backup copies |
 
-### Disc Image Commands
+---
 
-| Command | Description |
-|---|---|
-| `mount <path>` | Mount an ISO/BIN/CUE file as the CD-ROM drive |
-| `umount` | Eject the current disc |
+### 8. Compile and Upload Firmware
 
-### SD Card Commands
+After `build_exfat_libs.py` completes successfully:
 
-| Command | Description |
-|---|---|
-| `sd reinit` | Reinitialize the SD card driver |
+#### 8.1 Delete the Arduino build cache
 
-### Wi-Fi Commands
+This step is **mandatory** -- without it Arduino IDE will use old compiled objects and the exFAT/USBMSC patch will not take effect.
 
-| Command | Description |
-|---|---|
-| `wifi reconnect` | Disconnect and reconnect using current settings |
+Open File Explorer and navigate to:
+```
+%LOCALAPPDATA%\arduino\
+```
+Delete the **entire `arduino` folder** (or all its contents).
 
-### Configuration — `set <key> [value]`
+#### 8.2 Restart Arduino IDE
 
-Omitting the value clears that field. All changes are written to NVS immediately.
+Close completely and reopen.
 
-| Key | Description | Example |
+#### 8.3 Select the port
+
+Connect the ESP32-S3 using the UART USB cable (left connector -- labelled UART or COM).
+
+In Arduino IDE: **Tools -> Port** -> select the port with `CH343`, `CP2102`, or `Silicon Labs`.
+
+> If the port does not appear, install the CH343 driver: https://www.wch-ic.com/products/CH343.html
+
+#### 8.4 Upload
+
+Click the Upload arrow or **Sketch -> Upload**. The first compile takes 3-5 minutes.
+
+#### 8.5 Verify
+
+Open **Tools -> Serial Monitor** at **115200 baud**. A successful boot looks like:
+
+```
+[SD]   exFAT support: YES (compiled in)
+[WiFi] Connected!  IP: 192.168.x.x
+[OK]  HTTP server started at http://192.168.x.x
+```
+
+---
+
+### 9. First Boot and Configuration
+
+#### Basic Wi-Fi (WPA2-Personal)
+
+In the Serial Monitor:
+```
+set ssid YourNetworkName
+set pass YourPassword
+wifi reconnect
+```
+
+#### After connecting
+
+Open a browser at `http://cd.local` or `http://192.168.x.x`.
+
+#### Set a default disc image
+
+```
+mount /path/to/image.iso
+```
+
+In the web interface click **Set default** -- the image will mount automatically on every boot.
+
+#### Enable the audio module (if you have GY-PCM5102)
+
+Via serial:
+```
+set audio-module on
+reboot
+```
+
+Or via web: **Config tab -> Audio Module -> GY-PCM5102 I2S -- GPIO 14/15/16 -> Save -> Reboot**.
+
+---
+
+## Arduino IDE Settings Reference
+
+| Setting | Value | Why |
 |---|---|---|
-| `ssid` | Wi-Fi network name | `set ssid MyNetwork` |
-| `pass` | WPA2-Personal password | `set pass s3cr3t` |
-| `dhcp` | DHCP on/off | `set dhcp on` |
-| `ip` | Static IP address | `set ip 192.168.1.50` |
-| `mask` | Subnet mask | `set mask 255.255.255.0` |
-| `gw` | Default gateway | `set gw 192.168.1.1` |
-| `dns` | DNS server | `set dns 8.8.8.8` |
-| `hostname` | Hostname or FQDN | `set hostname espcd` or `set hostname espcd.corp.net` |
-| `eap-mode` | 802.1x mode: `0`=off, `1`=PEAP, `2`=EAP-TLS | `set eap-mode 2` |
-| `eap-id` | EAP outer identity | `set eap-id device@corp.net` |
-| `eap-user` | PEAP inner username | `set eap-user john` |
-| `eap-pass` | PEAP inner password | `set eap-pass hunter2` |
-| `eap-ca` | SD path to CA certificate PEM | `set eap-ca /wifi/ca.pem` |
-| `eap-cert` | SD path to client certificate | `set eap-cert /wifi/client.crt` |
-| `eap-key` | SD path to private key | `set eap-key /wifi/client.key` |
-| `eap-kpass` | Passphrase for encrypted private key | `set eap-kpass myKeyPass` |
+| Board | ESP32S3 Dev Module | Correct config for N16R8; ESP32-S3-USB-OTG has 8 MB flash hardcoded |
+| USB CDC On Boot | Disabled | USB OTG must act as CD-ROM, not as CDC serial |
+| Flash Size | 16MB (128Mb) | Required for Custom partition; linker rejects the sketch otherwise |
+| Partition Scheme | Custom | `partitions.csv` provides 6 MB for the application |
+| PSRAM | OPI PSRAM | N16R8 has OPI PSRAM, not QSPI |
+| USB Mode | USB-OTG (TinyUSB) | OTG port = virtual CD-ROM |
+
+![Arduino IDE Settings](doc/arduino_ide_settings.png)
 
 ---
 
 ## Web Interface
 
-When connected to Wi-Fi the device serves a single-page application at `http://<ip-address>/` or `http://<hostname>.local/`. The interface consists of five tabs:
+Available at `http://cd.local` or via the device IP address.
 
-### CD-ROM Tab
-Browse the SD card for disc images (`.iso`, `.bin`, `.cue`). Click a file to mount it; the entry updates in real time. A separate button ejects the current disc. The default auto-mount image (loaded automatically on every boot) is set here.
+**CD-ROM** -- browse the SD card, mount/eject disc images, set the default image loaded on boot.
 
-### File Manager Tab
-Full file manager for the SD card — navigate directories, upload files via drag-and-drop or the file picker, download any file, delete files and directories, and create new folders. Upload progress is shown per file.
+**Audio** -- appears automatically when a CUE image with audio tracks is mounted. Contains: progress bar (clickable seek), play/pause/stop/prev/next controls, volume slider, mute toggle, scrollable track list. Tab is greyed out when no audio CD is mounted.
 
-### Log Tab
-Live streaming log output — shows the same messages that appear on the serial port, visible without a serial cable.
+**File Manager** -- full SD card file manager, drag-and-drop upload, download, delete, create folders.
 
-### Status Tab
-Real-time device status in a structured panel:
+**Log** -- live output stream (same messages as the serial port).
 
-- **Wi-Fi** — SSID, band (2.4/5 GHz), channel, signal quality bar, IP/mask/gateway/DNS, BSSID, hostname, mDNS link, auth method
-- **802.1x security detail** (when enterprise mode is active) — EAP identity, client cert path, key path, passphrase status, CA cert, runtime cert format, runtime key format
-- **SD card** — total / used / free capacity
-- **Disc image** — path, sector count, raw sector size, header offset, USB media-present flag
-- **System** — free heap, uptime, CPU frequency, flash size, SDK version
+**Status** -- real-time device status: Wi-Fi, SD card, disc image, EAP certificate details, audio module, system info.
 
-### Config Tab
-All configuration settings are editable through the web UI without the serial port:
+**Config** -- complete configuration without a serial cable. Sections:
+- **WiFi** -- SSID, password, network scan
+- **Network** -- DHCP/Static, IP/mask/gateway/DNS, Hostname with live mDNS preview
+- **802.1x Enterprise WiFi** -- EAP Mode, identity, **Scan SD** for auto-detection of `.pem/.crt/.key` files, CA cert, Client cert/key, passphrase
+- **Audio Module** -- PCM5102 I2S enable/disable dropdown
+- **Web UI Authentication** -- enable/disable HTTP Basic Auth, username, password (write-only)
+- **Actions** -- Save, Reboot, Factory reset, SD unmount/mount
 
-- Wi-Fi SSID and password
-- DHCP toggle — when switched off the current IP/mask/gateway/DNS from the running system is pre-filled automatically
-- Static IP/mask/gateway/DNS fields
-- Hostname field with live mDNS preview (`.local` link updates as you type)
-- **802.1x section** — mode dropdown, SD card scan button (finds all `.pem`, `.crt`, `.key` files anywhere on the card and populates dropdowns), CA cert dropdown (includes "none" option to disable server verification), client cert dropdown, client key dropdown, key passphrase field
-- Save, Reboot, and Factory Reset actions
-- SD card unmount / remount
+---
+
+## Serial CLI
+
+Connect any serial terminal at **115 200 baud, 8N1**.
+
+| Command | Description |
+|---|---|
+| `help` | Command list (sections: 802.1x / Web Auth / Commands) |
+| `show config` | Full configuration + runtime state |
+| `status` | Current Wi-Fi, SD, disc image, audio state |
+| `show files [path]` | Recursive SD card listing |
+| `mount <file>` | Mount ISO/BIN/CUE |
+| `umount` | Eject current disc |
+| `sd reinit` | Reinitialize SD card |
+| `wifi reconnect` | Disconnect and reconnect Wi-Fi |
+| `reboot` | Restart device |
+| `clear config` | Factory reset (erases all NVS settings) |
+
+**`set` commands:**
+
+| Key | Description |
+|---|---|
+| `ssid` | Wi-Fi network name |
+| `pass` | WPA2-Personal password |
+| `dhcp on/off` | Enable/disable DHCP |
+| `ip / mask / gw / dns` | Static network settings |
+| `hostname` | Hostname or FQDN |
+| `eap-mode 0/1/2` | 0=off, 1=PEAP, 2=EAP-TLS |
+| `eap-id / eap-user / eap-pass` | EAP credentials |
+| `eap-ca / eap-cert / eap-key` | Paths to certificates on SD card |
+| `eap-kpass` | Passphrase for an encrypted private key |
+| `audio-module on/off` | PCM5102 I2S audio module |
+| `web-auth on/off` | HTTP Basic Auth (default: off) |
+| `web-user <name>` | Web UI username (default: admin) |
+| `web-pass <password>` | Web UI password (default: admin) |
 
 ---
 
 ## Wi-Fi Configuration
 
-The device supports both DHCP and static IP addressing. The hostname configured via `set hostname` is sent to the DHCP server as the client identifier and is also used for mDNS. When a fully-qualified domain name is given (e.g. `device.corp.net`) the first label becomes the mDNS name (`device.local`) while the full FQDN is sent to the DHCP server.
-
-Wi-Fi credentials and all settings are stored in the ESP32 NVS flash partition and survive power cycling.
+The firmware supports both DHCP and static IP. The configured hostname is sent to the DHCP server and used for mDNS. A FQDN (e.g. `cd.corp.net`) automatically creates the mDNS alias `cd.local`.
 
 ---
 
 ## 802.1x Enterprise Wi-Fi (EAP)
 
-The firmware supports connecting to WPA2-Enterprise networks using either PEAP (username + password) or EAP-TLS (client certificate + private key). Both modes use the `esp_eap_client` API from ESP-IDF 5.x.
-
-### PEAP (mode 1)
+### PEAP
 
 ```
 set eap-mode 1
-set eap-id   username@corp.net
-set eap-user username
+set eap-id   user@corp.net
+set eap-user user
 set eap-pass Password123
-set eap-ca   /wifi/ca.pem        (optional)
+set eap-ca   /wifi/ca.pem     (optional)
 wifi reconnect
 ```
 
-### EAP-TLS (mode 2)
+### EAP-TLS
 
 ```
 set eap-mode 2
 set eap-cert /wifi/client.crt
 set eap-key  /wifi/client.key
-set eap-ca   /wifi/ca.pem        (optional — omit to skip server cert verification)
+set eap-ca   /wifi/ca.pem     (optional)
 wifi reconnect
 ```
 
-The EAP identity (`eap-id`) is optional in EAP-TLS mode. When not set, the firmware extracts the Common Name (CN) from the client certificate using mbedTLS at connect time and uses it automatically.
+The EAP identity (`eap-id`) is optional in EAP-TLS mode -- the firmware extracts it from the certificate CN automatically.
 
 ### Certificate Requirements
 
-- Certificates and keys must be in **PEM format** (base64, with `-----BEGIN ...-----` headers)
-- Supported private key formats:
-  - `BEGIN RSA PRIVATE KEY` — PKCS#1 (traditional OpenSSL format)
-  - `BEGIN PRIVATE KEY` — PKCS#8 (default in OpenSSL 3.x and later)
-  - `BEGIN EC PRIVATE KEY` — EC private key
-  - `BEGIN ENCRYPTED PRIVATE KEY` — passphrase-protected; set `eap-kpass` before connecting
-- Both RSA 2048-bit and RSA 4096-bit certificates are supported under ESP-IDF 5.5 / mbedTLS 3.x
-- The client certificate should include the `extendedKeyUsage = clientAuth` (OID `1.3.6.1.5.5.7.3.2`) extension
-- Maximum file size per PEM file: 16 KB; the firmware checks available heap before loading
+- Format: **PEM** (base64, `-----BEGIN ...-----` header)
+- Supported private key formats: PKCS#1, PKCS#8, EC, encrypted (set `eap-kpass`)
+- RSA 2048-bit and 4096-bit both work under ESP-IDF 5.5 / mbedTLS 3.x
 
-### Converting a PKCS#8 Key to PKCS#1
-
-Modern OpenSSL (3.x) generates PKCS#8 by default. While PKCS#8 is supported by ESP-IDF 5.5, if you need PKCS#1 for compatibility with older builds:
-
-```bash
-openssl pkey -traditional -in client.key -out client_rsa.key
-# Output starts with: -----BEGIN RSA PRIVATE KEY-----
-```
-
-### Key Format Diagnostics
-
-Every connection attempt logs the detected key and certificate format:
-
-```
-[EAP]  ── Format Check ──
-[EAP]  Key : PKCS#8  ✓  (supported by ESP-IDF 5.x mbedTLS)
-[EAP]  Cert: X.509 PEM  ✓
-[EAP]  Client cert + key OK  (heap: 218460 B)
-```
-
-### Certificate Buffers and the Supplicant Task
-
-A critical implementation detail: the ESP-IDF WPA supplicant runs as a background FreeRTOS task and continues performing the TLS handshake asynchronously after `WiFi.begin()` returns. The certificate and key buffers passed to `esp_eap_client_set_certificate_and_key()` **must remain allocated in memory** for the entire duration of the handshake. The firmware keeps these buffers in static global variables (`s_eapCertBuf`, `s_eapKeyBuf`, `s_eapCaBuf`) that are freed only at the start of the next `startWiFi()` call.
-
-### RADIUS Server Setup (EAP-TLS)
-
-For a FreeRADIUS server to accept the ESP32 certificate, the username used in the SQL `radcheck` table must match the EAP identity sent by the device:
+### FreeRADIUS Setup
 
 ```sql
 INSERT INTO radcheck (username, attribute, value, op)
-VALUES ('device@corp.net', 'Auth-Type', 'EAP', ':=');
+VALUES ('identity', 'Auth-Type', 'EAP', ':=');
 ```
+
+---
+
+## Web UI Authentication
+
+The web interface can be protected with HTTP Basic Auth. Default state: **disabled** (no login required). Default credentials: `admin / admin`.
+
+**Via serial CLI:**
+```
+set web-auth on          # enable authentication
+set web-user myuser      # change username
+set web-pass mysecret    # change password
+show config              # verify: Web auth: enabled
+```
+
+**Via web Config tab:** Web UI Authentication section -> dropdown Enabled -> fill in Username and New password -> Save.
+
+Password is **write-only** -- the API never returns it. Changes take effect immediately, no reboot needed.
+
+---
+
+## Audio CD Playback
+
+### Bidirectional Synchronization
+
+The HTML audio player synchronises with the PC player (and vice versa) within **400 ms**:
+- PC sends STOP/PAUSE via SCSI -> firmware updates state within 13 ms -> HTML poll detects the change and redraws the UI
+- HTML PLAY/PAUSE/STOP buttons -> firmware -> PC player sees the state immediately via READ SUB-CHANNEL
+
+### Enable the Module
+
+```
+set audio-module on
+reboot
+```
+
+Or via the web Config tab.
+
+### How It Works
+
+The CUE parser extracts audio tracks and their LBA positions. A FreeRTOS audio task on core 0 reads raw PCM sectors from BIN files (2352 B/sector, skip 16 B header), applies software gain, and streams the data to I2S DMA -> PCM5102 -> line out. The PC controls playback via SCSI commands (READ TOC, PLAY AUDIO LBA/MSF, PAUSE/RESUME, STOP, READ SUB-CHANNEL).
+
+Games such as Tomb Raider, Quake, and Need for Speed communicate with the firmware transparently as if it were a real optical drive.
+
+### Without the Module
+
+If the audio module is disabled: CUE tracks are still parsed, the audio task tracks position in real time (75 fps), sub-channel data is correct. PC players function correctly (see tracks, get position) but there is no sound output.
+
+### Connecting to a Mixer
+
+The PCM5102 output is line level (~2 Vrms). Connect to **line-in** (AUX), not to a microphone input. Set volume to 100 and regulate on the mixer.
 
 ---
 
@@ -296,220 +601,71 @@ VALUES ('device@corp.net', 'Auth-Type', 'EAP', ':=');
 | Raw MODE1/2352 | `.bin` | 2352 B | 16 |
 | Raw MODE2/2352 | `.bin` | 2352 B | 24 |
 | Raw MODE2/2336 | `.bin` | 2336 B | 8 |
-| CUE sheet | `.cue` | Determined by CUE | Determined by CUE |
-
-The CUE parser reads the `FILE` and `TRACK` directives to locate the binary data track and determine its sector layout. Only the first data track is mounted; audio tracks are ignored. The parser handles both `MODE1/2352` and `MODE2/2352` CUE track types.
+| CUE sheet | `.cue` | Per CUE | Per CUE |
 
 ---
 
-## Python Utility Scripts
+## Python Scripts
 
-Both scripts must be run **once** before compiling the sketch. They modify the Arduino ESP32 toolchain installation in place and create `.bak` backups of every file they change. They do not modify the sketch source files.
+### `build_exfat_libs.py` (WSL/Linux)
 
----
+The main script. Compiles `libfatfs.a` with exFAT support and patches `USBMSC.cpp`. Run in AlmaLinux/WSL.
 
-### `build_exfat_libs.py` — exFAT Support
+**Why two files must be patched:**
 
-By default the Arduino ESP32 core's FATFS library is compiled without exFAT support. This script rebuilds `libfatfs.a` with `FF_FS_EXFAT = 1` and installs it into the Arduino15 package directory.
+- `libfatfs.a` -- compiled FATFS library with `FF_FS_EXFAT=1`
+- `sdkconfig.h` -- header with `#define CONFIG_FATFS_EXFAT_SUPPORT 1`
 
-#### Background
+The firmware checks `#ifdef CONFIG_FATFS_EXFAT_SUPPORT` at compile time. Without this define the serial output shows `NO` even if `libfatfs.a` is correct. The script patches both.
 
-The Espressif Arduino lib-builder uses `esp32-arduino-lib-builder`, a CMake/ninja build system layered on top of ESP-IDF. The relevant FATFS configuration header is `ffconf.h`, located inside the lib-builder's ESP-IDF submodule. The key challenge is that `build.sh` calls `git reset --hard` at startup, which silently reverts any changes made to `ffconf.h` before the build starts. The script works around this by:
+**Why `build.sh` runs `git reset --hard`:** The Espressif build script automatically reverts any changes at startup. It is therefore impossible to patch `ffconf.h` before running `build.sh`. The solution: run the full build first, patch afterwards, then recompile only the fatfs target.
 
-1. Running `build.sh` first so that git reset can complete and all ESP-IDF components are built
-2. Patching `ffconf.h` **after** `build.sh` exits
-3. Deleting only the `fatfs` CMake cache directory
-4. Invoking `ninja` to recompile only the `esp-idf/fatfs/libfatfs.a` target (~10 seconds instead of the full 1–3 hour build)
-5. Copying the resulting `libfatfs.a` into the Arduino15 package tree
-
-The same `ffconf.h` patch is also applied to the TinyUSB fatfs copy inside the Arduino hardware directory.
-
-#### Usage
-
-Run from a WSL terminal (the script auto-detects the Arduino15 path by scanning `/mnt/c/Users/*/AppData/Local/Arduino15`):
+After updating the board package in Arduino IDE run:
 
 ```bash
-# Full build + patch (first run, takes 1-3 hours):
-python3 build_exfat_libs.py
-
-# Skip build.sh if it was already run recently (~10 seconds):
 python3 build_exfat_libs.py --skip-full-build
-
-# Specify a different Arduino ESP32 version:
-python3 build_exfat_libs.py --arduino-version 3.3.7
-
-# Override the Arduino15 path:
-python3 build_exfat_libs.py --arduino15 /mnt/c/Users/Admin/AppData/Local/Arduino15
-
-# Verify current installation without making changes:
-python3 build_exfat_libs.py --test
-
-# Preview actions without modifying any file:
-python3 build_exfat_libs.py --dry-run
-
-# Restore all original files from backups:
-python3 build_exfat_libs.py --restore
 ```
 
-#### What the Script Does — Step by Step
+### `patch_usbmsc.py` (Windows)
 
-**Step 1 — Locate Arduino15**
-
-The script searches `/mnt/c/Users/*/AppData/Local/Arduino15` and `/mnt/d/...` for the Arduino15 directory. It then derives the paths to the ESP32 hardware directory and `esp32s3-libs` tools directory from the version string. Two possible locations for `libfatfs.a` are checked (the path format changed between lib-builder versions).
-
-**Step 2 — Clone the lib-builder (if absent)**
-
-If `esp32-arduino-lib-builder` is not already present at the hardcoded path `/root/esp32_exfat_build/esp32-arduino-lib-builder`, it is cloned from the official Espressif GitHub repository.
-
-**Step 3 — Run `build.sh`**
-
-```bash
-./build.sh -t esp32s3 -b build -c '<arduino15_hardware_path>'
-```
-
-This is a full ESP-IDF build targeting the ESP32-S3. On the first run it takes 1–3 hours. The script warns that `git reset --hard` is expected and intentional. Skipped with `--skip-full-build` if the build directory already exists.
-
-**Step 4 — Patch `ffconf.h`**
-
-After `build.sh` exits, the script uses a compiled regular expression to find and replace `#define FF_FS_EXFAT 0` with `#define FF_FS_EXFAT 1` in every `ffconf.h` found under the lib-builder directory tree. A `.bak` copy of the original is created before any modification. The function `patch_ffconf()` is idempotent — it skips files that already have the value set to `1`.
-
-```python
-FFCONF_PATTERN = re.compile(r'(#define\s+FF_FS_EXFAT\s+)0')
-new, count = FFCONF_PATTERN.subn(r'\g<1>1', txt)
-```
-
-**Step 5 — Delete fatfs CMake cache and recompile**
-
-Deleting the `build/esp-idf/fatfs/` directory forces ninja to recompile the fatfs target from scratch with the patched header:
-
-```bash
-source esp-idf/export.sh && cd build && ninja esp-idf/fatfs/libfatfs.a
-```
-
-**Step 6 — Verify exFAT symbols**
-
-`strings` and `nm` are run on the freshly built `libfatfs.a` to confirm exFAT symbol names are present. The script also checks file size (without exFAT ~40 KB, with exFAT ~80+ KB).
-
-**Step 7 — Install and patch installed files**
-
-`shutil.copy2()` is used instead of the shell `cp` command to avoid the interactive alias `-i` present on many Linux systems. The built library is copied to:
-
-```
-<arduino15>/packages/esp32/tools/esp32s3-libs/<version>/lib/libfatfs.a
-```
-
-The installed `ffconf.h` headers in the Arduino15 tree are also patched in the same way.
-
-**Step 8 — Run `--test` as a final verification pass**
-
-The script calls itself with `--test` to produce a structured pass/fail report covering all modified files.
-
-#### Test Mode Output
-
-```
->>> 1. Checking installed ffconf.h
-  ✓ FF_FS_EXFAT = 1 in installed ffconf.h
-
->>> 3. Checking exFAT symbols in installed libfatfs.a
-  ✓ exFAT strings/symbols found in libfatfs.a
-  ✓ libfatfs.a size 87 KB (expected >50 KB)
-
-==============================
-  RESULT: PASS - all checks passed (6/6)
-```
-
-#### After the Script
-
-1. Delete the Arduino build cache: `%LOCALAPPDATA%\arduino\sketches\` — delete all subdirectory contents
-2. Restart the Arduino IDE completely
-3. Compile and upload the sketch
-4. The serial monitor will show:
-   ```
-   [SD]   exFAT support: YES (compiled in)
-   ```
-
----
-
-### `patch_usbmsc.py` — CD-ROM SCSI Commands
-
-The Arduino ESP32 core's `USBMSC.cpp` implements only basic USB Mass Storage read/write operations. A standard CD-ROM drive must also respond to several additional SCSI commands that hosts use to discover the disc type, read the Table of Contents, and query drive capabilities. Without these handlers, Windows and Linux mount the device as a raw drive but cannot auto-run CDs, show the correct disc type, or enumerate audio tracks.
-
-#### What the Patch Does
-
-The script locates `USBMSC.cpp` in the Arduino15 hardware directory, creates a `.bak` backup, and inserts a `switch` block inside the `tud_msc_scsi_cb()` callback function. The handlers are injected at the very start of the function body — before any `media_present` check — so that the host always gets a valid response to these commands regardless of whether a disc is currently mounted.
-
-| SCSI Command | Opcode | Purpose |
-|---|---|---|
-| READ TOC | `0x43` | Returns the disc's Table of Contents; the firmware reports a single data track using the current block count |
-| GET CONFIGURATION | `0x46` | Reports the drive profile as a standard CD/DVD-ROM |
-| READ DISC INFO | `0x51` | Returns disc state (finalised, single session) |
-| MODE SENSE 6 | `0x1A` | Returns minimal mode page data |
-| MODE SENSE 10 | `0x5A` | Extended mode sense (8-byte response) |
-| PREVENT MEDIUM REMOVAL | `0x1E` | Acknowledged silently (returns 0 = success) |
-| MECHANISM STATUS | `0xBD` | Returns 8 zero bytes (tray in, no error) |
-
-The block count for the READ TOC response is read from the C-linkage global variable `extern uint32_t cdromBlockCount`, which the firmware updates whenever a disc image is mounted.
-
-#### Patch Marker
-
-The injected block begins with the comment `/* CD-ROM SCSI patched v3 */`. The script checks for this marker before patching so it is safe to run multiple times. Re-running always restores from the `.bak` backup first to ensure the patch is applied cleanly to an unmodified source.
-
-#### Usage
-
-Run from a Windows command prompt or PowerShell (Python 3 required):
+A standalone backup script for patching `USBMSC.cpp` without the exFAT build. Run from a Windows command prompt:
 
 ```cmd
 python patch_usbmsc.py
 ```
 
-The script auto-detects `USBMSC.cpp` via `%LOCALAPPDATA%\Arduino15`. Output:
-
-```
-========================================================
-  USBMSC.cpp CD-ROM SCSI Patcher v3
-========================================================
-
-File: C:\Users\...\Arduino15\packages\esp32\hardware\esp32\3.3.7\cores\esp32\USBMSC.cpp
-
-  Backup created: USBMSC.cpp.bak
-  Found tud_msc_scsi_cb (2184 bytes)
-  Patched v3: CD handlers now run BEFORE media_present check
-
-[SUCCESS]
-  1. Delete build cache: %LOCALAPPDATA%\arduino\sketches\
-  2. Re-upload ESP32S3_VirtualCDROM.ino
-  3. Mount ISO - should now show DATA disc
-```
-
-#### After the Script
-
-Delete the Arduino build cache and recompile. The patch only affects the compiled binary — the `.ino` source files do not change.
-
 ---
 
 ## API Reference
 
-The web server exposes a REST-style JSON API consumed by the browser UI.
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/status` | GET | Mounted image state (path, sectors, default image) |
-| `/api/sysinfo` | GET | Full device status (WiFi, SD, image, EAP details, system) |
-| `/api/isos` | GET | Recursive list of `.iso`/`.bin`/`.cue` files on the SD card |
-| `/api/ls?path=` | GET | Directory listing for the given SD path |
-| `/api/mount?file=` | POST | Mount the specified disc image |
-| `/api/umount` | POST | Eject the current disc |
-| `/api/config/get` | GET | Retrieve all configuration (passwords redacted) |
-| `/api/config/save` | POST | Save configuration (form-encoded body) |
-| `/api/wifi/scan` | GET | Scan for nearby access points |
-| `/api/sd/unmount` | POST | Safely unmount the SD card |
-| `/api/sd/mount` | POST | Re-mount the SD card |
-| `/api/reboot` | POST | Restart the ESP32 |
-| `/api/factory` | POST | Factory reset (clears NVS) and reboot |
-| `/upload?path=` | POST | Upload a file to the SD card (multipart/form-data) |
-| `/api/delete?path=` | DELETE | Delete a file |
-| `/api/mkdir?path=` | POST | Create a directory |
-| `/api/download?path=` | GET | Download a file from the SD card |
+| Endpoint | Description |
+|---|---|
+| `GET /api/sysinfo` | Full device status (JSON) |
+| `GET /api/status` | Mounted image state |
+| `GET /api/mount?file=` | Mount a disc image |
+| `GET /api/umount` | Eject disc |
+| `GET /api/isos` | List disc images on SD card |
+| `GET /api/ls?path=` | Directory listing |
+| `GET /api/config/get` | Read configuration (password omitted) |
+| `GET /api/config/save?key=val` | Save configuration (includes webAuth/webUser/webPass) |
+| `GET /api/wifi/scan` | Scan for Wi-Fi networks |
+| `GET /api/audio/status` | Playback state + track list |
+| `GET /api/audio/play?track=N` | Play track N |
+| `GET /api/audio/play?lba=L&end=E` | Play LBA range |
+| `GET /api/audio/stop` | Stop playback |
+| `GET /api/audio/pause` | Pause playback |
+| `GET /api/audio/resume` | Resume playback |
+| `GET /api/audio/volume?v=0-100` | Set volume |
+| `GET /api/audio/mute` | Toggle mute |
+| `GET /api/audio/seek?track=N&rel=0.0-1.0` | Seek within a track |
+| `GET /api/reboot` | Restart device |
+| `GET /api/factory` | Factory reset |
+| `GET /api/download?path=` | Download file from SD card |
+| `POST /api/upload?path=` | Upload file to SD card |
+| `GET /api/delete?path=` | Delete file |
+| `GET /api/mkdir?path=` | Create folder |
+| `GET /api/sd/unmount` | Safely unmount SD card |
+| `GET /api/sd/mount` | Remount SD card |
 
 ---
 
@@ -529,56 +685,102 @@ The web server exposes a REST-style JSON API consumed by the browser UI.
 
 ### SD card not detected
 
-- Confirm VCC is connected to **3.3 V** (not 5 V)
-- Check the four data wires: CLK→GPIO12, CMD→GPIO11, D0→GPIO13, CS/D3→GPIO10
-- Try a different SD card; some cards require a lower SPI frequency (edit `SD_MMC.begin()` clock parameter)
-- Confirm the card is formatted FAT32 or exFAT (exFAT requires `build_exfat_libs.py`)
+- VCC must be **3.3 V** (not 5 V)
+- Check wiring: CLK->GPIO12, CMD->GPIO11, D0->GPIO13, CS->GPIO10
+- Try a different SD card
+- Verify formatting: FAT32 or exFAT (exFAT requires `build_exfat_libs.py`)
 
-### USB CD-ROM not appearing on host PC
+### USB CD-ROM not appearing on the PC
 
-- Confirm the **right** USB port is connected (the OTG port, not the UART bridge)
-- Check that `patch_usbmsc.py` was applied and the sketch was recompiled after deleting the build cache
-- Arduino IDE must be set to **USB-OTG (TinyUSB)**, not "Hardware CDC"
-- Try `umount` then `mount` again from the serial CLI
-- Some hosts require a reboot after first enumerating the device
+- The **right** USB connector must be plugged in (OTG, not UART)
+- Tools -> USB Mode: **USB-OTG (TinyUSB)** (not Hardware CDC)
+- Verify `build_exfat_libs.py` completed -- USBMSC patch v4 must be applied
+- Delete the build cache and re-upload firmware after patching
+- Try `umount` then `mount` from the serial CLI
 
-### Wi-Fi fails to connect
+### `[SD] exFAT support: NO` after compile
 
-- Verify SSID and password with `show config`
-- Check that the access point is visible with a scan (web Config tab → Scan button)
-- For enterprise networks, ensure the RADIUS SQL table has a row for the EAP identity
+1. Run `python3 build_exfat_libs.py --test` -- must show 18/18 PASS
+2. Delete the **entire** `%LOCALAPPDATA%\arduino` folder
+3. Restart Arduino IDE
+4. Recompile
 
-### EAP-TLS: connection attempt reaches RADIUS but authentication fails
+### Audio tab is always greyed out after page load
 
-Check RADIUS server logs. Common causes and remedies:
+- The tab activates within 3 seconds of page load (background poll)
+- Verify serial output shows: `[CUE] 16 audio track(s) found`
+- Check that the BIN files for audio tracks exist on the SD card
 
-| Symptom in RADIUS log | Cause | Fix |
-|---|---|---|
-| `User not found in radcheck table` | EAP identity not in RADIUS database | Add SQL row for the identity shown in `[EAP] Identity:` |
-| `Server certificate chain validation failed` | CA cert missing or wrong | Set `eap-ca` to the server's CA, or omit it to skip server verification |
-| `TLS handshake failure` | Cipher suite mismatch | Generate a new cert with `sha256WithRSAEncryption` and 2048-bit RSA |
-| `Method private structure allocated failure` | Internal mbedTLS error | Usually caused by an encrypted key without a passphrase; set `eap-kpass` |
+### EAP-TLS: NAK loop or authentication failure
 
-### EAP-TLS: nothing appears in RADIUS log
+Diagnostics in WSL:
+```bash
+# Verify key matches certificate (both MD5 hashes must match)
+openssl x509 -noout -modulus -in client.crt | md5sum
+openssl rsa  -noout -modulus -in client.key | md5sum
 
-The device is not reaching the access point at the 802.11 association level. This typically means Wi-Fi mode or auth type is misconfigured. Verify with `show config` that `eap-mode` is `2` and that the SSID matches the enterprise network name exactly (case-sensitive).
-
-### Private key format error
-
-```
-[EAP]  Key : Encrypted  ✗  Set passphrase: set eap-kpass <passphrase>
+# Check signature algorithm (must be sha256WithRSAEncryption)
+openssl x509 -in client.crt -noout -text | grep "Signature Algorithm"
 ```
 
-The key is password-protected. Either set the passphrase with `set eap-kpass` or remove the passphrase:
+Common causes:
+- EAP identity not present in RADIUS `radcheck` table
+- Certificate uses SHA-512 (not supported by ESP32 mbedTLS) -- regenerate with SHA-256
+- Encrypted private key without `eap-kpass` configured
+
+### Forgotten web UI password
+
+Via serial CLI (does not require web access):
+```
+set web-auth off         # disable auth -- allow access without login
+set web-pass newpassword # or change the password directly
+```
+
+Or factory reset: `clear config` -- restores default admin/admin with auth disabled.
+
+### `flash_parts: partition 3 invalid` -- boot loop
+
+Board is configured incorrectly:
+- Tools -> **Board: ESP32S3 Dev Module** (not ESP32-S3-USB-OTG)
+- Tools -> **Flash Size: 16MB (128Mb)**
+- Tools -> **Partition Scheme: Custom**
+
+### `build_exfat_libs.py` fails at cmake/ninja
 
 ```bash
-openssl rsa -in client.key -out client_plain.key
+sudo dnf install -y python3-devel openssl-devel ncurses-devel libffi-devel
+pip3 install --user cryptography future pyparsing pyserial
 ```
 
-### `build_exfat_libs.py` fails at ninja step
+### `build_exfat_libs.py` cannot find Arduino15
 
-If the ESP-IDF environment is not sourced, the `export.sh` step fails. Ensure the lib-builder's ESP-IDF submodule is fully initialised. Run with `--dry-run` first to inspect the commands, then run without the flag.
+```bash
+ls /mnt/c/Users/Administrator/AppData/Local/Arduino15/
+
+# Pass the path explicitly
+python3 build_exfat_libs.py --arduino15 "/mnt/c/Users/OtherName/AppData/Local/Arduino15"
+```
 
 ### Web interface shows "Failed to fetch"
 
-The device's web server and the browser must be on the same network. Check that `wifiConnected` is true in `show config`. If using a VPN or network policy that blocks mDNS, use the IP address directly.
+- The device and the browser must be on the same network
+- Verify `show config` -> Wi-Fi connected = true
+- Use the IP address directly if mDNS is blocked by a firewall or VPN
+
+---
+
+## Project Files
+
+| File | Description |
+|---|---|
+| `ESP32S3_VirtualCDROM.ino` | Main firmware (Arduino C++) |
+| `html_page.h` | Web interface as an inline C string |
+| `partitions.csv` | Custom partition table (6 MB app) |
+| `build_exfat_libs.py` | exFAT + USBMSC patch script -- run in WSL |
+| `patch_usbmsc.py` | Standalone USBMSC patch -- run on Windows |
+| `doc/arduino_ide_settings.png` | Arduino IDE settings screenshot |
+| `doc/esp32s3.png` | ESP32-S3 DevKitC-1 board photo |
+| `doc/GY-PCM5102.png` | GY-PCM5102 I2S module photo |
+| `doc/wiring.svg` | Wiring diagram |
+
+All `.ino` and `.h` files must be in the same folder.
