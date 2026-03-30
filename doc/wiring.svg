@@ -1,12 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" font-family="'Courier New', monospace" font-size="13">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 680" font-family="'Courier New', monospace" font-size="13">
 
   <!-- Background -->
-  <rect width="900" height="560" fill="#1a1a2e" rx="14"/>
+  <rect width="900" height="680" fill="#1a1a2e" rx="14"/>
 
   <!-- Title -->
   <text x="450" y="38" fill="#e94560" text-anchor="middle" font-size="17" font-weight="bold">ESP32-S3 Virtual CD-ROM — Hardware Wiring</text>
-  <text x="450" y="58" fill="#a8a8b3" text-anchor="middle" font-size="12">SD_MMC 1-bit mode  ·  GPIO 10 / 11 / 12 / 13  ·  RGB LED GPIO 48  ·  Dual USB</text>
+  <text x="450" y="58" fill="#a8a8b3" text-anchor="middle" font-size="12">SD_MMC 1-bit  ·  GPIO 10/11/12/13  ·  I2S Audio GPIO 14/15/16  ·  RGB LED GPIO 48</text>
 
   <!-- ── ESP32-S3 Module ─────────────────────────────────────────── -->
   <rect x="320" y="80" width="260" height="360" fill="#0f3460" rx="10" stroke="#e94560" stroke-width="2.5"/>
@@ -31,6 +31,14 @@
   <text x="330" y="324" fill="#7ed321" font-size="12">3V3</text>
   <text x="330" y="354" fill="#9b9b9b" font-size="12">GND</text>
   <text x="330" y="394" fill="#f5a623" font-size="12">GPIO 48  (RGB)</text>
+
+  <!-- Right-side I2S pins on ESP32 (go right → PCM5102 module) -->
+  <circle cx="580" cy="310" r="5" fill="#e05cff"/>
+  <circle cx="580" cy="340" r="5" fill="#e05cff"/>
+  <circle cx="580" cy="370" r="5" fill="#e05cff"/>
+  <text x="568" y="314" fill="#e05cff" text-anchor="end" font-size="12">GPIO 14  (BCK)</text>
+  <text x="568" y="344" fill="#e05cff" text-anchor="end" font-size="12">GPIO 15  (WS)</text>
+  <text x="568" y="374" fill="#e05cff" text-anchor="end" font-size="12">GPIO 16  (DIN)</text>
 
   <!-- Right-side USB connectors on ESP32 -->
   <!-- UART USB -->
@@ -105,7 +113,43 @@
   <line x1="320" y1="390" x2="280" y2="390" stroke="#f5a623" stroke-width="2"/>
   <polyline points="280,390 280,498 422,498" fill="none" stroke="#f5a623" stroke-width="2" stroke-dasharray="5,3"/>
 
-  <!-- ── Host PC boxes ──────────────────────────────────────────── -->
+  <!-- ── GY-PCM5102 I2S Audio Module ────────────────────────────── -->
+  <rect x="660" y="295" width="200" height="170" fill="#1a0030" rx="10" stroke="#e05cff" stroke-width="2"/>
+  <text x="760" y="320" fill="#e05cff" text-anchor="middle" font-size="13" font-weight="bold">GY-PCM5102</text>
+  <text x="760" y="337" fill="#a8a8b3" text-anchor="middle" font-size="10">I2S DAC  (optional)</text>
+
+  <!-- PCM5102 pin dots on left edge -->
+  <circle cx="660" cy="360" r="5" fill="#e05cff"/>
+  <circle cx="660" cy="385" r="5" fill="#e05cff"/>
+  <circle cx="660" cy="410" r="5" fill="#e05cff"/>
+  <circle cx="660" cy="435" r="5" fill="#7ed321"/>
+  <circle cx="660" cy="457" r="5" fill="#9b9b9b"/>
+
+  <!-- PCM5102 pin labels -->
+  <text x="672" y="364" fill="#e0e0e0" font-size="12">BCK</text>
+  <text x="672" y="389" fill="#e0e0e0" font-size="12">LCK  (WS)</text>
+  <text x="672" y="414" fill="#e0e0e0" font-size="12">DIN</text>
+  <text x="672" y="439" fill="#7ed321" font-size="12">VIN  (3.3 V)</text>
+  <text x="672" y="461" fill="#9b9b9b" font-size="12">GND</text>
+
+  <!-- Line out label -->
+  <text x="760" y="480" fill="#e05cff" text-anchor="middle" font-size="11">LINE OUT → mixer / amp</text>
+
+  <!-- ── Wires ESP32 → PCM5102 ─────────────────────────────────── -->
+  <!-- BCK  GPIO14 → PCM5102 BCK -->
+  <line x1="580" y1="310" x2="660" y2="360" stroke="#e05cff" stroke-width="2"/>
+  <!-- WS   GPIO15 → PCM5102 LCK -->
+  <line x1="580" y1="340" x2="660" y2="385" stroke="#e05cff" stroke-width="2"/>
+  <!-- DIN  GPIO16 → PCM5102 DIN -->
+  <line x1="580" y1="370" x2="660" y2="410" stroke="#e05cff" stroke-width="2"/>
+  <!-- 3V3 power -->
+  <polyline points="320,320 310,320 310,600 640,600 640,435 660,435"
+            fill="none" stroke="#7ed321" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <!-- GND -->
+  <polyline points="320,350 308,350 308,608 642,608 642,457 660,457"
+            fill="none" stroke="#9b9b9b" stroke-width="1.5" stroke-dasharray="4,3"/>
+
+  <!-- ── Host PC boxes --> ──────────────────────────────────────────── -->
   <!-- Serial PC -->
   <rect x="680" y="140" width="185" height="65" fill="#16213e" rx="7" stroke="#e94560" stroke-width="1.8"/>
   <text x="773" y="163" fill="#e94560" text-anchor="middle" font-size="13" font-weight="bold">Host PC</text>
@@ -127,7 +171,7 @@
   <text x="662" y="254" fill="#7ed321" text-anchor="middle" font-size="10">USB OTG</text>
 
   <!-- ── Legend ─────────────────────────────────────────────────── -->
-  <rect x="50" y="420" width="220" height="110" fill="#16213e" rx="7" stroke="#444" stroke-width="1"/>
+  <rect x="50" y="420" width="220" height="130" fill="#16213e" rx="7" stroke="#444" stroke-width="1"/>
   <text x="160" y="440" fill="#a8a8b3" text-anchor="middle" font-size="11" font-weight="bold">Legend</text>
   <line x1="65" y1="455" x2="110" y2="455" stroke="#53d8fb" stroke-width="2"/>
   <text x="118" y="459" fill="#e0e0e0" font-size="11">SD_MMC data signals</text>
@@ -139,9 +183,11 @@
   <text x="118" y="510" fill="#e0e0e0" font-size="11">GND</text>
   <line x1="65" y1="523" x2="110" y2="523" stroke="#f5a623" stroke-width="2" stroke-dasharray="5,3"/>
   <text x="118" y="527" fill="#e0e0e0" font-size="11">GPIO 48 → RGB LED</text>
+  <line x1="65" y1="540" x2="110" y2="540" stroke="#e05cff" stroke-width="2"/>
+  <text x="118" y="544" fill="#e0e0e0" font-size="11">I2S audio (GPIO 14/15/16)</text>
 
   <!-- ── Note ───────────────────────────────────────────────────── -->
-  <text x="450" y="420" fill="#f5a623" text-anchor="middle" font-size="11">⚠  SD module VCC must be 3.3 V — NOT 5 V</text>
-  <text x="450" y="436" fill="#a8a8b3" text-anchor="middle" font-size="11">SD_MMC operates in 1-bit mode (4 wires) to avoid USB OTG pin conflicts</text>
+  <text x="450" y="570" fill="#f5a623" text-anchor="middle" font-size="11">⚠  SD module VCC must be 3.3 V — NOT 5 V</text>
+  <text x="450" y="588" fill="#a8a8b3" text-anchor="middle" font-size="11">SD_MMC operates in 1-bit mode (4 wires) to avoid USB OTG pin conflicts</text>
 
 </svg>
