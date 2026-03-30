@@ -449,8 +449,8 @@ def patch_usbmsc(path):
             src = src[:tur_start] + new_tur + src[tur_end:]
             print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION')
 
-    if 'CD-ROM SCSI patched v6' in src or 'scsi_audio_play' in src:
-        print("  Already patched v6")
+    if 'CD-ROM SCSI patched v8' in src or 'scsi_audio_play' in src:
+        print("  Already patched v8")
         return True
 
     func_start = src.find('int32_t tud_msc_scsi_cb(')
@@ -498,7 +498,7 @@ def patch_usbmsc(path):
 
     # Switch block inserted inside the function (no extern declarations here)
     inner = (
-        "{ /* CD-ROM SCSI patched v5 */\n"
+        "{ /* CD-ROM SCSI patched v8 */\n"
         "    auto msfToLba = [](uint8_t m,uint8_t s,uint8_t f)->uint32_t{\n"
         "      return (uint32_t)m*60*75+(uint32_t)s*75+f; };\n"
         "    // Helper: set CHECK CONDITION sense data in buffer\n"
@@ -605,8 +605,35 @@ def patch_usbmsc(path):
         "        ((uint8_t*)buffer)[1]=0x20;((uint8_t*)buffer)[2]=0x0E;\n"
         "        ((uint8_t*)buffer)[3]=((uint8_t*)buffer)[4]=\n"
         "        ((uint8_t*)buffer)[5]=((uint8_t*)buffer)[6]=1;return 34;}break;}\n"
-        "      case 0x1A:{if(bufsize>=4){memset(buffer,0,4);((uint8_t*)buffer)[0]=3;return 4;}break;}\n"
-        "      case 0x5A:{if(bufsize>=8){memset(buffer,0,8);((uint8_t*)buffer)[1]=6;return 8;}break;}\n"
+        "      case 0x1A:{ /* MODE SENSE(6) — support page 0x0E Audio Control */\n"
+        "        uint8_t pc=scsi_cmd[2]&0x3F; /* page code */\n"
+        "        if((pc==0x0E||pc==0x3F)&&bufsize>=20){\n"
+        "          /* page 0x0E: CD-ROM Audio Control Parameters per OB-U0077C §2.9.6 */\n"
+        "          uint8_t*b=(uint8_t*)buffer; memset(b,0,20);\n"
+        "          b[0]=19;                 /* mode data length (20-1) */\n"
+        "          b[3]=0;                  /* block descriptor length = 0 */\n"
+        "          b[4]=0x0E;               /* page code */\n"
+        "          b[5]=0x0E;               /* page length = 14 */\n"
+        "          b[6]=0x04;               /* Immed=1, SOTC=0 */\n"
+        "          b[12]=0x01; b[13]=0xFF;  /* port 0: left channel, volume max */\n"
+        "          b[14]=0x02; b[15]=0xFF;  /* port 1: right channel, volume max */\n"
+        "          return 20;\n"
+        "        }\n"
+        "        if(bufsize>=4){memset(buffer,0,4);((uint8_t*)buffer)[0]=3;return 4;}break;}\n"
+        "      case 0x5A:{ /* MODE SENSE(10) — support page 0x0E Audio Control */\n"
+        "        uint8_t pc=scsi_cmd[2]&0x3F;\n"
+        "        if((pc==0x0E||pc==0x3F)&&bufsize>=24){\n"
+        "          uint8_t*b=(uint8_t*)buffer; memset(b,0,24);\n"
+        "          b[1]=22;                 /* mode data length (24-2), MSB=0 */\n"
+        "          b[7]=0;                  /* block descriptor length = 0 */\n"
+        "          b[8]=0x0E;               /* page code */\n"
+        "          b[9]=0x0E;               /* page length = 14 */\n"
+        "          b[10]=0x04;              /* Immed=1, SOTC=0 */\n"
+        "          b[16]=0x01; b[17]=0xFF;  /* port 0: left channel, volume max */\n"
+        "          b[18]=0x02; b[19]=0xFF;  /* port 1: right channel, volume max */\n"
+        "          return 24;\n"
+        "        }\n"
+        "        if(bufsize>=8){memset(buffer,0,8);((uint8_t*)buffer)[1]=6;return 8;}break;}\n"
         "      case 0x1B:{/* START/STOP UNIT per spec OB-U0077C §2.39 */\n"
         "        {uint8_t loej=scsi_cmd[4]&2, start=scsi_cmd[4]&1;\n"
         "        if(loej&&!start){ /* eject */ scsi_audio_stop(); }\n"
@@ -652,12 +679,14 @@ def patch_usbmsc(path):
         "      case 0x2B:return 0; /* SEEK(10): no-op for virtual drive */\n"
         "      case 0xDA:return 0; /* SET CD-ROM SPEED(1): no-op */\n"
         "      case 0xBB:return 0; /* SET CD-ROM SPEED(2): no-op */\n"
+        "      case 0x15:return 0; /* MODE SELECT(6): accept, ignore — volume stored by host */\n"
+        "      case 0x55:return 0; /* MODE SELECT(10): accept, ignore */\n"
         "      case 0x1E:return 0;\n"
         "      case 0xBD:{uint16_t l=bufsize<8?(uint16_t)bufsize:8;memset(buffer,0,l);return(int32_t)l;}\n"
         "      default:break;\n"
         "    }\n"
         "  }\n"
-        "  /* end CD-ROM SCSI patched v4 */\n"
+        "  /* end CD-ROM SCSI patched v8 */\n"
         "  "
     )
 

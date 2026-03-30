@@ -1782,8 +1782,6 @@ void handleApiGetConfig() {
   j += ",\"tlsMinVer\":" + String(cfg.tlsMinVer);
   j += ",\"tlsCiphers\":" + String(cfg.tlsCiphers);
   // webPass intentionally omitted from GET response
-  j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
-  j += ",\"audioModule\":" + String(cfg.audioModule ? "true" : "false");
   j += "}";
   httpServer.send(200, "application/json", j);
 }
@@ -1825,17 +1823,8 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("tlsMinVer"))  { cfg.tlsMinVer=(uint8_t)constrain(httpServer.arg("tlsMinVer").toInt(),0,1); changed=true; }
   if (httpServer.hasArg("tlsCiphers")) { cfg.tlsCiphers=(uint8_t)constrain(httpServer.arg("tlsCiphers").toInt(),0,3); changed=true; }
   if (httpServer.hasArg("httpsKPass")){ strlcpy(cfg.httpsKeyPass, httpServer.arg("httpsKPass").c_str(), sizeof(cfg.httpsKeyPass)); changed=true; }
-  if (httpServer.hasArg("httpsEnabled")) { String v=httpServer.arg("httpsEnabled"); cfg.httpsEnabled=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("httpsCert")) { strlcpy(cfg.httpsCertPath, httpServer.arg("httpsCert").c_str(), sizeof(cfg.httpsCertPath)); changed=true; }
-  if (httpServer.hasArg("httpsKey"))  { strlcpy(cfg.httpsKeyPath,  httpServer.arg("httpsKey").c_str(),  sizeof(cfg.httpsKeyPath));  changed=true; }
   if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
   if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
-  if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
-  if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
-  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
   if (changed) {
     saveConfig();
     dualPrint.println(F("[OK]  Config saved via web."));
@@ -2500,10 +2489,9 @@ bool startHttpsServer() {
   #define _HW_RSA " RSA=OFF"
 #endif
   dualPrint.println(F("[HTTPS] HW crypto: " _HW_AES _HW_SHA _HW_RSA));
-  // Enable verbose mbedTLS logging to diagnose handshake failures
-  esp_log_level_set("esp-tls", ESP_LOG_DEBUG);
-  esp_log_level_set("esp-tls-mbedtls", ESP_LOG_DEBUG);
-  esp_log_level_set("esp_https_server", ESP_LOG_DEBUG);
+  // TLS logging: WARN level (DEBUG floods serial with handshake details)
+  esp_log_level_set("esp-tls-mbedtls", ESP_LOG_WARN);
+  esp_log_level_set("esp_https_server", ESP_LOG_WARN);
   httpd_ssl_config_t conf = HTTPD_SSL_CONFIG_DEFAULT();
   // Apply configured ports
   conf.httpd.server_port = cfg.httpsPort ? cfg.httpsPort : 443;
