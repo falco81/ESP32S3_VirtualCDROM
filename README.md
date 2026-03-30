@@ -68,30 +68,32 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 
 ## Wiring
 
+![Wiring Diagram](doc/wiring.svg)
+
 ### SD Card (SD_MMC 1-bit mode)
 
-```
-ESP32-S3 GPIO12  ->  CLK  (D5)
-ESP32-S3 GPIO11  ->  CMD  (D7 / MOSI)
-ESP32-S3 GPIO13  ->  D0   (D6 / MISO)
-ESP32-S3 GPIO10  ->  CS   (D4 / D3)
-ESP32-S3 3V3     ->  VCC
-ESP32-S3 GND     ->  GND
-```
+| ESP32-S3 | SD Module | Signal |
+|---|---|---|
+| GPIO 12 | D5 | CLK |
+| GPIO 11 | D7 (MOSI) | CMD |
+| GPIO 13 | D6 (MISO) | D0 |
+| GPIO 10 | D4 (CS) | D3 / CS |
+| 3V3 | VCC | Power |
+| GND | GND | Ground |
 
 ### GY-PCM5102 I2S Audio (optional)
 
 ![GY-PCM5102](doc/GY-PCM5102.png)
 
-```
-ESP32-S3 GPIO14  ->  BCK  (Bit Clock)
-ESP32-S3 GPIO15  ->  LCK  (Word Select / WS)
-ESP32-S3 GPIO16  ->  DIN  (Data In)
-ESP32-S3 3V3     ->  VCC
-ESP32-S3 GND     ->  GND
-GND              ->  FMT  (I2S Philips format -- connect to GND)
-GND              ->  SCK  (no master clock -- connect to GND)
-```
+| ESP32-S3 | PCM5102 | Signal |
+|---|---|---|
+| GPIO 14 | BCK | Bit Clock |
+| GPIO 15 | LCK | Word Select (WS) |
+| GPIO 16 | DIN | Data In |
+| 3V3 | VIN | Power |
+| GND | GND | Ground |
+| GND | FMT | I2S Philips format |
+| GND | SCK | No master clock |
 
 > **Important:** The SD module must be powered from **3.3 V**, not 5 V. The ESP32-S3 DevKitC-1 has **two** USB connectors -- the left one is UART (programming and serial monitor), the right one is USB OTG (virtual CD-ROM for the target PC). Never swap them.
 
