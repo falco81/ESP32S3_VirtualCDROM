@@ -69,7 +69,7 @@ extern "C" { bool tud_disconnect(void); bool tud_connect(void); void msc_set_uni
 //  Audio sectors are raw 16-bit signed stereo LE at 44100 Hz, 2352 B/sector.
 //  The first 16 bytes of each sector are the sync/address header (ignored).
 // =============================================================================
-#define MAX_AUDIO_TRACKS 16
+#define MAX_AUDIO_TRACKS 99   // CD standard: max 99 tracks; Tomb Raider has 56 audio tracks
 
 struct AudioTrack {
   uint8_t  number;          // Track number (1-based)
@@ -146,6 +146,7 @@ struct Config {
   char webUser[32];        // Web UI username (default: admin)
   char webPass[64];        // Web UI password (default: admin)
   bool dosCompat;          // true = skip USB re-enum on mount (DOS compatibility)
+  uint8_t dosDriver;       // 0=Generic 1=USBCD2/TEAC 2=ESPUSB/Panasonic 3=DI1000DD/USBASPI
   bool     httpsEnabled;       // true = enable HTTPS
   char     httpsCertPath[64];  // SD path to TLS server certificate
   char     httpsKeyPath[64];   // SD path to TLS server private key
@@ -183,6 +184,7 @@ void loadConfig() {
   strlcpy(cfg.webUser, prefs.getString("webUser", "admin").c_str(), sizeof(cfg.webUser));
   strlcpy(cfg.webPass, prefs.getString("webPass", "admin").c_str(), sizeof(cfg.webPass));
   cfg.dosCompat = prefs.getBool("dosCompat", false);
+  cfg.dosDriver = (uint8_t)prefs.getUChar("dosDriver", 0);
   cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
   strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
   strlcpy(cfg.httpsKeyPath,  prefs.getString("httpsKey",  "").c_str(), sizeof(cfg.httpsKeyPath));
@@ -223,6 +225,7 @@ void saveConfig() {
   prefs.putString("webUser", cfg.webUser);
   prefs.putString("webPass", cfg.webPass);
   prefs.putBool("dosCompat", cfg.dosCompat);
+  prefs.putUChar("dosDriver", cfg.dosDriver);
   prefs.putBool("httpsEnabled", cfg.httpsEnabled);
   prefs.putString("httpsCert", cfg.httpsCertPath);
   prefs.putString("httpsKey",  cfg.httpsKeyPath);
@@ -332,6 +335,7 @@ void clearConfig() {
   strlcpy(cfg.webUser, "admin", sizeof(cfg.webUser));
   strlcpy(cfg.webPass, "admin", sizeof(cfg.webPass));
   cfg.dosCompat = false;
+  cfg.dosDriver = 0;
   cfg.httpsEnabled = false;
   cfg.httpsCertPath[0] = 0;
   cfg.httpsKeyPath[0]  = 0;
@@ -801,8 +805,36 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
   r[2] = 0x05;  // version: SPC-3
   r[3] = 0x02;  // response data format
   r[4] = 0x1F;  // additional length
-  memcpy(&r[8],  "ESP32-S3",         8);
-  memcpy(&r[16], "Virtual CD-ROM  ", 16);
+  // INQUIRY identity — configurable per DOS driver compatibility
+  if (cfg.dosDriver == 1) {
+    // USBCD2.SYS (TEAC) — checks hardcoded model list against INQUIRY vendor/product
+    memcpy(&r[8],  "TEAC    ",         8);
+    memcpy(&r[16], "CD-56E          ", 16);
+  } else if (cfg.dosDriver == 2) {
+    // USBCD1.SYS (Panasonic) + usbaspi2.sys (Novac) / usbaspi1.sys (Panasonic)
+    // USBCD1 komunikuje pres SCSIMGR$ DOS device (INT 21h IOCTL) s USBASPI
+    // USBCD1 skenuji Target ID: 0x18, 0x08, 0x10
+    // usbaspi2.sys (Novac) priradi ID 0x08 → USBCD1 device najde
+    // usbaspi1.sys (Panasonic v2.20) = zkousit jako zalozni variantu
+    // INQUIRY check (SRB+0x19) = USBASPI staticka tabulka 0x42 & 0x1E = 0x02 → vzdy projde
+    // => INQUIRY odpoved neni rozhodujici, identita jen informativni
+    r[0] = 0x05;  // CD-ROM device type (SCSI)
+    r[1] = 0x80;  // removable
+    r[2] = 0x02;  // ANSI version: SCSI-2 (shoduje se s realnou Panasonic mechanikou)
+    memcpy(&r[8],  "MATSHITA",         8);
+    memcpy(&r[16], "CD-ROM CR-572   ", 16);
+  } else if (cfg.dosDriver == 3) {
+    // DI1000DD.SYS (NOVAC/USBASPI 2.20) — accepts CD-ROM type 0x05 natively
+    // DI1000DD provides data-only access (READ10/CAPACITY) — no audio
+    // No model check — generic identity works fine
+    // USBASPI 2.20 uses DOSUSBTBL0 standard interface (INT 2Fh)
+    memcpy(&r[8],  "ESP32-S3",         8);
+    memcpy(&r[16], "Virtual CD-ROM  ", 16);
+  } else {
+    // Generic / default identity
+    memcpy(&r[8],  "ESP32-S3",         8);
+    memcpy(&r[16], "Virtual CD-ROM  ", 16);
+  }
   memcpy(&r[32], "1.00",              4);
   return 36;
 }
@@ -1044,6 +1076,20 @@ static AudioTrack* findAudioTrack(uint8_t num) {
 }
 
 void audioPlay(uint32_t startLba, uint32_t endLba) {
+  // USBCD1 truncates M:S:F to M:S when storing track positions (drops F field).
+  // Result: startLba can be up to 74 sectors BEFORE the actual audio track start.
+  // Snap forward to the nearest audio track start if within 150 sectors (2 seconds).
+  for (int i = 0; i < audioTrackCount; i++) {
+    uint32_t ts = audioTracks[i].startLba;
+    if (startLba < ts && ts - startLba <= 150u) {
+      dualPrint.printf("[AUDIO] Snap LBA %lu→%lu (F-trunc fix, +%lu sectors)\n",
+                       startLba, ts, ts - startLba);
+      startLba = ts;
+      break;
+    }
+    if (startLba >= ts && startLba < ts + audioTracks[i].lengthSectors)
+      break;  // already in a valid track, no snap needed
+  }
   audioState      = AUDIO_STOP;  // pause task momentarily
   vTaskDelay(pdMS_TO_TICKS(5));
   audioCurrentLba = startLba;
@@ -1077,6 +1123,20 @@ void audioPause() { audioState = AUDIO_PAUSE; dualPrint.println(F("[AUDIO] Pause
 void audioResume(){ audioState = AUDIO_PLAY;  dualPrint.println(F("[AUDIO] Resume.")); }
 
 // =============================================================================
+//  SCSI DEBUG BRIDGE — volána z USBMSC.cpp patche, výstup jde do dualPrint (Serial + HTML)
+// =============================================================================
+void scsi_log(const char* msg) {
+  dualPrint.print(msg);
+}
+
+void scsi_log_play_msf(uint8_t sm, uint8_t ss, uint8_t sf,
+                       uint8_t em, uint8_t es, uint8_t ef,
+                       uint32_t s, uint32_t e) {
+  dualPrint.printf("[SCSI] PLAY_MSF %02X:%02X:%02X→%02X:%02X:%02X  LBA %lu→%lu\n",
+                   sm, ss, sf, em, es, ef, s, e);
+}
+
+// =============================================================================
 //  BRIDGE FUNCTIONS FOR USBMSC.cpp SCSI PATCH
 //  Plain C++ functions — USBMSC.cpp and this file are both C++,
 //  so C++ name mangling matches automatically. No extern "C" needed.
@@ -1100,7 +1160,7 @@ void scsi_audio_subchannel(uint8_t* buf) {
 int scsi_audio_track_count() { return (int)audioTrackCount; }
 
 int scsi_audio_track_info(int n, uint32_t* startLba, uint32_t* lenSectors) {
-  if (n == 1) return 0;  // Track 1 is data track — not an audio track
+  // Note: track 1 IS a valid audio track on pure audio CDs — don't skip it
   for (int i = 0; i < audioTrackCount; i++) {
     if (audioTracks[i].number == (uint8_t)n) {
       if (startLba)   *startLba   = audioTracks[i].startLba;
@@ -1111,10 +1171,23 @@ int scsi_audio_track_info(int n, uint32_t* startLba, uint32_t* lenSectors) {
   return 0;
 }
 
+// Returns track number of first audio track (1 for pure audio CD, 2 for mixed)
+uint8_t scsi_first_audio_track() {
+  if (audioTrackCount > 0) return audioTracks[0].number;
+  return 0;
+}
+
+// Returns true if disc has a data track (cdromBlockCount > 0)
+bool scsi_has_data_track() { return cdromBlockCount > 0; }
+
 uint32_t cdromBlockCount_get() {
   // For READ TOC lead-out: return full virtual disc LBA (includes audio)
   return discLeadOutLba > 0 ? discLeadOutLba : cdromBlockCount;
 }
+
+// Returns current DOS driver mode (used by SCSI patch for PLAY_MSF decode)
+uint8_t scsi_get_dos_driver() { return cfg.dosDriver; }
+bool    scsi_get_dos_compat()  { return cfg.dosCompat; }
 
 // =============================================================================
 //  WIFI
@@ -1571,6 +1644,7 @@ void handleApiSysinfo() {
   j += ",\"sys_flash_mb\":" + String(ESP.getFlashChipSize() / (1024*1024));
   j += ",\"sys_sdk\":\""   + jsonEsc(ESP.getSdkVersion())           + "\"";
   j += ",\"dos_compat\":" + String(cfg.dosCompat ? "true" : "false");
+  j += ",\"dos_driver\":" + String(cfg.dosDriver);
   j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
   j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
   j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
@@ -1774,6 +1848,7 @@ void handleApiGetConfig() {
   j += ",\"webAuth\":" + String(cfg.webAuth ? "true" : "false");
   j += ",\"webUser\":\"" + jsonEsc(cfg.webUser) + "\"";
     j += ",\"dosCompat\":" + String(cfg.dosCompat ? "true" : "false");
+  j += ",\"dosDriver\":" + String(cfg.dosDriver);
   j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
   j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
   j += ",\"httpsKey\":\"" + jsonEsc(cfg.httpsKeyPath) + "\"";
@@ -1815,6 +1890,10 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("dosCompat"))  { String v=httpServer.arg("dosCompat");  cfg.dosCompat=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("dosDriver"))  { cfg.dosDriver=(uint8_t)httpServer.arg("dosDriver").toInt(); changed=true;
+    if (cfg.dosDriver == 1 && !cfg.dosCompat) { cfg.dosCompat=true; } // USBCD2 implies DOS compat
+    if (cfg.dosDriver == 2 && !cfg.dosCompat) { cfg.dosCompat=true; } // USBCD1 implies DOS compat
+  }
   if (httpServer.hasArg("httpsEnabled")) { String v=httpServer.arg("httpsEnabled"); cfg.httpsEnabled=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("httpsCert")) { strlcpy(cfg.httpsCertPath, httpServer.arg("httpsCert").c_str(), sizeof(cfg.httpsCertPath)); changed=true; }
   if (httpServer.hasArg("httpsKey"))  { strlcpy(cfg.httpsKeyPath,  httpServer.arg("httpsKey").c_str(),  sizeof(cfg.httpsKeyPath));  changed=true; }
@@ -2648,6 +2727,17 @@ void printConfig(bool showRuntime = true) {
     }
   }
   dualPrint.printf("  Default image : %s\n",  defaultMount.length() ? defaultMount.c_str() : "(none)");
+  // DOS compat + driver (driver jen kdyz compat=ON)
+  dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "ON  (UNIT ATTENTION, no USB re-enum)" : "OFF");
+  if (cfg.dosCompat) {
+    const char* dosDriverName[] = {
+      "0=Generic (no special identity)",
+      "1=USBCD2/TEAC  [INQUIRY: TEAC CD-56E]",
+      "2=ESPUSB/Panasonic  [INQUIRY: MATSHITA CR-572]",
+      "3=DI1000DD/USBASPI 2.20  [data only, no audio]"
+    };
+    dualPrint.printf("  DOS driver    : %s\n",  dosDriverName[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
+  }
   dualPrint.printf("  Audio module  : %s\n",  cfg.audioModule ? "PCM5102 enabled" : "disabled");
   dualPrint.printf("  Web auth      : %s\n",  cfg.webAuth ? "enabled" : "disabled (no login required)");
   if (cfg.webAuth) dualPrint.printf("  Web user      : %s\n", cfg.webUser);
@@ -2661,8 +2751,6 @@ void printConfig(bool showRuntime = true) {
   dualPrint.printf("  TLS ciphers   : %s\n", cfg.tlsCiphers==1?"Strong/GCM":cfg.tlsCiphers==2?"Medium/CBC":cfg.tlsCiphers==3?"All/Legacy":"Auto");
   }
   dualPrint.println(F(""));
-  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
-  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled" : "disabled");
   printSep();
   if (!showRuntime) return;
   dualPrint.println(F("  RUNTIME STATE"));
@@ -2822,12 +2910,31 @@ void printStatus() {
   dualPrint.printf("  HTTPS port    : %u\n", cfg.httpsPort ? cfg.httpsPort : 443);
   dualPrint.printf("  TLS version   : %s\n", cfg.tlsMinVer==0?"TLS 1.2 only":"TLS 1.2 + 1.3");
   dualPrint.printf("  TLS ciphers   : %s\n", cfg.tlsCiphers==1?"Strong/GCM":cfg.tlsCiphers==2?"Medium/CBC":cfg.tlsCiphers==3?"All/Legacy":"Auto");
-  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled" : "disabled");
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F("  ┌─ System ───────────────────────────────────────┐"));
   dualPrint.println(F(""));
-  dualPrint.println(F("  ┌─ Other Settings ───────────────────────────────┐"));
-  dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "enabled (no USB re-enum)" : "disabled");
+  dualPrint.println(F("  ┌─ DOS Compatibility ─────────────────────────────┐"));
+  dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "ON  (UNIT ATTENTION, no USB re-enum)" : "OFF");
+  if (cfg.dosCompat) {
+    const char* drvNames[] = {
+      "0=Generic  (no special identity, works with any ASPI)",
+      "1=USBCD2   TEAC CD-56E  [BROKEN: needs INT 13h hook]",
+      "2=ESPUSB  MATSHITA CR-572  [audio via CDP.COM/cdp.com]",
+      "3=DI1000DD USBASPI 2.20  [data only, no audio]"
+    };
+    dualPrint.printf("  DOS driver    : %s\n",  drvNames[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
+  }
+  if (cfg.dosDriver == 2) {
+    dualPrint.println(F("  USBASPI needed: usbaspi2.sys (Novac) or usbaspi1.sys"));
+    dualPrint.println(F("  Audio player  : use CDP.COM (cdplayer.exe aborts on IOCTL OUT sf3 without espusb.sys)"));
+    dualPrint.println(F("  Driver file   : espusb.sys  (sf3 fix + alloc patch)"));
+  } else if (cfg.dosDriver == 3) {
+    dualPrint.println(F("  USBASPI needed: usbaspi1.sys (Panasonic v2.20)"));
+    dualPrint.println(F("  Note          : data-only, no MSCDEX audio commands"));
+  } else if (cfg.dosDriver == 1) {
+    dualPrint.println(F("  WARNING       : USBCD2 uses INT 13h AH=0x50 (not std ASPI)"));
+    dualPrint.println(F("                  Standard USBASPI does not provide INT 13h hook"));
+  }
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
   dualPrint.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
@@ -2871,7 +2978,21 @@ void printHelp() {
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
   dualPrint.println(F("  ┌─ DOS Compatibility ─────────────────────────────┐"));
-  dualPrint.println(F("  set dos-compat on|off     DOS mode (no USB re-enum on disc swap)"));
+  dualPrint.println(F("  set dos-compat on|off     ON = UNIT ATTENTION only, no USB re-enum"));
+  dualPrint.println(F("  set dos-driver <0-3>      Set USB CD-ROM driver identity:"));
+  dualPrint.println(F("    0 Generic     no special identity, universal"));
+  dualPrint.println(F("    1 USBCD2/TEAC INQUIRY: TEAC CD-56E  [BROKEN: needs INT 13h]"));
+  dualPrint.println(F("    2 ESPUSB/Pan  INQUIRY: MATSHITA CR-572  [recommended for audio]"));
+  dualPrint.println(F("    3 DI1000DD    INQUIRY: generic  [data only, no audio]"));
+  dualPrint.println(F("  DOS driver 2 (ESPUSB) notes:"));
+  dualPrint.println(F("    USBASPI: usbaspi2.sys (Novac) or usbaspi1.sys (Panasonic v2.20)"));
+  dualPrint.println(F("    ESPUSB communicates via SCSIMGR$ DOS device (INT 21h IOCTL)"));
+  dualPrint.println(F("    ESPUSB scans ASPI target IDs: 0x18, 0x08, 0x10"));
+  dualPrint.println(F("    CDPlayer.exe works with espusb.sys (sf3 IOCTL OUT fix included)"));
+  dualPrint.println(F("    Use CDP.COM if cdplayer.exe still fails"));
+  dualPrint.println(F("  DOS driver 3 (DI1000DD) notes:"));
+  dualPrint.println(F("    USBASPI: usbaspi1.sys (Panasonic v2.20)  assigns ID 0"));
+  dualPrint.println(F("    Data access only — no MSCDEX audio IOCTL support"));
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
   dualPrint.println(F("  ┌─ HTTPS / TLS ───────────────────────────────────┐"));
@@ -3020,6 +3141,10 @@ void processCommand(String &line) {
     else if (key=="audio-module") { String v=val; v.toLowerCase(); cfg.audioModule=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="web-auth")  { String v=val; v.toLowerCase(); cfg.webAuth=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="dos-compat")   { String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="dos-driver")   { int d=constrain(val.toInt(),0,3); cfg.dosDriver=(uint8_t)d;
+      if (d==1||d==2) cfg.dosCompat=true; // USBCD1/USBCD2 require DOS compat
+      if (d==3) cfg.dosCompat=false; // DI1000DD does not need DOS compat
+    }
     else if (key=="https-enable")  { String v=val; v.toLowerCase(); cfg.httpsEnabled=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="https-cert")    { strlcpy(cfg.httpsCertPath, val.c_str(), sizeof(cfg.httpsCertPath)); }
     else if (key=="https-key")     { strlcpy(cfg.httpsKeyPath,  val.c_str(), sizeof(cfg.httpsKeyPath)); }

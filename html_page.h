@@ -169,8 +169,8 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 </div>
 
 <div class="panel" id="p1">
-  <div class="card" style="flex:1">
-    <div class="ap" id="audioPlayer" style="display:block;background:transparent;border:none;padding:0">
+  <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0">
+    <div class="ap" id="audioPlayer" style="display:flex;flex-direction:column;flex:1;min-height:0;background:transparent;border:none;padding:0">
       <div class="ct" style="margin-bottom:12px">&#127925; Audio CD Player</div>
       <div class="ap-track" id="apTrackName">&#8212;</div>
       <div class="ap-time">
@@ -196,7 +196,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
                oninput="apSetVolume(this.value)" title="Volume">
         <span style="font-size:.78rem;color:var(--tx2);min-width:28px;text-align:right" id="apVolLabel">80</span>
       </div>
-      <div class="ap-tracklist" id="apTrackList" style="max-height:300px"></div>
+      <div class="ap-tracklist" id="apTrackList" style="flex:1;min-height:0;max-height:none"></div>
     </div>
   </div>
 </div>
@@ -422,19 +422,53 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <div class="ct">&#128190; DOS Compatibility Mode</div>
       <div class="cfg-row">
         <label class="cfg-lbl">Mount behavior</label>
-        <select class="cfg-inp" id="cfgDosCompat" style="width:100%">
+        <select class="cfg-inp" id="cfgDosCompat" style="width:100%" onchange="dosCompatChanged()">
           <option value="0">Normal (USB re-enumeration on mount/eject)</option>
           <option value="1">DOS compatible (UNIT ATTENTION only, no re-enum)</option>
         </select>
       </div>
       <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-        &#9432; Enable when using with DOS (MSCDEX / USBASPI). Prevents the device from
-        disappearing after disc swap. Uses UNIT&nbsp;ATTENTION&nbsp;0x28 instead of USB
-        re-enumeration so DOS drivers can reload the TOC without losing the device.
+        &#9432; DOS compat prevents the device from disappearing on disc swap.
+        Uses UNIT&nbsp;ATTENTION&nbsp;0x28 instead of USB re-enumeration.
+        Automatically enabled when a DOS driver is selected above.
+      </div>
+      <div id="dosDriverSection" style="display:none;margin-top:12px">
+        <div class="cfg-row">
+          <label class="cfg-lbl">DOS CD-ROM driver</label>
+          <select class="cfg-inp" id="cfgDosDriver" onchange="dosDriverChanged()">
+            <option value="0">Generic (no driver-specific identity)</option>
+            <option value="1">USBCD2.SYS &mdash; TEAC CD-56E [BROKEN &ndash; needs INT 13h hook]</option>
+            <option value="2">ESPUSB.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
+            <option value="3">DI1000DD.SYS + usbaspi1.sys &mdash; data only, no audio</option>
+          </select>
+        </div>
+        <div id="dosDriverNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(241,196,15,.1);border:1px solid rgba(241,196,15,.3);border-radius:4px;padding:8px 12px">
+          &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.
+          <b style="color:#e74c3c">Requires USBASPI with INT&nbsp;13h hook</b> &mdash; standard USBASPI.EXE/SYS does not provide this.
+          USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) to detect drives, not ASPI INT&nbsp;2Fh.
+          Result: <code>[Invalid parameter]</code> with all known USBASPI versions.
+          <b>Not recommended</b> &mdash; use ESPUSB.SYS instead.
+        </div>
+        <div id="dosDriverNote2" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(52,152,219,.1);border:1px solid rgba(52,152,219,.3);border-radius:4px;padding:8px 12px">
+          &#10003; <b>ESPUSB.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
+          Audio: PLAY, STOP, RESUME, READ_SUB-CHANNEL via MSCDEX IOCTL.<br>
+          Communicates via <b>SCSIMGR$ DOS device</b> &mdash; works with usbaspi1.sys/usbaspi2.sys.<br>
+          <b style="color:#e67e22">CD Player compatibility:</b><br>
+          &bull; <b style="color:#e74c3c">cdplayer.exe fails with original USBCD1.SYS:</b> missing IOCTL OUT sf3 &rarr; <code>error 3</code><br>
+          &bull; <b style="color:#27ae60">CDP.COM works:</b> tolerates missing sf3, continues to PLAY/STOP/SEEK<br>
+          &bull; <b style="color:#27ae60">espusb.sys:</b> includes sf3 fix + alloc patch &rarr; cdplayer.exe works<br>
+          CONFIG.SYS: <code>usbaspi2.sys /w /v</code> + <code>ESPUSB.SYS /D:USBCD0</code>
+        </div>
+        <div id="dosDriverNote3" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
+          &#128190; <b>DI1000DD.SYS (NOVAC) + USBASPI 2.20:</b> Data-only USB storage &mdash; <b>no audio</b>.<br>
+          SD card files accessible as regular DOS drive letter (FAT).<br>
+          Use <b>usbaspi1.sys</b> as ASPI layer (Panasonic v2.20): <code>usbaspi1.sys /w /v</code> + <code>DI1000DD.SYS</code><br>
+          No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively.
+        </div>
       </div>
     </div>
 
-    <!-- HTTPS -->
+        <!-- HTTPS -->
     <div class="card">
       <div class="ct">&#128274; HTTPS / TLS</div>
       <div class="cfg-row">
@@ -735,6 +769,23 @@ function apSeekRel(rel){
   if(t) fetch('/api/audio/seek?track='+t.num+'&rel='+rel);
 }
 
+function dosCompatChanged(){
+  var v=parseInt($('cfgDosCompat').value||0);
+  var sec=$('dosDriverSection');
+  if(sec) sec.style.display=(v===1)?'block':'none';
+  // Při vypnutí dosCompat vrať driver na Generic
+  if(v===0 && $('cfgDosDriver')) $('cfgDosDriver').value='0';
+}
+function dosDriverChanged(){
+  var v=parseInt($('cfgDosDriver').value||0);
+  var n1=$('dosDriverNote1'), n2=$('dosDriverNote2');
+  if(n1) n1.style.display=(v===1)?'block':'none';
+  if(n2) n2.style.display=(v===2)?'block':'none';
+  var n3=$('dosDriverNote3'); if(n3) n3.style.display=(v===3)?'block':'none';
+  // USBCD2 and USBCD1 force DOS compat ON; DI1000DD does not need it
+  if(v===1||v===2) $('cfgDosCompat').value='1';
+  if(v===3) $('cfgDosCompat').value='0';
+}
 function webAuthToggle(){
   $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
 }
@@ -1034,7 +1085,8 @@ function cfgLoad(){
     $('cfgEapKey')._savedVal  = c.eapKeyPath  || '';
     $('cfgEapKPass').value = '';  // never pre-fill password
     $('cfgAudioModule').value = c.audioModule ? '1' : '0';
-    $('cfgDosCompat').value = c.dosCompat ? '1' : '0';
+    $('cfgDosCompat').value = c.dosCompat ? '1' : '0'; dosCompatChanged();
+    var ddEl=$('cfgDosDriver'); if(ddEl){ddEl.value=c.dosDriver||0; dosDriverChanged();}
     var heEl=$('cfgHttpsEnabled'); if(heEl){heEl.value=c.httpsEnabled?'1':'0'; httpsToggle();}
     var hcEl=$('cfgHttpsCert'); if(hcEl){hcEl._savedVal=c.httpsCert||''; if(c.httpsCert){var o=document.createElement('option');o.value=c.httpsCert;o.textContent=c.httpsCert+' (saved)';hcEl.appendChild(o);hcEl.value=c.httpsCert;}}
     var hkEl=$('cfgHttpsKey'); if(hkEl){hkEl._savedVal=c.httpsKey||''; if(c.httpsKey){var o=document.createElement('option');o.value=c.httpsKey;o.textContent=c.httpsKey+' (saved)';hkEl.appendChild(o);hkEl.value=c.httpsKey;}}
@@ -1071,6 +1123,7 @@ function cfgSave(){
   params.set('eapKeyPath',$('cfgEapKey').value||'');
   if($('cfgEapKPass').value.trim()) params.set('eapKeyPass',$('cfgEapKPass').value.trim());
   params.set('audioModule',$('cfgAudioModule').value);
+  params.set('dosDriver',$('cfgDosDriver')?$('cfgDosDriver').value:'0');
   params.set('dosCompat',$('cfgDosCompat').value);
   params.set('httpsEnabled',$('cfgHttpsEnabled')?$('cfgHttpsEnabled').value:'0');
   params.set('httpsCert',$('cfgHttpsCert')?$('cfgHttpsCert').value:'');
@@ -1209,7 +1262,6 @@ function loadSysinfo(){
     siRow(sy,'CPU',s.sys_cpu_mhz+' MHz');
     siRow(sy,'Flash',s.sys_flash_mb+' MB');
     siRow(sy,'SDK',s.sys_sdk);
-    dosCompatOn=s.dos_compat||false;
     siRow(sy,'HTTP port',s.httpPort||80);
     siRow(sy,'HTTPS',s.httpsEnabled?'<span style="color:var(--ok)">&#10003; Enabled (port 443)</span>':'<span style="color:var(--muted)">Disabled</span>');
     if(s.httpsEnabled){
@@ -1220,7 +1272,12 @@ function loadSysinfo(){
       siRow(sy,'TLS protocol',verNames[s.tlsMinVer||0]||'TLS 1.2 only');
       siRow(sy,'TLS ciphers',cipNames[s.tlsCiphers||0]||'Auto');
     }
-    siRow(sy,'DOS compat',s.dos_compat?'<span style="color:var(--ok)">&#10003; Enabled (no USB re-enum on mount)</span>':'<span style="color:var(--muted)">Disabled</span>');
+    var dosDriverNames=['Generic','USBCD2.SYS (TEAC CD-56E)','ESPUSB.SYS (Panasonic CR-572)','DI1000DD.SYS (USBASPI 2.20)'];
+    var dosDriverName=dosDriverNames[s.dos_driver||0]||'Generic';
+    siRow(sy,'DOS driver',s.dos_compat
+      ?'<span style="color:var(--ok)">&#10003; '+dosDriverName+'</span>'
+      :'<span style="color:var(--muted)">Disabled</span>');
+    dosCompatOn=s.dos_compat||false;
       // Audio section
       var ta=$('siAudio')&&$('siAudio').querySelector('tbody');
       if(ta){
