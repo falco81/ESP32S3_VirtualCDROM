@@ -1,7 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
 title ESP32-S3 Virtual CD-ROM -- Flash Tool
-
 echo ============================================================
 echo   ESP32-S3 Virtual CD-ROM -- Flash Tool
 echo ============================================================
@@ -25,7 +24,7 @@ if errorlevel 1 (
 )
 
 :: Install / update esptool
-echo Installing esptool...
+echo Installing / updating esptool...
 pip install esptool --quiet --upgrade
 if errorlevel 1 (
     echo ERROR: Failed to install esptool.
@@ -47,13 +46,14 @@ echo.
 echo Ready to flash. Connect the UART USB cable (LEFT connector).
 echo Press any key to start...
 pause >nul
-
 echo.
 echo Flashing...
 echo.
 
+:: --after no_reset: esptool exits cleanly after writing
+:: (hard_reset hangs at 99.6%% waiting for DTR/RTS response on CH343/CP2102)
 python -m esptool --chip esp32s3 --baud 921600 ^
-  --before default_reset --after hard_reset ^
+  --before default_reset --after no_reset ^
   write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m ^
   0x0 firmware_merged.bin
 
@@ -68,11 +68,16 @@ if errorlevel 1 (
     echo   2. Install CH343 driver:
     echo      https://www.wch-ic.com/products/CH343.html
     echo   3. Hold BOOT button, press RESET, release BOOT, retry
-    echo   4. Try a lower baud rate: edit this file, change 921600 to 460800
+    echo   4. Try a lower baud rate: change 921600 to 460800
     echo.
     pause
     exit /b 1
 )
+
+:: Trigger boot after successful flash
+echo.
+echo Resetting ESP32-S3...
+python -m esptool --chip esp32s3 run >nul 2>&1
 
 echo.
 echo ============================================================
