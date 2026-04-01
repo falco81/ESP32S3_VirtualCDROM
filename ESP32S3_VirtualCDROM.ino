@@ -409,8 +409,9 @@ bool initSD() {
 void closeIso() {
   if (isoOpen) {
     isoOpen = false;          // disable reads on core 0 FIRST
-    delay(2);                 // let any in-flight mscReadCb finish (~1 SD read cycle)
+    delay(15);                // wait for any in-flight mscReadCb sector loop to see isoOpen=false and exit
     isoFileHandle.close();
+    isoFileHandle = File();   // explicit null — prevents stale internal FatFS pointer
   }
 }
 
@@ -1013,6 +1014,8 @@ static int32_t mscReadCb(uint32_t lba, uint32_t offset, void *buffer, uint32_t b
   // TinyUSB may call with bufsize > binUserDataSize (multi-sector read).
   // A single seek+read(bufsize) would cross sector boundaries and return
   // header/ECC bytes as data → file corruption. Must read sector by sector.
+  // IMPORTANT: re-check isoOpen/mscMediaPresent each iteration — doMount()
+  // on the other core may close isoFileHandle while we're mid-loop.
   uint8_t* dst     = (uint8_t*)buffer;
   int32_t  total   = 0;
   uint32_t rem     = bufsize;
@@ -1020,6 +1023,8 @@ static int32_t mscReadCb(uint32_t lba, uint32_t offset, void *buffer, uint32_t b
   uint32_t inSect  = offset;  // byte offset within current sector's user data area
 
   while (rem > 0) {
+    if (!isoOpen || !mscMediaPresent) return total > 0 ? total : -1;  // file closing on other core
+
     uint32_t chunk = binUserDataSize - inSect;   // bytes left in this sector
     if (chunk > rem) chunk = rem;
 
