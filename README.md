@@ -44,8 +44,9 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 ## Features
 
 - **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; the PC sees an optical drive without any drivers
-- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with multi-track support
-- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; full SCSI-2 audio command set per Pioneer OB-U0077C spec (PLAY AUDIO, READ TOC, READ SUB-CHANNEL, PAUSE/RESUME, STOP, TRACK RELATIVE)
+- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with full multi-track support including all raw sector formats
+- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; full SCSI-2 audio command set per Pioneer OB-U0077C spec (PLAY AUDIO, READ TOC, READ SUB-CHANNEL, PAUSE/RESUME, STOP, TRACK RELATIVE); audio enabled for non-DOS mode (Windows/Linux) and DOS drivers 0, 1, 2; driver 3 (DI1000DD) is data-only by design
+- **CUE parser** — supports all sector formats (MODE1/2352, MODE2/2352, MODE2/2336, MODE1/2048, MODE2/2048, CDG/2448), physical pregap via INDEX 00, virtual pregap via PREGAP directive, single-BIN and separate-BIN-per-track layouts
 - **Web file manager** — upload, download, delete, create folders, drag-and-drop
 - **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with full certificate management
 - **mDNS** — device reachable at `hostname.local`; FQDN support
@@ -54,8 +55,8 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - **exFAT SD cards** — supported after applying the `build_exfat_libs.py` patch
 - **Web UI authentication** — HTTP Basic Auth, enable/disable, username/password via web or CLI, disabled by default
 - **HTTPS / TLS** — optional encrypted HTTPS on port 443; certificate and key loaded from SD card; HTTP auto-redirects to HTTPS; ESP32-S3 hardware AES/SHA/RSA acceleration
-- **HTTPS / TLS** — optional encrypted HTTPS on port 443; certificate and key loaded from SD card; HTTP auto-redirects; hardware AES/SHA/RSA acceleration on ESP32-S3
 - **Bidirectional audio sync** — PC controls playback via SCSI, HTML syncs within 400 ms
+- **Audio module runtime toggle** — enable or disable the I2S module without reboot via web UI or CLI
 - **RGB LED** — boot / Wi-Fi / error state indication
 
 ---
@@ -435,10 +436,11 @@ In the web interface click **Set default** -- the image will mount automatically
 Via serial:
 ```
 set audio-module on
-reboot
 ```
 
-Or via web: **Config tab -> Audio Module -> GY-PCM5102 I2S -- GPIO 14/15/16 -> Save -> Reboot**.
+Or via web: **Config tab -> Audio Module -> GY-PCM5102 I2S -- GPIO 14/15/16 -> Save**.
+
+The I2S module is initialised immediately at runtime — no reboot required. Disabling the module also takes effect immediately and stops any active playback.
 
 ---
 
@@ -471,15 +473,15 @@ Available at `http://cd.local` or via the device IP address.
 
 **Status** -- real-time device status: Wi-Fi, SD card, disc image, EAP certificate details, audio module, system info.
 
-**Config** -- complete configuration without a serial cable. Sections:
+**Config** -- complete configuration without a serial cable. Sections scroll freely; Save/Reboot/Factory Reset remain fixed at the bottom of the tab at all times. Sections:
 - **WiFi** -- SSID, password, network scan
 - **Network** -- DHCP/Static, IP/mask/gateway/DNS, Hostname with live mDNS preview
 - **802.1x Enterprise WiFi** -- EAP Mode, identity, **Scan SD** for auto-detection of `.pem/.crt/.key` files, CA cert, Client cert/key, passphrase
-- **Audio Module** -- PCM5102 I2S enable/disable dropdown
-- **HTTPS / TLS** — optional HTTPS on port 443 with certificate from SD card; HTTP auto-redirects to HTTPS; hardware AES/SHA/RSA acceleration
-- **DOS Compatibility Mode** -- UNIT ATTENTION instead of USB re-enum on mount/eject
+- **Audio Module** -- PCM5102 I2S enable/disable dropdown; takes effect immediately without reboot
 - **Web UI Authentication** -- enable/disable HTTP Basic Auth, username, password (write-only)
-- **Actions** -- Save, Reboot, Factory reset, SD unmount/mount
+- **DOS Compatibility Mode** -- UNIT ATTENTION instead of USB re-enum on mount/eject; expands to show DOS driver selector when enabled
+- **HTTPS / TLS** — optional HTTPS on port 443 with certificate from SD card; HTTP auto-redirects to HTTPS; hardware AES/SHA/RSA acceleration
+- **Actions** (fixed at bottom) -- Save & apply, Reboot, Factory reset, SD unmount/mount
 
 ---
 
@@ -513,8 +515,9 @@ Connect any serial terminal at **115 200 baud, 8N1**.
 | `eap-id / eap-user / eap-pass` | EAP credentials |
 | `eap-ca / eap-cert / eap-key` | Paths to certificates on SD card |
 | `eap-kpass` | Passphrase for an encrypted private key |
-| `audio-module on/off` | PCM5102 I2S audio module |
-| `dos-compat on/off` | DOS compatibility mode -- no USB re-enum on mount (default: off) |
+| `audio-module on/off` | PCM5102 I2S audio module (takes effect immediately, no reboot required) |
+| `dos-compat on/off` | DOS compatibility mode — no USB re-enum on mount; automatically set when a DOS driver is selected; disabling resets driver to 0 (default: off) |
+| `dos-driver 0/1/2/3` | DOS CD-ROM driver identity (requires dos-compat on; see DOS Compatibility Mode) |
 | `web-auth on/off` | HTTP Basic Auth (default: off) |
 | `web-user <name>` | Web UI username (default: admin) |
 | `web-pass <password>` | Web UI password (default: admin) |
@@ -571,12 +574,27 @@ VALUES ('identity', 'Auth-Type', 'EAP', ':=');
 
 When **DOS Compatibility Mode** is enabled, the drive never disconnects from USB when you switch disc images. Instead:
 
-1. Host sends READ(10) — drive is present, media reported absent (`mediaPresent = false`)
-2. Firmware swaps the image file
-3. SCSI UNIT ATTENTION (`06h / 28h`) is signalled via the patched `tud_msc_test_unit_ready_cb`
-4. MSCDEX detects the change and re-reads the TOC — new disc appears without any USB re-enumeration
+1. Host sends READ(10) — `mscReadCb` is disabled immediately at the start of the mount operation
+2. Firmware parses and opens the new image file
+3. `msc.mediaPresent(false)` is signalled briefly — MSCDEX detects no media
+4. After a short wait, `msc.mediaPresent(true)` + SCSI UNIT ATTENTION (`06h/28h`) is signalled
+5. UNIT ATTENTION persists across 3 consecutive TUR poll cycles to ensure the OS catches the disc-change event
+6. MSCDEX re-reads the TOC — new disc appears without any USB re-enumeration
 
-Enable via CLI: `set dos-compat on` + `reboot`, or via the web Config tab.
+Enable via CLI: `set dos-compat on`, or via the web Config tab.
+
+### DOS Driver Modes
+
+DOS driver mode is only available when DOS Compatibility Mode is enabled. Selecting a driver mode automatically enables DOS compat; disabling DOS compat resets the driver to Generic.
+
+| Driver | Value | INQUIRY Identity | Audio | Notes |
+|---|---|---|---|---|
+| Generic | `0` | ESP32-S3 / Virtual CD-ROM | ✅ Full | Works with any ASPI-compatible driver + MSCDEX |
+| USBCD2/TEAC | `1` | TEAC / CD-56E (SCSI-2) | ✅ Handled | Driver communication broken — USBCD2 uses INT 13h AH=0x50, standard USBASPI does not provide this hook |
+| ESPUSB/Panasonic | `2` | MATSHITA / CD-ROM CR-572 (SCSI-2) | ✅ Full | Requires `usbaspi1.sys` or `usbaspi2.sys` + `espusb.sys` |
+| DI1000DD | `3` | ESP32-S3 / Virtual CD-ROM (SCSI-2) | ❌ Data-only | Requires `usbaspi1.sys` (Panasonic v2.20); no MSCDEX audio commands |
+
+Via CLI: `set dos-driver 0` (Generic), `set dos-driver 2` (Panasonic/ESPUSB), etc.
 
 The web UI respects DOS compat mode: the **Mount** button automatically ejects (`/api/umount`), waits 2.5 s, then mounts the new image (`/api/mount`) — all without a USB disconnect.
 
@@ -612,22 +630,47 @@ The firmware has been tested on a real **DOS / Windows 98SE retro PC** — [DOSR
 
 ### DOS Driver Setup
 
-Add to `CONFIG.SYS`:
+#### Generic (Driver 0) — recommended starting point
 
+Add to `CONFIG.SYS`:
 ```dos
-; ESP32-S3 Virtual CD-ROM
-; /u  = UHCI only, /w /w = startup delays (required on older chipsets)
 DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI.EXE /u /w /w
-DEVICEHIGH=C:\DRIVERS\USBCD\USBCD1.SYS /D:ESPCD0
 ```
 
 Add to `AUTOEXEC.BAT`:
-
 ```dos
-LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:ESPCD0 /Q
+LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:USBCD0 /Q
 ```
 
-> **Important**: Enable **DOS Compatibility Mode** on the ESP32-S3 (`set dos-compat on`) before use. This prevents USB re-enumeration on disc swap, which would confuse the USBASPI driver stack.
+Set on ESP32: `set dos-compat on` + `set dos-driver 0`
+
+#### ESPUSB/Panasonic (Driver 2) — full audio in DOS
+
+Add to `CONFIG.SYS`:
+```dos
+DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI2.SYS /w /v
+DEVICEHIGH=C:\DRIVERS\USBCD\ESPUSB.SYS /D:USBCD0
+```
+
+Add to `AUTOEXEC.BAT`:
+```dos
+LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:USBCD0 /Q
+; For audio: use CDP.COM (cdplayer.exe requires espusb.sys for IOCTL OUT sf3 support)
+```
+
+Set on ESP32: `set dos-compat on` + `set dos-driver 2`
+
+#### DI1000DD (Driver 3) — data-only
+
+Add to `CONFIG.SYS`:
+```dos
+DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI1.SYS /w /v
+DEVICEHIGH=C:\DRIVERS\USBCD\DI1000DD.SYS
+```
+
+Set on ESP32: `set dos-compat on` + `set dos-driver 3`
+
+No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively. Data access only — no audio SCSI commands.
 
 > **Tip**: The ESP32-S3 must be powered and connected **before** the PC boots — USBASPI only scans at init time.
 
@@ -762,7 +805,7 @@ Connect a **GY-PCM5102 I2S DAC** module to the ESP32-S3:
 | GND | FMT | I2S Philips format |
 | GND | SCK | No master clock |
 
-Enable via CLI: `set audio-module on` + `reboot`, or via the web Config tab.
+Enable via CLI: `set audio-module on`, or via the web Config tab. The module is initialised immediately — no reboot required. Disabling also takes effect immediately.
 
 ### Audio Data Format
 
@@ -771,21 +814,34 @@ Red Book audio sectors are **raw 16-bit signed stereo PCM, little-endian, 44100 
 - **No header** — all 2352 bytes are usable PCM data
 - I2S configured: 44100 Hz, 16-bit, stereo, Philips format
 
+### Audio Support by Mode
+
+| Mode | Audio |
+|---|---|
+| Non-DOS (Windows, Windows 98, Linux) | ✅ Full |
+| DOS compat, driver 0 Generic | ✅ Full |
+| DOS compat, driver 1 USBCD2/TEAC | ✅ SCSI handled (driver communication broken via INT 13h) |
+| DOS compat, driver 2 ESPUSB/Panasonic | ✅ Full |
+| DOS compat, driver 3 DI1000DD | ❌ Data-only by design |
+
 ### Virtual Disc Layout (CUE/BIN)
 
 For **separate BIN files** (one `.bin` per track — e.g. Tomb Raider):
 ```
 LBA 0          … dataTrackSectors-1   → Track 01 (data)
 LBA dataEnd    … dataEnd+len02-1      → Track 02 (audio, pregap stripped)
-LBA …          … …                    → Track 03 … 17
+LBA …          … …                    → Track 03 … N
 LBA leadOut                           → Lead-out (reported in READ TOC as 0xAA)
 ```
 
-For **single BIN file** (all tracks in one file — ISO 9660 style):
-- Track LBAs come directly from CUE `INDEX 01` positions
-- File offset = `(lba - trackStartLba) × 2352`
+For **single BIN file** (all tracks in one file):
+- Track LBAs come directly from CUE `INDEX 01` positions (absolute BIN sector)
+- Audio seek: `fileSector = fileSectorBase + (lba - trackStartLba)` where `fileSectorBase = trackStartLba` for single-BIN
+- `mscReadCb` uses `dataTrackStartSect = 0` for single-BIN (DOS navigates via Track 01 LBA from TOC)
 
-**Pregap handling**: if a track BIN file has an internal pregap (`INDEX 01 00:02:00` in the CUE), the parser sets `pregapSectors = 150`. The audio task seeks to `(lba - trackStart + pregap) × 2352` — the pregap silence is skipped transparently.
+**Pregap handling:**
+- Physical pregap (INDEX 00 in CUE): `fileSectorBase = INDEX01_position`; length excludes the pregap
+- Virtual pregap (PREGAP directive): `fileSectorBase = 0`; pregap LBA space reserved in virtual layout but no file seek needed
 
 ### Bidirectional Synchronisation
 
@@ -922,15 +978,28 @@ Current Position Data Block (12 bytes, format 01h):
 
 ## Supported Disc Image Formats
 
-| Format | Extension | Sector size | Header offset |
-|---|---|---|---|
-| ISO 9660 | `.iso` | 2048 B | 0 |
-| Raw MODE1/2048 | `.bin` | 2048 B | 0 |
-| Raw MODE1/2352 | `.bin` | 2352 B | 16 |
-| Raw MODE2/2352 | `.bin` | 2352 B | 24 |
-| Raw MODE2/2336 | `.bin` | 2336 B | 8 |
-| CUE sheet (single BIN) | `.cue` | Per CUE | Per CUE |
-| CUE sheet (separate BIN per track) | `.cue` | 2352 B | 16 or 24 B |
+| Format | Extension | Sector size | Header offset | Notes |
+|---|---|---|---|---|
+| ISO 9660 | `.iso` | 2048 B | 0 | |
+| Raw MODE1/2048 | `.bin` | 2048 B | 0 | Cooked/stripped |
+| Raw MODE1/2352 | `.bin` / `.cue` | 2352 B | 16 | Full raw sector with sync and ECC |
+| Raw MODE2/2352 | `.bin` / `.cue` | 2352 B | 24 | XA with 8-byte sub-header |
+| Raw MODE2/2336 | `.bin` / `.cue` | 2336 B | 8 | Sub-header only, no sync |
+| Raw MODE2/2048 | `.cue` | 2048 B | 0 | Cooked MODE2 |
+| CD+G | `.cue` | 2448 B | 0 | Raw 2352 B data + 96 B subcode; served as-is |
+| CUE sheet (single BIN) | `.cue` | Per CUE | Per CUE | All tracks in one file; LBAs from INDEX 01 |
+| CUE sheet (separate BIN per track) | `.cue` | Per CUE | Per CUE | One file per track; virtual LBAs assigned after parse |
+
+### CUE Pregap Handling
+
+Two pregap formats are fully supported:
+
+- **Physical pregap (INDEX 00):** pregap data is stored in the BIN file before INDEX 01. The parser reads the INDEX 00 position, subtracts it from INDEX 01 to determine pregap length, and the audio task seeks past it using `fileSectorBase`.
+- **Virtual pregap (PREGAP directive):** pregap silence is not in the BIN file. The parser reserves the pregap LBA space in the virtual disc layout and the audio task reads from byte 0 of the BIN file directly.
+
+### Multi-sector Read Correctness
+
+For all raw sector formats (sector size > 2048 B), `mscReadCb` reads one sector at a time, seeking to `lba × rawSectorSize + headerOffset` for each sector. This prevents the sync/ECC bytes between sectors from appearing as data when the OS requests multiple sectors in a single read command.
 
 ---
 
@@ -957,22 +1026,21 @@ python3 build_exfat_libs.py --restore
 python3 build_exfat_libs.py --skip-full-build
 ```
 
-**Current patch version: v8.** The patch modifies `tud_msc_scsi_cb` in `USBMSC.cpp` to inject:
+**Current patch version: v13.** The patch modifies `tud_msc_scsi_cb` in `USBMSC.cpp` to inject:
 - Full CD-ROM SCSI command set (READ TOC, PLAY AUDIO, READ SUB-CHANNEL, START/STOP, …)
-- MODE SENSE page `0x0E` (Audio Control Parameters) — required by DOS audio players
+- Audio and TOC SCSI commands active for: non-DOS mode (Windows/Linux) and DOS drivers 0, 1, 2; driver 3 (DI1000DD) receives universal handlers only (data-only)
+- READ TOC response fills tracks sequentially from Track 1 regardless of allocation length; `Data Length` always reflects the full TOC size so the OS can issue a correctly-sized follow-up request and see all tracks
+- MODE SENSE pages `0x0D`, `0x0E`, `0x2A` (6-byte and 10-byte variants) — required by DOS audio players and Windows
 - MODE SELECT `15h`/`55h` — accepted without error
-- UNIT ATTENTION (`06h/28h`) for DOS compatibility disc swap
+- UNIT ATTENTION (`06h/28h`) via a 3-cycle counter — persists across multiple OS poll cycles to ensure reliable disc-change detection
 - `setSense()` helper, `_audioPlayedOnce` sticky audio status flag
+- `tud_msc_test_unit_ready_cb` patched for UNIT ATTENTION counter support
 
 Always run `--restore` before `--skip-full-build` to avoid double-patching.
 
 ### `patch_usbmsc.py` (Windows)
 
-A standalone backup script for patching `USBMSC.cpp` without the exFAT build. Run from a Windows command prompt:
-
-```cmd
-python patch_usbmsc.py
-```
+A standalone backup script included for reference. Not used in the standard workflow — `build_exfat_libs.py` handles the USBMSC patch as part of the exFAT build.
 
 ---
 
@@ -1034,7 +1102,7 @@ python patch_usbmsc.py
 
 - The **right** USB connector must be plugged in (OTG, not UART)
 - Tools -> USB Mode: **USB-OTG (TinyUSB)** (not Hardware CDC)
-- Verify `build_exfat_libs.py` completed -- USBMSC patch v4 must be applied
+- Verify `build_exfat_libs.py` completed — USBMSC patch v13 must be applied
 - Delete the build cache and re-upload firmware after patching
 - Try `umount` then `mount` from the serial CLI
 
@@ -1050,12 +1118,12 @@ python patch_usbmsc.py
 This happens when the CUE image uses separate BIN files per track (e.g. Tomb Raider). The firmware assigns virtual disc LBAs after parsing -- check serial output for confirmation:
 
 ```
-[CUE] Data track sectors from file: 146011
+[CUE] Data track sectors from file: 146011 (total=146011 pregap=0)
 [CUE] Virtual disc LBAs assigned, lead-out LBA=215612
 [CUE] Track 02: LBA 146011  len 14593  (~194s)
 ```
 
-If you see `LBA 0` for all audio tracks, re-flash with the latest firmware which includes the virtual LBA fix.
+If you see `LBA 0` for all audio tracks, re-flash with the latest firmware.
 
 ### Audio tab is always greyed out after page load
 
@@ -1097,10 +1165,23 @@ The device may not be in download mode:
 Enable DOS Compatibility Mode:
 ```
 set dos-compat on
-reboot
 ```
 
 This replaces the USB re-enumeration with a UNIT ATTENTION signal so MSCDEX/USBASPI can reload the TOC without losing the device.
+
+### DOS CD player shows only one audio track
+
+This is caused by an older USBMSC patch (v12 or earlier). The READ TOC handler previously used a `skipData` optimisation that caused MSCDEX to receive only one audio track when it issued its first TOC request with a small allocation length. The patch now always fills tracks sequentially from Track 1 and always sets `Data Length` to the full TOC size, so MSCDEX correctly issues a second request and sees all tracks.
+
+Re-apply the patch:
+```bash
+python3 build_exfat_libs.py --restore
+python3 build_exfat_libs.py --skip-full-build
+```
+
+### After several remounts the drive appears empty or disappears
+
+This is caused by the OS not catching the disc-change signal in time. The firmware signals UNIT ATTENTION across 3 consecutive TUR poll cycles and sequences the `msc.mediaPresent(false)` / `msc.mediaPresent(true)` transition carefully to minimise the window during which no media is visible. In non-DOS mode, USB callbacks are re-registered before every `msc.begin()` call to prevent callback loss across remounts.
 
 ### Forgotten web UI password
 
