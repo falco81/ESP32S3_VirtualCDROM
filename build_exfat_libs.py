@@ -20,7 +20,7 @@ Usage:
   python3 build_exfat_libs.py --dry-run           # show what would be done
   python3 build_exfat_libs.py --skip-usbmsc       # skip USBMSC patch
 
-Note: USBMSC.cpp patch (CD-ROM + Audio SCSI v10) is now integrated.
+Note: USBMSC.cpp patch (CD-ROM + Audio SCSI v12) is now integrated.
 """
 
 import os, sys, re, shutil, subprocess, glob, argparse
@@ -299,12 +299,12 @@ if args.test:
             check(f"USBMSC: {name}", passed)
 
         any_cdrom = any(p for _, p in checks_usbmsc)
-        is_v10 = "patched v4" in content.lower() or "scsi_audio_play" in content
+        is_v10 = "patched v12" in content.lower() or "patched v10" in content.lower() or "scsi_audio_play" in content
         if is_v10:
-            check("USBMSC: CD-ROM + Audio SCSI patch v10", True)
+            check("USBMSC: CD-ROM + Audio SCSI patch v12", True)
         elif any_cdrom:
             check("USBMSC: CD-ROM patch applied (older version)", True,
-                  "-> Re-run build_exfat_libs.py to upgrade to v10")
+                  "-> Re-run build_exfat_libs.py --restore then --skip-full-build to upgrade to v12")
         else:
             check("USBMSC: CD-ROM patch applied", False,
                   "-> Run build_exfat_libs.py to apply patch")
@@ -434,12 +434,13 @@ def patch_usbmsc(path):
             if depth == 0: tur_end = i + 1; break
         if tur_end > 0 and 'msc_set_unit_attention' not in src[:tur_start]:
             new_tur = (
-                '// UNIT ATTENTION flag — declared here so visible in TUR callback\n'
-                'static volatile bool _ua_pending = false;\n'
-                'extern "C" void msc_set_unit_attention(void) { _ua_pending = true; }\n'
+                '// UNIT ATTENTION counter — persists for multiple TUR polling cycles so the OS\n'
+                '// has several opportunities to react to disc change (single-shot flag is unreliable).\n'
+                'static volatile uint8_t _ua_counter = 0;\n'
+                'extern "C" void msc_set_unit_attention(void) { _ua_counter = 8; }\n'
                 'bool tud_msc_test_unit_ready_cb(uint8_t lun) {\n'
-                '  if (_ua_pending) {\n'
-                '    _ua_pending = false;\n'
+                '  if (_ua_counter > 0) {\n'
+                '    _ua_counter--;\n'
                 '    tud_msc_set_sense(lun, 0x06, 0x28, 0x00);\n'
                 '    return false;\n'
                 '  }\n'
@@ -447,11 +448,17 @@ def patch_usbmsc(path):
                 '}\n'
             )
             src = src[:tur_start] + new_tur + src[tur_end:]
-            print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION')
+            print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION (8-cycle counter)')
 
-    if 'CD-ROM SCSI patched v10' in src or 'scsi_audio_play' in src:
-        print("  Already patched v10")
+    if 'CD-ROM SCSI patched v12' in src:
+        print("  Already patched v12")
         return True
+    # v10/v11 had audio gated on mode-2 only or non-DOS — v12 enables all modes except driver 3.
+    # After restore-from-backup above, src is always clean so this only triggers
+    # on first-ever run when no .bak exists yet and USBMSC.cpp is already v10-patched.
+    if 'CD-ROM SCSI patched v11' in src or 'CD-ROM SCSI patched v10' in src or 'scsi_audio_play' in src:
+        print("  Found older patch (v11/v10) — run --restore first, then --skip-full-build to upgrade to v12")
+        return False  # cannot safely re-patch without clean original
 
     func_start = src.find('int32_t tud_msc_scsi_cb(')
     if func_start < 0:
@@ -504,11 +511,9 @@ def patch_usbmsc(path):
 
     # Switch block inserted inside the function (no extern declarations here)
     inner = (
-        "{ /* CD-ROM SCSI patched v10 */\n"
-        "  /* dosCompat=ON && dosDriver=2: v10 audio/TOC.     */\n"
-        "  /* All other combinations: v8 behavior (original). */\n"
-        "  /* Mode 2 (ESPUSB/Panasonic) only: all audio/TOC handling. */\n"
-        "  /* Modes 0,1,3: fall through to original TinyUSB handlers. */\n"
+        "{ /* CD-ROM SCSI patched v12 */\n"
+        "  /* Audio/TOC active for: non-DOS (Windows/Win98/Linux) + DOS drivers 0/1/2. Driver 3 = data-only. */\n"
+        "  /* DOS modes 0,1,3: universal handlers only (data access, no audio SCSI commands).             */\n"
         "  /* Universal handlers — all modes (Windows/Mac/Linux/DOS) */\n"
         "  switch(scsi_cmd[0]) {\n"
 "      case 0x51:{if(bufsize>=34){memset(buffer,0,34);\n"
@@ -609,7 +614,9 @@ def patch_usbmsc(path):
                 "    default:break;\n"
         "  }\n"
         
-        "  if(scsi_get_dos_compat()&&scsi_get_dos_driver()==2){\n"
+        "  /* Audio/TOC block: active for non-DOS mode (Windows/Win98/Linux) OR any DOS driver except 3.  */\n"
+        "  /* DOS driver 3 (DI1000DD/USBASPI 2.20): data-only by design, no audio SCSI commands.        */\n"
+        "  if(!scsi_get_dos_compat()||scsi_get_dos_driver()!=3){\n"
         "    auto msfToLba = [](uint8_t m,uint8_t s,uint8_t f)->uint32_t{\n"
         "      return (uint32_t)m*60*75+(uint32_t)s*75+f; };\n"
         "    // Helper: set CHECK CONDITION sense data in buffer\n"
@@ -1057,7 +1064,7 @@ def patch_usbmsc(path):
         "    }\n"
         "  }\n"
         "  }\n"
-"  /* end CD-ROM SCSI patched v10 */\n"
+"  /* end CD-ROM SCSI patched v12 */\n"
         "  "        "  "
     )
 
@@ -1066,7 +1073,7 @@ def patch_usbmsc(path):
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(new_src)
-    print("  Patched v4: CD+Audio handlers (C bridge, no extern issues)")
+    print("  Patched v12: audio/TOC for non-DOS + DOS drivers 0/1/2; driver 3 data-only")
     return True
 
 
@@ -1197,14 +1204,14 @@ if not sdkconfig_h_files:
 
 # ── USBMSC patch (integrated from patch_usbmsc.py) ──────────────────────────
 if not args.skip_usbmsc:
-    step("Applying USBMSC.cpp CD-ROM + Audio SCSI patch v10")
+    step("Applying USBMSC.cpp CD-ROM + Audio SCSI patch v12")
     if usbmsc.exists():
         if not args.dry_run:
             result = patch_usbmsc(usbmsc)
             if result:
-                ok("USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v4)")
+                ok("USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v12 — non-DOS audio enabled)")
             else:
-                warn("USBMSC.cpp: patch already applied or failed")
+                warn("USBMSC.cpp: patch failed or needs --restore first (v10 found without clean backup)")
         else:
             ok(f"[dry-run] Would patch: {usbmsc}")
     else:

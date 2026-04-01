@@ -75,15 +75,20 @@ struct AudioTrack {
   uint8_t  number;          // Track number (1-based)
   uint32_t startLba;        // Virtual disc LBA (absolute, reported in TOC)
   uint32_t lengthSectors;   // Track length in sectors (usable audio, after pregap)
-  uint32_t pregapSectors;   // Pregap offset within BIN file (separate layout only)
+  uint32_t pregapSectors;   // Pregap offset within BIN file (separate-BIN layout only)
+  uint32_t fileSectorBase;  // First sector to seek in the BIN file for this track:
+                            //   single-BIN  → absolute BIN sector (= startLba before virtual remapping)
+                            //   separate-BIN → pregap sectors within individual track file
   String   binFile;         // Full SD path to the .bin file for this track
   bool     valid;
 };
 
 // Global audio track table — filled by parseCue, cleared on umount
 static AudioTrack audioTracks[MAX_AUDIO_TRACKS];
-static uint8_t    audioTrackCount = 0;
-static uint32_t   dataTrackEndLba = 0;  // LBA where data track ends
+static uint8_t    audioTrackCount   = 0;
+static uint32_t   dataTrackEndLba   = 0;  // LBA where data track ends
+static uint32_t   dataTrackStartSect = 0; // Sector index in BIN file where data track begins (for mscReadCb offset)
+static uint32_t   dataTrackSectors_g = 0; // Usable data sector count (for cdromBlockCount)
 
 // ── Playback state (accessed from SCSI callbacks and audio task) ──
 // All writes from a single core; reads from SCSI callback (core 0) are
@@ -92,10 +97,10 @@ enum AudioPlayState { AUDIO_STOP = 0, AUDIO_PLAY = 1, AUDIO_PAUSE = 2 };
 volatile AudioPlayState audioState     = AUDIO_STOP;
 volatile uint32_t       audioCurrentLba = 0;   // current playback position
 volatile uint32_t       audioEndLba     = 0;   // stop when reaching this LBA
-static  TaskHandle_t    audioTaskHandle = nullptr;
-static  i2s_chan_handle_t i2sTx         = nullptr;
-static  int             audioVolume     = 80;  // 0-100, software gain
-static  bool            audioMuted      = false;
+static  TaskHandle_t      audioTaskHandle = nullptr;
+static volatile i2s_chan_handle_t i2sTx   = nullptr;  // volatile: written from core 1, read from core 0
+static volatile int             audioVolume = 80;      // volatile: written from core 1, read from core 0
+static volatile bool            audioMuted  = false;   // volatile: written from core 1, read from core 0
 
 // ── Sub-channel data (updated by audio task, read by SCSI READ SUB-CHANNEL) ──
 // MSF = Minutes:Seconds:Frames  (1 frame = 1 sector = 1/75 s)
@@ -402,7 +407,11 @@ bool initSD() {
 }
 
 void closeIso() {
-  if (isoOpen) { isoFileHandle.close(); isoOpen = false; }
+  if (isoOpen) {
+    isoOpen = false;          // disable reads on core 0 FIRST
+    delay(2);                 // let any in-flight mscReadCb finish (~1 SD read cycle)
+    isoFileHandle.close();
+  }
 }
 
 // =============================================================================
@@ -440,12 +449,16 @@ String parseCue(const String &cuePath) {
   int slash = dir.lastIndexOf('/');
   dir = (slash >= 0) ? dir.substring(0, slash) : "/";
 
-  // Clear audio track table
-  audioTrackCount = 0;
-  dataTrackEndLba = 0;
+  // Clear audio track table and all disc-level state
+  audioTrackCount   = 0;
+  dataTrackEndLba   = 0;
+  dataTrackStartSect = 0;
+  dataTrackSectors_g = 0;
+  discLeadOutLba    = 0;  // reset — must not carry stale value from previous image
   for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
     audioTracks[i].valid = false;
     audioTracks[i].pregapSectors = 0;
+    audioTracks[i].fileSectorBase = 0;
     audioTracks[i].startLba = 0;
     audioTracks[i].lengthSectors = 0;
   }
@@ -466,9 +479,21 @@ String parseCue(const String &cuePath) {
 
   // We need two passes: first to collect all INDEX 01 positions,
   // then to compute lengths. Store intermediate info:
-  struct RawTrack { int num; bool audio; String file; uint32_t startLba; };
+  //   pregapPhysical: true  = pregap is stored in BIN file (came from INDEX 00)
+  //                   false = pregap is virtual/silent (came from PREGAP directive)
+  struct RawTrack {
+    int num; bool audio; String file; uint32_t startLba;
+    uint32_t pregapLba;      // size of pregap in sectors (0 if none)
+    bool     pregapPhysical; // true=in BIN file (INDEX 00), false=virtual (PREGAP directive)
+  };
   static RawTrack raw[MAX_AUDIO_TRACKS + 2];
   int rawCount = 0;
+
+  // Per-track parsing temporaries reset on each TRACK line
+  uint32_t currentIndex00Lba  = 0;
+  bool     currentHasIndex00  = false;
+  uint32_t currentPregapSects = 0;   // from PREGAP directive
+  bool     currentHasPregap   = false;
 
   while (cue.available()) {
     String line = cue.readStringUntil('\n');
@@ -480,6 +505,12 @@ String parseCue(const String &cuePath) {
       if (q1 >= 0 && q2 > q1) currentFile = line.substring(q1+1, q2);
     }
     else if (up.startsWith("TRACK") && currentFile.length()) {
+      // Reset per-track pregap state on each new TRACK
+      currentIndex00Lba  = 0;
+      currentHasIndex00  = false;
+      currentPregapSects = 0;
+      currentHasPregap   = false;
+
       currentTrackNum = line.substring(6, 8).toInt();
       currentIsAudio  = (up.indexOf("AUDIO") >= 0);
       currentIsData   = (up.indexOf("MODE") >= 0);
@@ -489,16 +520,47 @@ String parseCue(const String &cuePath) {
         else if (up.indexOf("MODE2/2352") >= 0) { binRawSectorSize=2352; binHeaderOffset=24; binUserDataSize=2048; dualPrint.println(F("[CUE] MODE2/2352 -> offset=24")); }
         else if (up.indexOf("MODE2/2336") >= 0) { binRawSectorSize=2336; binHeaderOffset=8;  binUserDataSize=2048; dualPrint.println(F("[CUE] MODE2/2336 -> offset=8")); }
         else if (up.indexOf("MODE1/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; dualPrint.println(F("[CUE] MODE1/2048 -> offset=0")); }
-        else { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; }
+        else if (up.indexOf("MODE2/2048") >= 0) { binRawSectorSize=2048; binHeaderOffset=0;  binUserDataSize=2048; dualPrint.println(F("[CUE] MODE2/2048 -> offset=0")); }
+        else if (up.indexOf("CDG")       >= 0) { binRawSectorSize=2448; binHeaderOffset=0;  binUserDataSize=2352; dualPrint.println(F("[CUE] CDG/2448 -> raw passthrough")); }
+        else { binRawSectorSize=2352; binHeaderOffset=16; binUserDataSize=2048; dualPrint.println(F("[CUE] Unknown mode -> default MODE1/2352")); }
         foundData = true;
         dualPrint.printf("[CUE] Data track %d: %s\n", currentTrackNum, dataTrackBin.c_str());
       }
+    }
+    else if (up.startsWith("PREGAP") && currentTrackNum > 0) {
+      // PREGAP directive = silent/virtual pregap NOT stored in BIN file
+      String msfStr = line.substring(7); msfStr.trim();
+      currentPregapSects = msfToLba(msfStr);
+      currentHasPregap   = true;
+      dualPrint.printf("[CUE] Track %02d: PREGAP directive %lu sectors (virtual)\n",
+                    currentTrackNum, currentPregapSects);
+    }
+    else if (up.startsWith("INDEX 00") && currentTrackNum > 0) {
+      // INDEX 00 = physical pregap stored in BIN file
+      String msfStr = line.substring(9); msfStr.trim();
+      currentIndex00Lba = msfToLba(msfStr);
+      currentHasIndex00 = true;
     }
     else if (up.startsWith("INDEX 01") && currentTrackNum > 0 && rawCount < MAX_AUDIO_TRACKS + 1) {
       String msfStr = line.substring(9); msfStr.trim();
       uint32_t lba = msfToLba(msfStr);
       String fp = (dir == "/") ? "/" + currentFile : dir + "/" + currentFile;
-      raw[rawCount++] = { currentTrackNum, currentIsAudio, fp, lba };
+
+      // Compute pregap size and type:
+      //   INDEX 00 present → physical pregap (in file), size = INDEX01 - INDEX00
+      //   PREGAP directive → virtual pregap (not in file), size from directive
+      //   Neither          → no pregap
+      uint32_t pgSects = 0;
+      bool     pgPhys  = false;
+      if (currentHasIndex00) {
+        pgSects = (lba > currentIndex00Lba) ? (lba - currentIndex00Lba) : 0;
+        pgPhys  = true;
+      } else if (currentHasPregap) {
+        pgSects = currentPregapSects;
+        pgPhys  = false;
+      }
+
+      raw[rawCount++] = { currentTrackNum, currentIsAudio, fp, lba, pgSects, pgPhys };
     }
   }
   cue.close();
@@ -528,23 +590,50 @@ String parseCue(const String &cuePath) {
 
         if (separateFiles) {
           // Each track in its own file.
-          // pregapSectors = INDEX 01 offset within file (typically 150 = 2 seconds)
-          // lengthSectors = usable audio = file_size/2352 - pregap
-          uint32_t pregap = raw[i].startLba;  // INDEX 01 in file = pregap
-          File af = SD_MMC.open(at.binFile.c_str());
-          if (af) {
-            uint64_t sz = af.size(); af.close();
-            uint32_t totalSectors = (uint32_t)(sz / 2352);
-            at.pregapSectors  = pregap;
-            at.lengthSectors  = (totalSectors > pregap) ? (totalSectors - pregap) : totalSectors;
+          // Physical pregap (INDEX 00): stored in BIN — fileSectorBase = INDEX01 pos in file, strip from length
+          // Virtual pregap (PREGAP directive): not in BIN — fileSectorBase = 0, not subtracted from file size
+          if (raw[i].pregapPhysical && raw[i].pregapLba > 0) {
+            // INDEX 00 present: pregap physically in file; INDEX 01 LBA = offset into file
+            uint32_t pregap = raw[i].pregapLba; // sectors before audio data
+            File af = SD_MMC.open(at.binFile.c_str());
+            if (af) {
+              uint64_t sz = af.size(); af.close();
+              uint32_t totalSectors = (uint32_t)(sz / 2352);
+              at.pregapSectors  = pregap;
+              at.fileSectorBase = raw[i].startLba; // INDEX 01 position in file = seek offset
+              at.lengthSectors  = (totalSectors > raw[i].startLba) ? (totalSectors - raw[i].startLba) : 0;
+            } else {
+              at.pregapSectors  = pregap;
+              at.fileSectorBase = raw[i].startLba;
+              at.lengthSectors  = 0;
+            }
+            dualPrint.printf("[CUE] Track %02d: physical pregap %lu sects (INDEX 00)\n",
+                          at.number, pregap);
           } else {
-            at.pregapSectors  = pregap;
-            at.lengthSectors  = 0;
+            // PREGAP directive or no pregap: audio data starts at byte 0 of BIN file
+            File af = SD_MMC.open(at.binFile.c_str());
+            if (af) {
+              uint64_t sz = af.size(); af.close();
+              uint32_t totalSectors = (uint32_t)(sz / 2352);
+              at.pregapSectors  = raw[i].pregapLba;  // virtual pregap (not in file)
+              at.fileSectorBase = 0;                 // file starts with audio data directly
+              at.lengthSectors  = totalSectors;
+            } else {
+              at.pregapSectors  = raw[i].pregapLba;
+              at.fileSectorBase = 0;
+              at.lengthSectors  = 0;
+            }
+            if (raw[i].pregapLba > 0)
+              dualPrint.printf("[CUE] Track %02d: virtual pregap %lu sects (PREGAP directive)\n",
+                            at.number, raw[i].pregapLba);
           }
           // virtualStart assigned after all tracks parsed (needs dataTrackSectors)
         } else {
-          // Single BIN — INDEX 01 is absolute disc LBA
-          at.startLba = raw[i].startLba;
+          // Single BIN — INDEX 01 is absolute BIN LBA.
+          // startLba stays as BIN-absolute so PLAY AUDIO commands map directly to file seeks.
+          // fileSectorBase = startLba so audio task can compute: fileSector = fileSectorBase + (lba - startLba)
+          at.startLba      = raw[i].startLba;
+          at.fileSectorBase = raw[i].startLba;  // absolute BIN sector = startLba for single-BIN
           uint32_t nextLba = (i + 1 < rawCount) ? raw[i+1].startLba : 0xFFFFFFFF;
           at.lengthSectors = (nextLba != 0xFFFFFFFF) ? (nextLba - at.startLba) : 0;
         }
@@ -556,49 +645,95 @@ String parseCue(const String &cuePath) {
     } else {
       dataTrackLba = raw[i].startLba;
       if (!separateFiles) {
+        // Single-BIN: entire BIN file is presented as-is.
+        // DOS uses Track01.startLba from TOC to find data — no mscReadCb offset needed.
+        dataTrackStartSect = 0;
         uint32_t nextLba = (i + 1 < rawCount) ? raw[i+1].startLba : 0xFFFFFFFF;
         if (nextLba != 0xFFFFFFFF) {
+          // Next track's INDEX 01 LBA marks end of data track
           dataTrackSectors = nextLba - raw[i].startLba;
           dataTrackEndLba  = raw[i].startLba + dataTrackSectors;
+          dataTrackSectors_g = dataTrackSectors;
+        } else {
+          // Data track is the last (or only) track — derive length from file size
+          File dtf2 = SD_MMC.open(raw[i].file.c_str());
+          if (dtf2) {
+            uint64_t sz2 = dtf2.size(); dtf2.close();
+            uint32_t totalSect2 = (uint32_t)(sz2 / binRawSectorSize);
+            dataTrackSectors = (totalSect2 > dataTrackLba) ? (totalSect2 - dataTrackLba) : totalSect2;
+            dataTrackEndLba  = dataTrackLba + dataTrackSectors;
+            dataTrackSectors_g = dataTrackSectors;
+            dualPrint.printf("[CUE] Data track sectors (last track, from file): %lu\n", dataTrackSectors);
+          }
         }
       } else {
-        // Separate BIN files: data track length from Track 01 file size
-        // File size / 2352 bytes-per-raw-sector = number of sectors
+        // Separate BIN files: data track length from Track 01 file size, minus any pregap.
+        // dataTrackStartSect: offset within the data BIN file where actual data begins
+        // (= INDEX 01 position; strips any pregap so host LBA 0 = first real data sector).
+        dataTrackStartSect = dataTrackLba;
+        // Use binRawSectorSize (not hardcoded 2352) to support all sector formats
         File dtf = SD_MMC.open(raw[i].file.c_str());
         if (dtf) {
           uint64_t sz = dtf.size(); dtf.close();
-          dataTrackSectors = (uint32_t)(sz / 2352);
+          uint32_t totalSectors = (uint32_t)(sz / binRawSectorSize);
+          // Subtract pregap (= dataTrackLba offset within file) to get usable data sectors
+          dataTrackSectors = (totalSectors > dataTrackLba) ? (totalSectors - dataTrackLba) : totalSectors;
           dataTrackEndLba  = dataTrackLba + dataTrackSectors;
-          dualPrint.printf("[CUE] Data track sectors from file: %lu\n", dataTrackSectors);
+          dataTrackSectors_g = dataTrackSectors;
+          dualPrint.printf("[CUE] Data track sectors from file: %lu (total=%lu pregap=%lu)\n",
+                        dataTrackSectors, totalSectors, dataTrackLba);
         }
       }
     }
   }
 
   // Last track in single-BIN: length from file size
+  // Use binRawSectorSize — correct for all modes (MODE2/2336 = 2336, MODE1/2048 = 2048, etc.)
+  // Audio tracks are always 2352 B/sector, but in a single-BIN all sectors share binRawSectorSize.
   if (!separateFiles && audioTrackCount > 0) {
     AudioTrack &last = audioTracks[audioTrackCount - 1];
     if (last.lengthSectors == 0) {
       File af = SD_MMC.open(last.binFile.c_str());
       if (af) {
         uint64_t sz = af.size(); af.close();
-        last.lengthSectors = (uint32_t)(sz / 2352) - last.startLba;
+        uint32_t totalSects = (uint32_t)(sz / binRawSectorSize);
+        last.lengthSectors = (totalSects > last.startLba) ? (totalSects - last.startLba) : 0;
       }
     }
   }
 
   // For separate BIN layout: assign virtual disc LBAs
   // data track occupies [0 .. dataTrackSectors-1]
-  // audio tracks follow sequentially, each with its pregap stripped
+  // audio tracks follow sequentially. For each track:
+  //   Physical pregap (INDEX 00): already stripped — fileSectorBase skips it, not in virtual LBA space
+  //   Virtual pregap (PREGAP directive): must be added to virtual LBA space so TOC gap is correct,
+  //     but NOT seeked in the BIN file (fileSectorBase = 0, audio data starts at byte 0 of file)
   if (separateFiles && audioTrackCount > 0) {
     uint32_t virtualCursor = (dataTrackSectors > 0) ? dataTrackSectors : mountedBlocks;
     for (int i = 0; i < audioTrackCount; i++) {
+      // Virtual pregap (PREGAP directive, fileSectorBase==0, pregapSectors>0):
+      // reserve LBA space so the gap appears in TOC, but it's silence not in the BIN file.
+      // Physical pregap (INDEX 00, fileSectorBase>0): already stripped, not in virtual LBA space.
+      if (audioTracks[i].fileSectorBase == 0 && audioTracks[i].pregapSectors > 0) {
+        virtualCursor += audioTracks[i].pregapSectors;
+      }
       audioTracks[i].startLba = virtualCursor;
       virtualCursor += audioTracks[i].lengthSectors;
     }
     // Lead-out LBA = virtualCursor (used by READ TOC 0xAA entry)
     discLeadOutLba = virtualCursor;
     dualPrint.printf("[CUE] Virtual disc LBAs assigned, lead-out LBA=%lu\n", virtualCursor);
+  } else if (!separateFiles && audioTrackCount > 0) {
+    // Single-BIN: lead-out LBA = last audio track end (in BIN-absolute LBA space)
+    // This gives the correct TOC lead-out to the host without waiting for doMount()
+    // to fall back to mountedBlocks (which requires fileSize, not yet known here).
+    AudioTrack &last = audioTracks[audioTrackCount - 1];
+    if (last.startLba > 0 && last.lengthSectors > 0) {
+      discLeadOutLba = last.startLba + last.lengthSectors;
+      dualPrint.printf("[CUE] Single-BIN lead-out LBA=%lu (from last audio track)\n", discLeadOutLba);
+    }
+    // If lengthSectors still 0 (last track length computed later from file size),
+    // discLeadOutLba remains 0 and doMount() will set it from mountedBlocks — acceptable fallback.
   }
 
   // Log final track table with correct virtual LBAs
@@ -635,8 +770,8 @@ bool doMount(const String &filename) {
   }
 
   bool hadDisc = isoOpen;  // remember if disc was already in drive
+  mscMediaPresent = false;  // stop reads on core 0 BEFORE touching file handles
   closeIso();
-  mscMediaPresent = false;
   delay(200);
 
   // Reset disc state AFTER parseCue() so CUE geometry is preserved,
@@ -648,12 +783,15 @@ bool doMount(const String &filename) {
     dataTrackEndLba   = 0;
     discLeadOutLba    = 0;
     cdromBlockCount   = 0;
+    dataTrackStartSect = 0;
+    dataTrackSectors_g = 0;
     binRawSectorSize  = 2352;
     binHeaderOffset   = 16;
     binUserDataSize   = 2048;
     for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
       audioTracks[i].valid = false;
       audioTracks[i].pregapSectors = 0;
+      audioTracks[i].fileSectorBase = 0;
       audioTracks[i].startLba = 0;
       audioTracks[i].lengthSectors = 0;
     }
@@ -679,10 +817,14 @@ bool doMount(const String &filename) {
   isoOpen       = true;
   mscBlockCount   = mountedBlocks;
   mscBlockSize    = 2048;
-  cdromBlockCount = mountedBlocks;
-  // For non-CUE or single-BIN: lead-out = data track end
-  // For CUE separate files: already set by parseCue() above
+  cdromBlockCount = mountedBlocks;  // default; overridden below after discLeadOutLba is set
+  // For non-CUE or single-BIN: lead-out = total sectors
+  // For CUE separate files: already set by parseCue() to virtualCursor (data + audio)
   if (discLeadOutLba == 0) discLeadOutLba = mountedBlocks;
+  // cdromBlockCount is used by the SCSI patch as the lead-out LBA in READ TOC.
+  // It must be the FULL virtual disc end (including audio tracks), not just the data track.
+  // discLeadOutLba is correct for both separate-BIN (from parseCue) and single-BIN/ISO.
+  cdromBlockCount = discLeadOutLba;
   // Signal new media to host
   if (cfg.dosCompat) {
     // DOS compat: msc.begin() is NEVER called after initUSBMSC
@@ -692,11 +834,11 @@ bool doMount(const String &filename) {
       // Disc swap: signal removal then insertion
       mscMediaPresent = false;
       msc.mediaPresent(false);
-      delay(1500);  // wait 3 MSCDEX poll cycles (~500ms each)
+      delay(2500);  // wait for OS to fully process media removal (poll interval up to ~2s)
     }
     mscMediaPresent = true;
     msc.mediaPresent(true);
-    msc_set_unit_attention();  // signal UNIT ATTENTION to host
+    msc_set_unit_attention();  // signal UNIT ATTENTION (8-cycle counter — multiple OS polls)
     dualPrint.printf("[USB]  DOS compat: media %s, UA signalled\n",
                      hadDisc ? "swapped" : "inserted (first)");
   } else {
@@ -704,12 +846,12 @@ bool doMount(const String &filename) {
     mscMediaPresent = false;
     msc.mediaPresent(false);
     tud_disconnect();
-    delay(500);
+    delay(800);  // give OS time to fully process USB removal
     msc.begin(mountedBlocks, 2048);
     mscMediaPresent = true;
     msc.mediaPresent(true);
     tud_connect();
-    delay(200);
+    delay(500);  // give OS time to enumerate before UA
     msc_set_unit_attention();  // signal UNIT ATTENTION to host
   }
 
@@ -738,6 +880,7 @@ void doUmount() {
   closeIso();
   mountedFile = ""; mountedBlocks = 0;
   mscBlockCount = 0; cdromBlockCount = 0; discLeadOutLba = 0;
+  dataTrackStartSect = 0; dataTrackSectors_g = 0;
   unitAttentionPending = false;
   audioTrackCount = 0; dataTrackEndLba = 0;
   if (cfg.dosCompat) {
@@ -808,6 +951,8 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
   // INQUIRY identity — configurable per DOS driver compatibility
   if (cfg.dosDriver == 1) {
     // USBCD2.SYS (TEAC) — checks hardcoded model list against INQUIRY vendor/product
+    // TEAC CD-56E was SCSI-2 era — match real hardware ANSI version
+    r[2] = 0x02;  // ANSI version: SCSI-2
     memcpy(&r[8],  "TEAC    ",         8);
     memcpy(&r[16], "CD-56E          ", 16);
   } else if (cfg.dosDriver == 2) {
@@ -825,9 +970,9 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
     memcpy(&r[16], "CD-ROM CR-572   ", 16);
   } else if (cfg.dosDriver == 3) {
     // DI1000DD.SYS (NOVAC/USBASPI 2.20) — accepts CD-ROM type 0x05 natively
-    // DI1000DD provides data-only access (READ10/CAPACITY) — no audio
-    // No model check — generic identity works fine
     // USBASPI 2.20 uses DOSUSBTBL0 standard interface (INT 2Fh)
+    // USBASPI 2.20 era = SCSI-2
+    r[2] = 0x02;  // ANSI version: SCSI-2
     memcpy(&r[8],  "ESP32-S3",         8);
     memcpy(&r[16], "Virtual CD-ROM  ", 16);
   } else {
@@ -844,11 +989,43 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
 // =============================================================================
 static int32_t mscReadCb(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
   if (!isoOpen || !mscMediaPresent) return -1;
-  uint64_t pos = (binRawSectorSize > 2048)
-    ? (uint64_t)lba * binRawSectorSize + binHeaderOffset + offset
-    : (uint64_t)lba * 2048 + offset;
-  if (!isoFileHandle.seek(pos)) return -1;
-  return (int32_t)isoFileHandle.read((uint8_t*)buffer, bufsize);
+
+  if (binRawSectorSize <= 2048) {
+    // Cooked format (ISO / MODE1/2048): raw sector = user data, no headers.
+    // Consecutive sectors are contiguous in file → single seek+read is correct.
+    uint64_t pos = (uint64_t)(lba + dataTrackStartSect) * 2048 + offset;
+    if (!isoFileHandle.seek(pos)) return -1;
+    return (int32_t)isoFileHandle.read((uint8_t*)buffer, bufsize);
+  }
+
+  // Raw sector format (MODE1/2352, MODE2/2352, MODE2/2336, CDG/2448):
+  // Each raw sector has sync/header/ECC that must be skipped per sector.
+  // TinyUSB may call with bufsize > binUserDataSize (multi-sector read).
+  // A single seek+read(bufsize) would cross sector boundaries and return
+  // header/ECC bytes as data → file corruption. Must read sector by sector.
+  uint8_t* dst     = (uint8_t*)buffer;
+  int32_t  total   = 0;
+  uint32_t rem     = bufsize;
+  uint32_t curLba  = lba + dataTrackStartSect;
+  uint32_t inSect  = offset;  // byte offset within current sector's user data area
+
+  while (rem > 0) {
+    uint32_t chunk = binUserDataSize - inSect;   // bytes left in this sector
+    if (chunk > rem) chunk = rem;
+
+    uint64_t pos = (uint64_t)curLba * binRawSectorSize + binHeaderOffset + inSect;
+    if (!isoFileHandle.seek(pos)) return total > 0 ? total : -1;
+    int32_t got = (int32_t)isoFileHandle.read(dst, chunk);
+    if (got <= 0) break;
+
+    dst    += got;
+    total  += got;
+    rem    -= (uint32_t)got;
+    inSect  = 0;   // subsequent sectors start from offset 0
+    curLba++;
+  }
+
+  return total > 0 ? total : -1;
 }
 
 static int32_t mscWriteCb(uint32_t lba, uint32_t offset, uint8_t *buf, uint32_t bufsize) {
@@ -887,7 +1064,9 @@ void initI2S() {
   }
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.auto_clear = true;
-  if (i2s_new_channel(&chan_cfg, &i2sTx, nullptr) != ESP_OK) {
+  // Use local non-volatile temp — i2s_new_channel requires i2s_chan_handle_t* (non-volatile)
+  i2s_chan_handle_t txTmp = nullptr;
+  if (i2s_new_channel(&chan_cfg, &txTmp, nullptr) != ESP_OK) {
     dualPrint.println(F("[I2S]  Failed to create channel!")); return;
   }
   i2s_std_config_t std_cfg = {
@@ -902,10 +1081,12 @@ void initI2S() {
       .invert_flags = { .mclk_inv=false, .bclk_inv=false, .ws_inv=false }
     }
   };
-  if (i2s_channel_init_std_mode(i2sTx, &std_cfg) != ESP_OK) {
+  if (i2s_channel_init_std_mode(txTmp, &std_cfg) != ESP_OK) {
+    i2s_del_channel(txTmp);
     dualPrint.println(F("[I2S]  Failed to init STD mode!")); return;
   }
-  i2s_channel_enable(i2sTx);
+  i2s_channel_enable(txTmp);
+  i2sTx = txTmp;  // assign to volatile global only after full init
   dualPrint.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
 }
@@ -982,10 +1163,12 @@ static void audioTask(void* arg) {
       }
     }
 
-    // Seek to LBA position in the BIN file
-    // For separate BIN: virtual disc LBA -> file sector = (lba-startLba)+pregap
-    // For single BIN:   pregapSectors=0, startLba=absolute disc LBA -> fileOffset=lba*2352
-    uint64_t fileSector = (uint64_t)(lba - trk->startLba) + trk->pregapSectors;
+    // Seek to LBA position in the BIN file using fileSectorBase:
+    //   single-BIN:   fileSectorBase = absolute BIN sector (= startLba), so
+    //                 fileSector = fileSectorBase + (lba - startLba) = lba  → correct absolute seek
+    //   separate-BIN: fileSectorBase = pregapSectors within track file, so
+    //                 fileSector = pregap + (lba - virtualStartLba)          → correct relative seek
+    uint64_t fileSector = (uint64_t)trk->fileSectorBase + (lba - trk->startLba);
     uint64_t fileOffset = fileSector * 2352;
     if (!audioFile.seek(fileOffset)) {
       audioState = AUDIO_STOP;
@@ -1009,6 +1192,13 @@ static void audioTask(void* arg) {
     int sectorsGot = bytesRead / 2352;
 
     // Write audio samples to I2S — skip 16-byte sector header per sector
+    // Snapshot i2sTx once per batch — it may be nulled from core 1 during module disable
+    i2s_chan_handle_t i2sHandle = i2sTx;
+    if (!i2sHandle) {
+      // Module was disabled mid-playback — stop cleanly
+      audioState = AUDIO_STOP;
+      continue;
+    }
     for (int s = 0; s < sectorsGot && audioState == AUDIO_PLAY; s++) {
       // Red Book audio sectors: 2352 bytes = raw 16-bit stereo PCM, NO header
       uint8_t* pcm    = audioBuf + s * 2352;
@@ -1017,16 +1207,16 @@ static void audioTask(void* arg) {
       // Apply software volume (mute = silence, otherwise scale 16-bit samples)
       if (audioMuted || audioVolume == 0) {
         static uint8_t silence[2352] = {};
-        i2s_channel_write(i2sTx, silence, pcmLen, &written, pdMS_TO_TICKS(100));
+        i2s_channel_write(i2sHandle, silence, pcmLen, &written, pdMS_TO_TICKS(100));
       } else if (audioVolume < 100) {
         // Scale in-place in a stack buffer to avoid modifying audioBuf
         int16_t scaled[2352/2];
         int16_t* src16 = (int16_t*)pcm;
         for (int si = 0; si < (int)(pcmLen/2); si++)
           scaled[si] = (int16_t)((int32_t)src16[si] * audioVolume / 100);
-        i2s_channel_write(i2sTx, scaled, pcmLen, &written, pdMS_TO_TICKS(100));
+        i2s_channel_write(i2sHandle, scaled, pcmLen, &written, pdMS_TO_TICKS(100));
       } else {
-        i2s_channel_write(i2sTx, pcm, pcmLen, &written, pdMS_TO_TICKS(100));
+        i2s_channel_write(i2sHandle, pcm, pcmLen, &written, pdMS_TO_TICKS(100));
       }
 
       // Update playback position and sub-channel
@@ -1110,16 +1300,27 @@ void audioPlay(uint32_t startLba, uint32_t endLba) {
 
 void audioStop() {
   audioState = AUDIO_STOP;
-  // Flush I2S with silence (only if module enabled)
-  if (i2sTx && cfg.audioModule) {
+  // Snapshot i2sTx locally — it may be nulled concurrently from core 1 during module disable
+  i2s_chan_handle_t h = i2sTx;
+  if (h && cfg.audioModule) {
     static uint8_t silence[512] = {};
     size_t w;
-    for (int i = 0; i < 4; i++) i2s_channel_write(i2sTx, silence, sizeof(silence), &w, 10);
+    for (int i = 0; i < 4; i++) i2s_channel_write(h, silence, sizeof(silence), &w, 10);
   }
   dualPrint.println(F("[AUDIO] Stop."));
 }
 
-void audioPause() { audioState = AUDIO_PAUSE; dualPrint.println(F("[AUDIO] Pause.")); }
+void audioPause() {
+  audioState = AUDIO_PAUSE;
+  // Flush I2S DMA with silence so speaker stops cleanly without draining buffered audio
+  i2s_chan_handle_t h = i2sTx;
+  if (h) {
+    static uint8_t silence[512] = {};
+    size_t w;
+    for (int i = 0; i < 4; i++) i2s_channel_write(h, silence, sizeof(silence), &w, 10);
+  }
+  dualPrint.println(F("[AUDIO] Pause."));
+}
 void audioResume(){ audioState = AUDIO_PLAY;  dualPrint.println(F("[AUDIO] Resume.")); }
 
 // =============================================================================
@@ -1887,12 +2088,44 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("eapCertPath")){ strlcpy(cfg.eapCertPath, httpServer.arg("eapCertPath").c_str(), sizeof(cfg.eapCertPath)); changed = true; }
   if (httpServer.hasArg("eapKeyPath")) { strlcpy(cfg.eapKeyPath,  httpServer.arg("eapKeyPath").c_str(),  sizeof(cfg.eapKeyPath));  changed = true; }
   if (httpServer.hasArg("eapKeyPass") && httpServer.arg("eapKeyPass").length()) { strlcpy(cfg.eapKeyPass, httpServer.arg("eapKeyPass").c_str(), sizeof(cfg.eapKeyPass)); changed = true; }
-  if (httpServer.hasArg("audioModule")) { String v=httpServer.arg("audioModule"); cfg.audioModule=(v=="1"||v=="true"||v=="on"); changed=true; }
+  if (httpServer.hasArg("audioModule")) {
+    String v=httpServer.arg("audioModule");
+    bool newVal=(v=="1"||v=="true"||v=="on");
+    if (newVal != cfg.audioModule) {
+      cfg.audioModule = newVal;
+      if (cfg.audioModule) {
+        // Enable: init I2S immediately if not already running
+        if (!i2sTx) initI2S();
+        dualPrint.println(F("[I2S]  Audio module enabled at runtime."));
+      } else {
+        // Disable: safe cross-core teardown sequence
+        // 1. Signal audio task to stop (volatile write, visible to core 0)
+        audioStop();
+        if (i2sTx) {
+          // 2. Null out handle FIRST — audio task sees nullptr, skips i2s_channel_write
+          i2s_chan_handle_t h = i2sTx;
+          i2sTx = nullptr;
+          // 3. Wait for audio task to exit any in-flight i2s_channel_write (max one call ~30ms)
+          delay(50);
+          // 4. Safe to disable and delete now — no concurrent access possible
+          i2s_channel_disable(h);
+          i2s_del_channel(h);
+          dualPrint.println(F("[I2S]  Audio module disabled at runtime."));
+        }
+      }
+    }
+    changed=true;
+  }
   if (httpServer.hasArg("webAuth"))    { String v=httpServer.arg("webAuth");    cfg.webAuth=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("dosCompat"))  { String v=httpServer.arg("dosCompat");  cfg.dosCompat=(v=="1"||v=="true"||v=="on"); changed=true; }
-  if (httpServer.hasArg("dosDriver"))  { cfg.dosDriver=(uint8_t)httpServer.arg("dosDriver").toInt(); changed=true;
-    if (cfg.dosDriver == 1 && !cfg.dosCompat) { cfg.dosCompat=true; } // USBCD2 implies DOS compat
-    if (cfg.dosDriver == 2 && !cfg.dosCompat) { cfg.dosCompat=true; } // USBCD1 implies DOS compat
+  if (httpServer.hasArg("dosCompat"))  {
+    String v=httpServer.arg("dosCompat");
+    cfg.dosCompat=(v=="1"||v=="true"||v=="on");
+    if (!cfg.dosCompat) cfg.dosDriver=0;  // driver modes only meaningful with dosCompat ON
+    changed=true;
+  }
+  if (httpServer.hasArg("dosDriver"))  {
+    cfg.dosDriver=(uint8_t)constrain(httpServer.arg("dosDriver").toInt(),0,3); changed=true;
+    if (cfg.dosDriver > 0) cfg.dosCompat=true;  // any specific driver mode requires dosCompat ON
   }
   if (httpServer.hasArg("httpsEnabled")) { String v=httpServer.arg("httpsEnabled"); cfg.httpsEnabled=(v=="1"||v=="true"||v=="on"); changed=true; }
   if (httpServer.hasArg("httpsCert")) { strlcpy(cfg.httpsCertPath, httpServer.arg("httpsCert").c_str(), sizeof(cfg.httpsCertPath)); changed=true; }
@@ -3138,12 +3371,34 @@ void processCommand(String &line) {
     else if (key=="eap-cert")  strlcpy(cfg.eapCertPath,  val.c_str(), sizeof(cfg.eapCertPath));
     else if (key=="eap-key")   strlcpy(cfg.eapKeyPath,   val.c_str(), sizeof(cfg.eapKeyPath));
     else if (key=="eap-kpass") strlcpy(cfg.eapKeyPass,  val.c_str(), sizeof(cfg.eapKeyPass));
-    else if (key=="audio-module") { String v=val; v.toLowerCase(); cfg.audioModule=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="audio-module") {
+      String v=val; v.toLowerCase();
+      bool newVal=(v=="on"||v=="1"||v=="yes");
+      if (newVal != cfg.audioModule) {
+        cfg.audioModule = newVal;
+        if (cfg.audioModule) {
+          if (!i2sTx) initI2S();
+          dualPrint.println(F("[I2S]  Audio module enabled at runtime."));
+        } else {
+          audioStop();
+          if (i2sTx) {
+            i2s_chan_handle_t h = i2sTx;
+            i2sTx = nullptr;       // core 0 sees nullptr → skips i2s_channel_write
+            delay(50);             // wait for any in-flight write to finish
+            i2s_channel_disable(h);
+            i2s_del_channel(h);
+            dualPrint.println(F("[I2S]  Audio module disabled at runtime."));
+          }
+        }
+      }
+    }
     else if (key=="web-auth")  { String v=val; v.toLowerCase(); cfg.webAuth=(v=="on"||v=="1"||v=="yes"); }
-    else if (key=="dos-compat")   { String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes"); }
+    else if (key=="dos-compat")   {
+      String v=val; v.toLowerCase(); cfg.dosCompat=(v=="on"||v=="1"||v=="yes");
+      if (!cfg.dosCompat) cfg.dosDriver=0;  // driver modes only meaningful with dosCompat ON
+    }
     else if (key=="dos-driver")   { int d=constrain(val.toInt(),0,3); cfg.dosDriver=(uint8_t)d;
-      if (d==1||d==2) cfg.dosCompat=true; // USBCD1/USBCD2 require DOS compat
-      if (d==3) cfg.dosCompat=false; // DI1000DD does not need DOS compat
+      if (d > 0) cfg.dosCompat=true;  // any specific driver mode requires dosCompat ON
     }
     else if (key=="https-enable")  { String v=val; v.toLowerCase(); cfg.httpsEnabled=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="https-cert")    { strlcpy(cfg.httpsCertPath, val.c_str(), sizeof(cfg.httpsCertPath)); }

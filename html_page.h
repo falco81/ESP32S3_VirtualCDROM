@@ -436,18 +436,24 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <div class="cfg-row">
           <label class="cfg-lbl">DOS CD-ROM driver</label>
           <select class="cfg-inp" id="cfgDosDriver" onchange="dosDriverChanged()">
-            <option value="0">Generic (no driver-specific identity)</option>
+            <option value="0">Generic &mdash; any ASPI driver [audio supported]</option>
             <option value="1">USBCD2.SYS &mdash; TEAC CD-56E [BROKEN &ndash; needs INT 13h hook]</option>
             <option value="2">ESPUSB.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
             <option value="3">DI1000DD.SYS + usbaspi1.sys &mdash; data only, no audio</option>
           </select>
         </div>
+        <div id="dosDriverNote0" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
+          &#10003; <b>Generic mode:</b> No specific INQUIRY identity &mdash; works with any ASPI-compatible DOS driver.<br>
+          Audio: READ&nbsp;TOC, PLAY, STOP, PAUSE, READ&nbsp;SUB-CHANNEL fully supported via SCSI.<br>
+          Use with any standard USBASPI (e.g. <code>usbaspi1.sys</code> or <code>usbaspi2.sys</code>) + MSCDEX.<br>
+          CONFIG.SYS: <code>usbaspi1.sys /w /v</code> + <code>MSCDEX.EXE /D:USBCD0</code>
+        </div>
+        </div>
         <div id="dosDriverNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(241,196,15,.1);border:1px solid rgba(241,196,15,.3);border-radius:4px;padding:8px 12px">
-          &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.
-          <b style="color:#e74c3c">Requires USBASPI with INT&nbsp;13h hook</b> &mdash; standard USBASPI.EXE/SYS does not provide this.
-          USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) to detect drives, not ASPI INT&nbsp;2Fh.
-          Result: <code>[Invalid parameter]</code> with all known USBASPI versions.
-          <b>Not recommended</b> &mdash; use ESPUSB.SYS instead.
+          &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.<br>
+          <b style="color:#e74c3c">Driver communication is broken:</b> USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) &mdash; standard USBASPI does not provide this hook.<br>
+          Audio SCSI commands (READ&nbsp;TOC, PLAY, SUB-CHANNEL) are handled by firmware but unreachable via broken driver.<br>
+          <b>Not recommended</b> &mdash; use Generic or ESPUSB.SYS instead.
         </div>
         <div id="dosDriverNote2" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(52,152,219,.1);border:1px solid rgba(52,152,219,.3);border-radius:4px;padding:8px 12px">
           &#10003; <b>ESPUSB.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
@@ -466,7 +472,6 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively.
         </div>
       </div>
-    </div>
 
         <!-- HTTPS -->
     <div class="card">
@@ -538,6 +543,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         </div>
       </div>
     </div>
+  </div>
 
     <!-- Actions -->
     <div class="card">
@@ -558,7 +564,6 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
 
-  </div>
 </div>
 
 <script>
@@ -778,13 +783,13 @@ function dosCompatChanged(){
 }
 function dosDriverChanged(){
   var v=parseInt($('cfgDosDriver').value||0);
-  var n1=$('dosDriverNote1'), n2=$('dosDriverNote2');
+  var n0=$('dosDriverNote0'), n1=$('dosDriverNote1'), n2=$('dosDriverNote2');
+  if(n0) n0.style.display=(v===0)?'block':'none';
   if(n1) n1.style.display=(v===1)?'block':'none';
   if(n2) n2.style.display=(v===2)?'block':'none';
   var n3=$('dosDriverNote3'); if(n3) n3.style.display=(v===3)?'block':'none';
-  // USBCD2 and USBCD1 force DOS compat ON; DI1000DD does not need it
-  if(v===1||v===2) $('cfgDosCompat').value='1';
-  if(v===3) $('cfgDosCompat').value='0';
+  // All specific driver modes require DOS compat ON
+  if(v>=1) $('cfgDosCompat').value='1';
 }
 function webAuthToggle(){
   $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
