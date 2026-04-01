@@ -763,14 +763,17 @@ bool doMount(const String &filename) {
   String fl = filename; fl.toLowerCase();
   String actualFile = filename;
 
+  // Stop mscReadCb reads immediately (our internal guard) — but do NOT signal
+  // TUR no-media yet. MSCDEX should not see extended "no media" while we parse/open files
+  // because it may stop polling and miss the subsequent disc-change notification.
+  bool hadDisc = isoOpen;
+  mscMediaPresent = false;
+
   if (fl.endsWith(".cue")) {
     dualPrint.printf("[CUE] Parsing: %s\n", filename.c_str());
     actualFile = parseCue(filename);
     if (!actualFile.length()) { dualPrint.println(F("[ERR] CUE: no data track found.")); return false; }
   }
-
-  bool hadDisc = isoOpen;  // remember if disc was already in drive
-  mscMediaPresent = false;  // stop reads on core 0 BEFORE touching file handles
   closeIso();
   delay(200);
 
@@ -827,18 +830,17 @@ bool doMount(const String &filename) {
   cdromBlockCount = discLeadOutLba;
   // Signal new media to host
   if (cfg.dosCompat) {
-    // DOS compat: msc.begin() is NEVER called after initUSBMSC
-    // because it triggers re-enumeration which DOS cannot recover from.
-    // mediaPresent(false→true) is sufficient for MSCDEX to re-read the disc.
+    // DOS compat: msc.begin() is NEVER called after initUSBMSC.
+    // Signal disc-swap ONLY NOW — new file is ready, window is minimal.
+    // mscReadCb was already blocked (mscMediaPresent=false) the whole time,
+    // so no stale reads happened even while TUR still reported media present.
     if (hadDisc) {
-      // Disc swap: signal removal then insertion
-      mscMediaPresent = false;
-      msc.mediaPresent(false);
-      delay(2500);  // wait for OS to fully process media removal (poll interval up to ~2s)
+      msc.mediaPresent(false);  // brief no-media so MSCDEX notices the swap
+      delay(1500);              // wait ~3 MSCDEX poll cycles (500ms each)
     }
     mscMediaPresent = true;
     msc.mediaPresent(true);
-    msc_set_unit_attention();  // signal UNIT ATTENTION (8-cycle counter — multiple OS polls)
+    msc_set_unit_attention();
     dualPrint.printf("[USB]  DOS compat: media %s, UA signalled\n",
                      hadDisc ? "swapped" : "inserted (first)");
   } else {
@@ -847,6 +849,10 @@ bool doMount(const String &filename) {
     msc.mediaPresent(false);
     tud_disconnect();
     delay(800);  // give OS time to fully process USB removal
+    // Re-register callbacks before msc.begin() — begin() may clear them internally
+    msc.onRead(mscReadCb);
+    msc.onWrite(mscWriteCb);
+    msc.isWritable(false);
     msc.begin(mountedBlocks, 2048);
     mscMediaPresent = true;
     msc.mediaPresent(true);
@@ -888,6 +894,10 @@ void doUmount() {
     msc.mediaPresent(false);   // signal: no media, drive stays enumerated
     dualPrint.println(F("[USB]  DOS compat: disc ejected (drive stays connected)"));
   } else {
+    // Re-register callbacks before msc.begin() — begin() may clear them internally
+    msc.onRead(mscReadCb);
+    msc.onWrite(mscWriteCb);
+    msc.isWritable(false);
     msc.begin(1, 2048);
     msc.mediaPresent(false);
     tud_disconnect(); delay(800); tud_connect();

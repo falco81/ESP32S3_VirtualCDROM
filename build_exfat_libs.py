@@ -437,7 +437,7 @@ def patch_usbmsc(path):
                 '// UNIT ATTENTION counter — persists for multiple TUR polling cycles so the OS\n'
                 '// has several opportunities to react to disc change (single-shot flag is unreliable).\n'
                 'static volatile uint8_t _ua_counter = 0;\n'
-                'extern "C" void msc_set_unit_attention(void) { _ua_counter = 8; }\n'
+                'extern "C" void msc_set_unit_attention(void) { _ua_counter = 3; }\n'
                 'bool tud_msc_test_unit_ready_cb(uint8_t lun) {\n'
                 '  if (_ua_counter > 0) {\n'
                 '    _ua_counter--;\n'
