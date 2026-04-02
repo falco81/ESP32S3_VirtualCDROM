@@ -55,15 +55,24 @@ echo ""
 echo "Flashing..."
 echo ""
 
+# --after no_reset: esptool exits cleanly after writing.
+# hard_reset hangs at 99.6% waiting for DTR/RTS response on CH343/CP2102
+# modules that do not implement RTS-based reset. A separate 'run' command
+# is issued afterwards to boot the firmware.
 set +e
 python3 -m esptool --chip esp32s3 --baud 921600 \
-    --before default_reset --after hard_reset \
+    --before default_reset --after no_reset \
     write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m \
     0x0 firmware_merged.bin
 RESULT=$?
 set -e
 
 if [ $RESULT -eq 0 ]; then
+    # Trigger boot after successful flash
+    echo ""
+    echo "Resetting ESP32-S3..."
+    python3 -m esptool --chip esp32s3 run &>/dev/null || true
+
     echo ""
     echo -e "${BOLD}${GREEN}============================================================"
     echo "  FLASH SUCCESSFUL"
