@@ -1,6 +1,6 @@
 # ESP32-S3 Virtual CD-ROM Drive + File Manager
 
-Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored on an SD card are presented to the host PC as a standard optical drive — no drivers required. The device also acts as a Wi-Fi file manager and supports audio track playback from CUE images via an I2S DAC module.
+Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored on an SD card are presented to the host PC as a standard optical drive. Works natively on Windows and Linux without any drivers. For DOS and retro systems a custom DOS CD-ROM driver (`ESPUSBCD.SYS`) is included, providing full data and audio CD support through the standard ASPI interface. The device also acts as a Wi-Fi file manager and supports audio track playback from CUE images via an I2S DAC module.
 
 ---
 
