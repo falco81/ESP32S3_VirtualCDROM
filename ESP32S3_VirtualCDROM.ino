@@ -59,7 +59,7 @@ extern "C" { bool tud_disconnect(void); bool tud_connect(void); void msc_set_uni
 #define RGB_LED_PIN  48
 
 // I2S pins for PCM5102 module
-#define I2S_BCK_PIN   14    // Bit clock  (PCM5102 BCK)
+#define I2S_BCK_PIN    8    // Bit clock  (PCM5102 BCK)
 #define I2S_WS_PIN    15    // Word select (PCM5102 LCK)
 #define I2S_DATA_PIN  16    // Data out   (PCM5102 DIN)
 
@@ -1078,7 +1078,10 @@ void initI2S() {
     return;
   }
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-  chan_cfg.auto_clear = true;
+  chan_cfg.auto_clear    = true;   // output silence when DMA buffer drains (pause/stop)
+  chan_cfg.dma_desc_num  = 8;      // 8 DMA descriptors
+  chan_cfg.dma_frame_num = 1024;   // 8 × 1024 frames × 4 bytes = 32 KB ≈ 185 ms buffer
+                                   // absorbs worst-case SD card read latency without underrun
   // Use local non-volatile temp — i2s_new_channel requires i2s_chan_handle_t* (non-volatile)
   i2s_chan_handle_t txTmp = nullptr;
   if (i2s_new_channel(&chan_cfg, &txTmp, nullptr) != ESP_OK) {
@@ -1104,13 +1107,15 @@ void initI2S() {
   i2sTx = txTmp;  // assign to volatile global only after full init
   dualPrint.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
+  dualPrint.println(F("[I2S]  XSMT must be HIGH (3V3) — if no audio, check XSMT pin or H3L bridge on module."));
 }
 
 // ── Audio playback FreeRTOS task ────────────────────────────────
-// Runs on core 0, reads 2352-byte raw sectors from SD, strips the
-// 16-byte sync header, writes 2336 bytes (= 2 channels × 16-bit × 588 samples)
-// to the I2S DMA ring buffer.
-#define AUDIO_BUF_SECTORS 4   // read this many sectors per iteration (~9 KB)
+// Runs on core 0. Reads 2352-byte raw audio sectors from SD card BIN file
+// and writes all 2352 bytes to the I2S DMA buffer.
+// Red Book audio sectors contain raw 16-bit stereo PCM with NO header —
+// all 2352 bytes are usable audio data (588 stereo samples × 4 bytes each).
+#define AUDIO_BUF_SECTORS 8   // 8 × 2352 = 18 816 B ≈ 106 ms — larger batch reduces SD seek overhead
 static uint8_t audioBuf[2352 * AUDIO_BUF_SECTORS];
 
 static void audioTask(void* arg) {
@@ -1118,9 +1123,10 @@ static void audioTask(void* arg) {
   String openedFile;
 
   while (true) {
-    // Wait for play command
+    // Wait if not playing — close file only on STOP, keep it open during PAUSE
+    // (closing on PAUSE forces reopen+seek on resume → DMA underrun → crackling)
     if (audioState != AUDIO_PLAY) {
-      if (audioFile) { audioFile.close(); openedFile = ""; }
+      if (audioState == AUDIO_STOP && audioFile) { audioFile.close(); openedFile = ""; }
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -1206,8 +1212,8 @@ static void audioTask(void* arg) {
 
     int sectorsGot = bytesRead / 2352;
 
-    // Write audio samples to I2S — skip 16-byte sector header per sector
-    // Snapshot i2sTx once per batch — it may be nulled from core 1 during module disable
+    // Write full 2352-byte audio sector to I2S — Red Book audio has NO sync header,
+    // every byte is raw PCM. Snapshot i2sTx once per batch (may be nulled mid-playback).
     i2s_chan_handle_t i2sHandle = i2sTx;
     if (!i2sHandle) {
       // Module was disabled mid-playback — stop cleanly
@@ -1315,25 +1321,18 @@ void audioPlay(uint32_t startLba, uint32_t endLba) {
 
 void audioStop() {
   audioState = AUDIO_STOP;
-  // Snapshot i2sTx locally — it may be nulled concurrently from core 1 during module disable
-  i2s_chan_handle_t h = i2sTx;
-  if (h && cfg.audioModule) {
-    static uint8_t silence[512] = {};
-    size_t w;
-    for (int i = 0; i < 4; i++) i2s_channel_write(h, silence, sizeof(silence), &w, 10);
-  }
+  // Do NOT call i2s_channel_write here — the audio task may be inside
+  // i2s_channel_write concurrently; two simultaneous writers corrupt the
+  // I2S DMA ring buffer, causing "channel not enabled" errors.
+  // auto_clear=true outputs silence automatically when the DMA drains.
   dualPrint.println(F("[AUDIO] Stop."));
 }
 
 void audioPause() {
   audioState = AUDIO_PAUSE;
-  // Flush I2S DMA with silence so speaker stops cleanly without draining buffered audio
-  i2s_chan_handle_t h = i2sTx;
-  if (h) {
-    static uint8_t silence[512] = {};
-    size_t w;
-    for (int i = 0; i < 4; i++) i2s_channel_write(h, silence, sizeof(silence), &w, 10);
-  }
+  // Same reason as audioStop — no concurrent i2s_channel_write here.
+  // The audio task stops writing at the next sector boundary and auto_clear
+  // fills the remaining DMA frames with silence.
   dualPrint.println(F("[AUDIO] Pause."));
 }
 void audioResume(){ audioState = AUDIO_PLAY;  dualPrint.println(F("[AUDIO] Resume.")); }

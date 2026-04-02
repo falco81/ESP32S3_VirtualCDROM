@@ -382,11 +382,11 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <label class="cfg-lbl">PCM5102 I2S module</label>
         <select class="cfg-inp" id="cfgAudioModule" style="width:100%">
           <option value="0">Disabled (no hardware connected)</option>
-          <option value="1">GY-PCM5102 I2S &#8212; GPIO 14/15/16</option>
+          <option value="1">GY-PCM5102 I2S &#8212; GPIO 8/15/16</option>
         </select>
       </div>
       <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-        &#9432; Requires reboot. BCK&#8594;GPIO14 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
+        &#9432; Requires reboot. BCK&#8594;GPIO8 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
       </div>
     </div>
 
@@ -448,7 +448,6 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           Use with any standard USBASPI (e.g. <code>usbaspi1.sys</code> or <code>usbaspi2.sys</code>) + MSCDEX.<br>
           CONFIG.SYS: <code>usbaspi1.sys /w /v</code> + <code>MSCDEX.EXE /D:USBCD0</code>
         </div>
-        </div>
         <div id="dosDriverNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(241,196,15,.1);border:1px solid rgba(241,196,15,.3);border-radius:4px;padding:8px 12px">
           &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.<br>
           <b style="color:#e74c3c">Driver communication is broken:</b> USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) &mdash; standard USBASPI does not provide this hook.<br>
@@ -471,7 +470,8 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           Use <b>usbaspi1.sys</b> as ASPI layer (Panasonic v2.20): <code>usbaspi1.sys /w /v</code> + <code>DI1000DD.SYS</code><br>
           No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively.
         </div>
-      </div>
+      </div><!-- end dosDriverSection -->
+    </div><!-- end DOS card -->
 
         <!-- HTTPS -->
     <div class="card">
@@ -778,8 +778,8 @@ function dosCompatChanged(){
   var v=parseInt($('cfgDosCompat').value||0);
   var sec=$('dosDriverSection');
   if(sec) sec.style.display=(v===1)?'block':'none';
-  // Při vypnutí dosCompat vrať driver na Generic
   if(v===0 && $('cfgDosDriver')) $('cfgDosDriver').value='0';
+  dosDriverChanged();
 }
 function dosDriverChanged(){
   var v=parseInt($('cfgDosDriver').value||0);
@@ -1090,8 +1090,8 @@ function cfgLoad(){
     $('cfgEapKey')._savedVal  = c.eapKeyPath  || '';
     $('cfgEapKPass').value = '';  // never pre-fill password
     $('cfgAudioModule').value = c.audioModule ? '1' : '0';
+    var ddEl=$('cfgDosDriver'); if(ddEl) ddEl.value=c.dosDriver||0;
     $('cfgDosCompat').value = c.dosCompat ? '1' : '0'; dosCompatChanged();
-    var ddEl=$('cfgDosDriver'); if(ddEl){ddEl.value=c.dosDriver||0; dosDriverChanged();}
     var heEl=$('cfgHttpsEnabled'); if(heEl){heEl.value=c.httpsEnabled?'1':'0'; httpsToggle();}
     var hcEl=$('cfgHttpsCert'); if(hcEl){hcEl._savedVal=c.httpsCert||''; if(c.httpsCert){var o=document.createElement('option');o.value=c.httpsCert;o.textContent=c.httpsCert+' (saved)';hcEl.appendChild(o);hcEl.value=c.httpsCert;}}
     var hkEl=$('cfgHttpsKey'); if(hkEl){hkEl._savedVal=c.httpsKey||''; if(c.httpsKey){var o=document.createElement('option');o.value=c.httpsKey;o.textContent=c.httpsKey+' (saved)';hkEl.appendChild(o);hkEl.value=c.httpsKey;}}
