@@ -80,14 +80,19 @@ dev_name:   DB  'ESPUSBCD'
 rh_off:     DW  0
 rh_seg:     DW  0
 
-aspi_ha:    DB  0
-aspi_tgt:   DB  0
-aspi_lun:   DB  0
+aspi_tgt:   DB  0               ; SCSI target ID (default 0, /T: switch)
+aspi_lun:   DB  0               ; SCSI LUN (always 0)
 
-disc_ok:    DB  0
+disc_ok:    DB  1               ; 1=disc assumed present; updated by READ LONG result
 aud_state:  DB  AS_STOP
 toc_ok:     DB  0
 vol_sectors: DD 0
+
+; ASPI entry point obtained from SCSIMGR$ device via IOCTL
+; Stored as contiguous far pointer: [aspi_off:aspi_seg]
+; (offset at lower address so call far [cs:aspi_off] works)
+aspi_off:   DW  0               ; ASPI function offset
+aspi_seg:   DW  0               ; ASPI function segment
 
 ch_sel:     DB  0, 1, 2, 3
 ch_vol:     DB  0FFh, 0FFh, 0, 0
@@ -100,39 +105,41 @@ play_es: DB 0
 play_ef: DB 0
 
 ;=================================================================
-; ASPI SRB  (Adaptec ASPI for DOS layout, 74 bytes)
+; ASPI SRB — Panasonic/Matsushita USBASPI format
+; Confirmed by disassembly of ESPUSB.SYS (reference driver)
+; ALL field offsets differ from Adaptec ASPI spec!
 ;=================================================================
 ALIGN 2
 srb:
-.cmd:       DB  ASPI_EXEC
-.sts:       DB  0
-.ha:        DB  0
-.flg:       DB  0
-.rsv1:      DW  0
-.tgt:       DB  0
-.lun:       DB  0
-.blen:      DD  0
-.boff:      DW  0
-.bseg:      DW  0
-.snslen:    DB  14
-.cdblen:    DB  10
-.hastat:    DB  0
-.tgtstat:   DB  0
-.postproc:  DD  0
-.rsv2:      times 20 DB 0
-.cdb:       times 16 DB 0
-.sense:     times 14 DB 0
+.cmd:       DB  ASPI_EXEC    ; +0x00  SRB_Cmd = 2 (EXEC_SCSI)
+.sts:       DB  0            ; +0x01  SRB_Status  (0=pending, 1=done)
+.ha:        DB  0            ; +0x02  Host adapter (always 0)
+.flg:       DB  0            ; +0x03  Flags: 0x18=nodata 0x08=in 0x10=out
+            times 4 DB 0     ; +0x04-0x07  reserved
+.tgt:       DB  0            ; +0x08  SCSI Target ID  ← Adaptec has this at 0x06!
+.lun:       DB  0            ; +0x09  SCSI LUN        ← Adaptec has this at 0x07!
+.blen:      DW  0            ; +0x0A  Transfer length (WORD, bytes)
+            DW  0            ; +0x0C  reserved
+.snslen:    DB  0x12         ; +0x0E  Sense length = 18 (fixed, ESPUSB.SYS always 0x12)
+.boff:      DW  0            ; +0x0F  Data buffer offset  ← Adaptec: 0x0C
+.bseg:      DW  0            ; +0x11  Data buffer segment ← Adaptec: 0x0E
+            times 4 DB 0     ; +0x13-0x16  reserved
+.cdblen:    DB  0            ; +0x17  CDB length ← Adaptec has this at 0x11!
+            times 40 DB 0    ; +0x18-0x3F  reserved (40 bytes)
+.cdb:       times 12 DB 0    ; +0x40-0x4B  CDB     ← Adaptec CDB starts at 0x2C!
+            times 4  DB 0    ; +0x4C-0x4F  padding
+.sense:     times 18 DB 0    ; +0x50-0x61  Auto request sense (18 bytes = 0x12)
+; Total = 0x62 = 98 bytes
 
-; HA-Inquiry SRB (INIT only)
+; HA-Inquiry SRB — used by ESPUSB.SYS INIT to probe ASPI (Cmd=0)
+; We only use this to see if USBASPI is alive; result ignored.
 haiq:
-.cmd:   DB  ASPI_HAINQ
-.sts:   DB  0
-.ha:    DB  0
-.flg:   DB  0
-.rsv:   DW  0
-.count: DB  0
-.sid:   DB  0
-        times 48 DB 0
+.cmd:   DB  ASPI_HAINQ      ; +0x00  Cmd = 0 = HA_INQUIRY
+.sts:   DB  0               ; +0x01  Status
+.ha:    DB  0               ; +0x02  HaId
+        times 5 DB 0        ; +0x03-0x07
+.count: DB  0               ; +0x08  HA count (returned)
+        times 24 DB 0       ; pad to 32 bytes total
 
 ;=================================================================
 ; DATA BUFFERS
@@ -280,17 +287,20 @@ cmd_ioctl_in:
     mov [es:di+8], al
     jmp .sf_ok
 
-; SF1: Return Drive Head Location (current position)
+; SF1: Return Drive Head Location
+; Only query sub-channel when audio is actually playing to avoid ASPI hang at init.
 .sf1:
+    cmp  byte [aud_state], AS_PLAY
+    jne  .sf1_static
     call scsi_read_subchannel
-    jc   .sf_err
-    cmp  byte [es:di+1], 0   ; addressing mode: 0=LBA, 1=MSF
+    jc   .sf1_static
+    cmp  byte [es:di+1], 0
     je   .sf1_lba
-    mov  al, [data_buf+9]    ; abs M
+    mov  al, [data_buf+9]
     mov  [es:di+2], al
-    mov  al, [data_buf+10]   ; abs S
+    mov  al, [data_buf+10]
     mov  [es:di+3], al
-    mov  al, [data_buf+11]   ; abs F
+    mov  al, [data_buf+11]
     mov  [es:di+4], al
     mov  byte [es:di+5], 0
     jmp  .sf_ok
@@ -305,26 +315,16 @@ cmd_ioctl_in:
     sub  eax, 150
     mov  [es:di+2], eax
     jmp  .sf_ok
+.sf1_static:
+    ; Not playing — return zero position
+    xor  eax, eax
+    mov  [es:di+2], eax
+    jmp  .sf_ok
 
-; SF4: Audio Status - query sub-channel for live state
+; SF4: Audio Status
+; Return local aud_state. No ASPI probe here — avoids hang during SHSUCDX init.
+; Sub-channel is queried only by SF12 which is called by active audio players.
 .sf4:
-    call scsi_read_subchannel
-    jc   .sf4_local             ; on error, use local state
-    ; data_buf[1] = audio status: 11h=playing,12h=paused,13h=done,15h=none
-    xor  ax, ax
-    cmp  byte [data_buf+1], 12h  ; paused?
-    je   .sf4_paused
-    cmp  byte [data_buf+1], 11h  ; playing?
-    je   .sf4_play
-    jmp  .sf4_done
-.sf4_paused:
-    or   ax, 1                  ; bit0 = paused
-    mov  byte [aud_state], AS_PAUSE
-    jmp  .sf4_done
-.sf4_play:
-    mov  byte [aud_state], AS_PLAY
-    jmp  .sf4_done
-.sf4_local:
     xor  ax, ax
     cmp  byte [aud_state], AS_PAUSE
     jne  .sf4_done
@@ -354,17 +354,18 @@ cmd_ioctl_in:
     jmp  .sf_ok
 
 ; SF6: Return Device Status DWORD
+; CRITICAL: do NOT call scsi_tur here.
+; SHSUCDX calls SF6 during its init — any ASPI call here would hang if
+; USBASPI hasn't fully processed the previous request or returns async.
+; disc_ok is updated by READ LONG (set 1 on success, 0 on error).
+; At startup disc_ok=1 (optimistic) so SHSUCDX registers the drive letter.
 .sf6:
-    call scsi_tur
-    jc   .sf6_nodisc
-    mov  byte [disc_ok], 1
-    mov  dword [es:di+1], 0x0002   ; door unlocked, disc present
+    cmp  byte [disc_ok], 1
+    je   .sf6_present
+    mov  dword [es:di+1], 0x0102   ; bit8=no disc, door unlocked
     jmp  .sf_ok
-.sf6_nodisc:
-    mov  byte [disc_ok], 0
-    mov  byte [toc_ok], 0
-    mov  dword [vol_sectors], 0    ; force re-read on next mount
-    mov  dword [es:di+1], 0x0102   ; bit8=no disc
+.sf6_present:
+    mov  dword [es:di+1], 0x0002   ; door unlocked, disc present
     jmp  .sf_ok
 
 ; SF9: Return Volume Size (sectors)
@@ -405,7 +406,24 @@ cmd_ioctl_in:
     jmp  .sf_ok
 
 ; SF12/13: Audio Q-Channel Info
+; Only query sub-channel when audio is playing — avoids ASPI hang at init.
 .sf12:
+    cmp  byte [aud_state], AS_PLAY
+    je   .sf12_live
+    cmp  byte [aud_state], AS_PAUSE
+    je   .sf12_live
+    ; Not playing — return zeroed Q-channel block
+    xor  al, al
+    mov  cx, 12
+    push di
+    inc  di
+.sf12_zero:
+    mov  [es:di], al
+    inc  di
+    loop .sf12_zero
+    pop  di
+    jmp  .sf_ok
+.sf12_live:
     call scsi_read_subchannel
     jc   .sf_err
     mov  al, [data_buf+5]
@@ -476,7 +494,7 @@ cmd_ioctl_out:
     mov  byte [srb.cdb+4], 02h    ; LoEj=1 Start=0 = eject
     mov  byte [srb.cdblen], 6
     mov  byte [srb.flg], ASPI_NONE
-    mov  dword [srb.blen], 0
+    mov  word  [srb.blen], 0
     call do_aspi
     mov  byte [disc_ok], 0
     mov  byte [toc_ok], 0
@@ -518,7 +536,7 @@ cmd_ioctl_out:
     mov  byte [srb.cdb+4], 03h    ; LoEj=1 Start=1 = load
     mov  byte [srb.cdblen], 6
     mov  byte [srb.flg], ASPI_NONE
-    mov  dword [srb.blen], 0
+    mov  word  [srb.blen], 0
     call do_aspi
     jmp  .sf_ok
 
@@ -572,10 +590,10 @@ cmd_read_long:
     pop   ecx
 
     mov   byte [srb.cdb], SCSI_RD10
-    ; LBA big-endian at CDB+2..+5
+    ; LBA big-endian at CDB+2..+5 (32-bit store into Panasonic CDB area)
     mov   edx, eax
     bswap edx
-    mov   [srb.cdb+2], edx
+    mov   [srb.cdb+2], edx         ; 4-byte DWORD write into CDB[2..5]
     ; transfer length big-endian at CDB+7..+8
     mov   ax, cx
     xchg  al, ah
@@ -589,14 +607,19 @@ cmd_read_long:
 
     movzx eax, cx
     imul  eax, 2048
-    mov   [srb.blen], eax
+    mov   [srb.blen], ax   ; word (Panasonic blen is 16-bit)
 
     call  do_aspi
     jc    .err
+    mov   byte [disc_ok], 1        ; read succeeded — disc is present
 .ok:
     mov   word [es:bx+3], STAT_DONE
     ret
 .err:
+    ; read failed — mark disc absent and invalidate caches
+    mov   byte [disc_ok], 0
+    mov   byte [toc_ok], 0
+    mov   dword [vol_sectors], 0
     mov   word [es:bx+3], STAT_DONE|STAT_ERR|ERR_READ
     ret
 
@@ -662,7 +685,7 @@ cmd_play_audio:
     mov   [srb.cdb+8], al
     mov   byte [srb.cdblen], 10
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     jc    .err
     mov   byte [aud_state], AS_PLAY
@@ -680,7 +703,7 @@ cmd_stop_audio:
     mov   byte [srb.cdb], SCSI_STOP
     mov   byte [srb.cdblen], 10
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     mov   byte [aud_state], AS_STOP
     mov   word [es:bx+3], STAT_DONE
@@ -771,7 +794,7 @@ cmd_play_track_index:
     mov   [srb.cdb+8], al
     mov   byte [srb.cdblen], 10
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     jc    .err
     mov   byte [aud_state], AS_PLAY
@@ -793,7 +816,7 @@ cmd_resume_audio:
     mov   byte [srb.cdb+8], 01h   ; resume bit
     mov   byte [srb.cdblen], 10
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     jc    .err
     mov   byte [aud_state], AS_PLAY
@@ -804,79 +827,76 @@ cmd_resume_audio:
     ret
 
 ;=================================================================
-; DO_ASPI: Execute SCSI command via INT 4Bh
-; srb.cdb, srb.cdblen, srb.flg, srb.blen, srb.boff/bseg preset.
-; Returns: CF=0 success, CF=1 error
+; DO_ASPI: Execute SCSI command via USBASPI SCSIMGR$ interface
+; Caller pre-sets: srb.flg, srb.blen, srb.boff, srb.bseg,
+;                  srb.cdblen, srb.cdb (all at Panasonic offsets)
+; Returns: CF=0 success, CF=1 error/timeout
 ;=================================================================
 do_aspi:
-    push ax
-    push ds
-    push si
-
-    ; Fill SRB fixed fields
     mov   byte [srb.cmd], ASPI_EXEC
     mov   byte [srb.sts], 0
-    mov   byte [srb.rsv1], 0
-    mov   byte [srb.rsv1+1], 0
-    mov   al, [aspi_ha]
-    mov   [srb.ha], al
-    mov   al, [aspi_tgt]
-    mov   [srb.tgt], al
-    mov   al, [aspi_lun]
-    mov   [srb.lun], al
-    mov   byte [srb.snslen], 14
-    mov   dword [srb.postproc], 0  ; synchronous poll
+    ; srb.ha, srb.tgt, srb.lun, srb.snslen are set at INIT and never change
 
-    ; Call ASPI: DS:SI = SRB address
+    ; ── Call USBASPI via SCSIMGR$ far pointer ───────────────────────
+    ; Calling convention confirmed from ESPUSB.SYS offset 0x0728:
+    ;   DS = ES = SRB segment
+    ;   push ES (segment), push BX (offset = srb)
+    ;   call far [cs:aspi_off]
+    ;   add sp, 4
+    ;   sti
+    push  ds
+    push  es
+    pusha
     push  cs
+    pop   es
+    mov   bx, srb
+    mov   ax, es
+    mov   ds, ax
+    push  es
+    push  bx
+    call  far [cs:aspi_off]
+    add   sp, 4
+    sti
+    popa
+    pop   es
     pop   ds
-    mov   si, srb
-    int   4Bh                      ; ASPI entry point
 
-    ; Poll until SRB_Status != 0  (with timeout ~500k iterations ≈ ~5 sec)
-    mov   ecx, 500000
+    ; ── Poll SRB_Status ─────────────────────────────────────────────
+    ; ESPUSB.SYS polls without any timeout — USBASPI always eventually
+    ; sets SRB_Status. A timeout that fires before USBASPI completes
+    ; (common on fast modern PCs where 16M loop iterations takes <200ms)
+    ; causes spurious errors that drive SHSUCDX into a retry storm.
 .poll:
     mov   al, cs:[srb.sts]
     test  al, al
-    jnz   .polldone
-    dec   ecx
-    jnz   .poll
-    ; Timeout: force error
+    jz    .poll                 ; wait forever — USBASPI will set status
+.done:
+    cmp   al, 1                     ; 1 = ASPI_DONE
+    je    .ok
     stc
-    jmp   .ret
-.polldone:
-
-    ; Check result
-    cmp   al, ASPI_DONE
-    jne   .fail
-    cmp   byte cs:[srb.tgtstat], 0 ; target status must be 0 (GOOD)
-    jne   .fail
+    ret
+.ok:
     clc
-    jmp   .ret
-.fail:
-    stc
-.ret:
-    pop   si
-    pop   ds
-    pop   ax
+    ret
     ret
 
 ;=================================================================
 ; ZERO_CDB: zero SRB CDB (16 bytes) and clear status fields
 ;=================================================================
 zero_cdb:
+    ; Zero the 12-byte CDB area in the Panasonic SRB (starts at srb+0x40)
+    ; Also zero the sts field so do_aspi sees a clean pending state
     push  ax
     push  cx
     push  di
     push  es
     push  cs
     pop   es
-    mov   di, srb.cdb
-    xor   al, al
-    mov   cx, 16
-    rep   stosb
-    mov   byte [srb.hastat], 0
-    mov   byte [srb.tgtstat], 0
+    mov   di, srb.cdb           ; = srb + 0x40
+    xor   ax, ax
+    mov   cx, 6                 ; 6 words = 12 bytes (max 12-byte CDB)
+    rep   stosw
+    ; sts is cleared in do_aspi; nothing else to reset here
     pop   es
     pop   di
     pop   cx
@@ -893,7 +913,7 @@ scsi_tur:
     mov   byte [srb.cdb], SCSI_TUR
     mov   byte [srb.cdblen], 6
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     ret
 
@@ -908,7 +928,7 @@ scsi_inquiry:
     push  cs
     pop   ax
     mov   [srb.bseg], ax
-    mov   dword [srb.blen], 96
+    mov   word  [srb.blen], 96
     call  do_aspi
     ret
 
@@ -922,7 +942,7 @@ scsi_read_capacity:
     push  cs
     pop   ax
     mov   [srb.bseg], ax
-    mov   dword [srb.blen], 8
+    mov   word  [srb.blen], 8
     call  do_aspi
     ret
 
@@ -940,7 +960,7 @@ scsi_read_toc:
     push  cs
     pop   ax
     mov   [srb.bseg], ax
-    mov   dword [srb.blen], TOC_BUFSZ
+    mov   word  [srb.blen], TOC_BUFSZ
     call  do_aspi
     ret
 
@@ -959,7 +979,7 @@ scsi_read_subchannel:
     push  cs
     pop   ax
     mov   [srb.bseg], ax
-    mov   dword [srb.blen], 16
+    mov   word  [srb.blen], 16
     call  do_aspi
     ret
 
@@ -974,7 +994,7 @@ do_scsi_prevent:
     mov   [srb.cdb+4], al
     mov   byte [srb.cdblen], 6
     mov   byte [srb.flg], ASPI_NONE
-    mov   dword [srb.blen], 0
+    mov   word  [srb.blen], 0
     call  do_aspi
     ret
 
@@ -1112,16 +1132,55 @@ msf_to_lba:
 ; INIT CODE (past end_resident, freed by DOS after INIT completes)
 ;=================================================================
 
+;-----------------------------------------------------------------
+; get_aspi_entry: open SCSIMGR$, read 4-byte far pointer via IOCTL,
+; store it at [cs:aspi_off:aspi_seg].
+; Identical approach to ESPUSB.SYS offset 0x0F4D.
+; Returns CF=0 on success, CF=1 if SCSIMGR$ not found.
+;-----------------------------------------------------------------
+get_aspi_entry:
+    push  ds
+    push  cs
+    pop   ds                        ; DS = CS = our segment
+
+    mov   ax, 0x3D00                ; INT 21h open file, read-only
+    mov   dx, scsimgr_name          ; DS:DX = "SCSIMGR$",0
+    int   21h
+    jc    .fail                     ; SCSIMGR$ not installed
+
+    mov   bx, ax                    ; BX = file handle
+    mov   cx, 4                     ; read 4 bytes
+    mov   dx, aspi_off              ; DS:DX = buffer (stores directly into aspi_off:aspi_seg)
+    mov   ax, 0x4402                ; INT 21h IOCTL read from character device
+    int   21h
+    pushf                           ; save IOCTL result flags
+    mov   ah, 0x3E                  ; close handle regardless
+    int   21h
+    popf                            ; restore IOCTL flags
+    jc    .fail
+
+    ; Verify entry point is non-zero
+    mov   ax, [aspi_off]
+    or    ax, [aspi_seg]
+    jz    .fail
+
+    pop   ds
+    clc
+    ret
+.fail:
+    pop   ds
+    stc
+    ret
+
+;-----------------------------------------------------------------
 ; cmd_init: called from _interrupt for command 0 (INIT)
-; ES:BX = request header
-; RH+14: end-of-resident pointer to set (DWORD far ptr)
-; RH+23: far ptr to CONFIG.SYS command line tail
+;-----------------------------------------------------------------
 cmd_init:
     push  es
     push  bx
 
     ; Parse command line: /D:name  /T:id  /H:ha
-    mov   ax, [es:bx+20]           ; command line segment (at INIT RH+18/+20)
+    mov   ax, [es:bx+20]           ; command line segment
     mov   di, [es:bx+18]           ; command line offset
     push  ax
     pop   es                        ; ES:DI = command line
@@ -1134,23 +1193,34 @@ cmd_init:
     mov   dx, msg_banner
     call  print_msg
 
-    ; Try TEST UNIT READY to probe the device (uses do_aspi with built-in timeout).
-    ; We do NOT call aspi_ha_inquiry — some USBASPI versions ignore that SRB
-    ; and never set SRB_Status, causing an infinite polling loop.
-    ; If TUR fails it just means no disc is in the drive yet — that is OK.
-    ; The driver always loads successfully so MSCDEX/SHSUCDX can register it.
-    call  scsi_tur
-    jc    .no_disc
-    mov   byte [disc_ok], 1
-    mov   dx, msg_ok
+    ; ── Get ASPI entry point from SCSIMGR$ ──────────────────────────
+    ; Exactly as ESPUSB.SYS: open SCSIMGR$, IOCTL read 4 bytes,
+    ; store far pointer at [cs:aspi_off:aspi_seg].
+    call  get_aspi_entry
+    jnc   .aspi_ok
+    ; SCSIMGR$ not found — USBASPI probably not loaded
+    mov   dx, msg_no_aspi
     call  print_msg
-    jmp   .success
-.no_disc:
-    mov   dx, msg_no_disc
-    call  print_msg
+    ; Still load the driver (MSCDEX will get errors but won't crash DOS)
+    jmp   .set_resident
+.aspi_ok:
+    ; Initialise permanent SRB fields (set once, never changed at runtime)
+    mov   al, [aspi_tgt]
+    mov   [srb.tgt], al             ; Target ID at Panasonic SRB+0x08
+    mov   al, [aspi_lun]
+    mov   [srb.lun], al             ; LUN at Panasonic SRB+0x09
+    ; srb.snslen is pre-initialised to 0x12 in the declaration
 
-.success:
-    ; Set end-of-resident pointer and return success
+    ; ── Warm-up TUR ─────────────────────────────────────────────────
+    ; Send a single TEST UNIT READY to initialise USBASPI's USB bulk
+    ; endpoint state before SHSUCDX/MSCDEX loads and issues its first
+    ; IOCTL.  Without this, the first ASPI call from the redirector can
+    ; freeze the PC (USBASPI enters CLI + infinite USB poll while
+    ; opening the bulk pipe for the first time).
+    ; Result is ignored — disc may not be mounted yet.
+    call  scsi_tur                  ; CF result ignored
+
+.set_resident:
     pop   bx
     pop   es
     mov   word [es:bx+14], end_resident
@@ -1158,6 +1228,8 @@ cmd_init:
     pop   ax
     mov   word [es:bx+16], ax
     mov   word [es:bx+3], STAT_DONE
+    mov   dx, msg_ok
+    call  print_msg
     ret
 
 ;-----------------------------------------------------------------
@@ -1242,15 +1314,7 @@ parse_cmdline:
     inc   di
     jmp   .next_char
 
-.sw_h:  ; /H:ha — host adapter number (single digit)
-    inc   di
-    cmp   byte [es:di], ':'
-    jne   .next_char
-    inc   di
-    mov   al, [es:di]
-    sub   al, '0'
-    and   al, 3
-    mov   [aspi_ha], al
+.sw_h:  ; /H:ha — host adapter (ignored, SCSIMGR$ always uses HA 0)
     inc   di
     jmp   .next_char
 
@@ -1258,38 +1322,6 @@ parse_cmdline:
     pop   si
     pop   cx
     pop   ax
-    ret
-
-;-----------------------------------------------------------------
-; aspi_ha_inquiry: call ASPI HAINQ SRB to check if ASPI is up
-; CF=1 if not installed or fails
-;-----------------------------------------------------------------
-aspi_ha_inquiry:
-    push  ds
-    push  si
-    push  cs
-    pop   ds
-    mov   byte [haiq.cmd], ASPI_HAINQ
-    mov   byte [haiq.sts], 0
-    mov   al, [aspi_ha]
-    mov   [haiq.ha], al
-    mov   byte [haiq.flg], 0
-    mov   word [haiq.rsv], 0
-    mov   si, haiq
-    int   4Bh
-.poll:
-    mov   al, cs:[haiq.sts]
-    test  al, al
-    jz    .poll
-    cmp   al, ASPI_DONE
-    je    .ok
-    stc
-    jmp   .done
-.ok:
-    clc
-.done:
-    pop   si
-    pop   ds
     ret
 
 ;-----------------------------------------------------------------
@@ -1324,11 +1356,14 @@ print_msg:
 ;=================================================================
 ; INIT STRINGS  (in discarded area after end_resident)
 ;=================================================================
+scsimgr_name:
+    DB  'SCSIMGR$', 0
+
 msg_banner:
     DB  13, 10
     DB  'ESPUSBCD.SYS  ESP32 Virtual CD-ROM Driver  v1.0', 13, 10
     DB  '$'
 msg_ok:
-    DB  'ESPUSBCD: Ready. Disc detected.', 13, 10, '$'
-msg_no_disc:
-    DB  'ESPUSBCD: Loaded (no disc in drive - insert disc before use).', 13, 10, '$'
+    DB  'ESPUSBCD: Loaded. Ready for MSCDEX/SHSUCDX.', 13, 10, '$'
+msg_no_aspi:
+    DB  'ESPUSBCD: WARNING - SCSIMGR$ not found. Load USBASPI first.', 13, 10, '$'
