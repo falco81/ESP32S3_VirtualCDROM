@@ -151,7 +151,7 @@ struct Config {
   char webUser[32];        // Web UI username (default: admin)
   char webPass[64];        // Web UI password (default: admin)
   bool dosCompat;          // true = skip USB re-enum on mount (DOS compatibility)
-  uint8_t dosDriver;       // 0=Generic 1=USBCD2/TEAC 2=ESPUSB/Panasonic 3=DI1000DD/USBASPI
+  uint8_t dosDriver;       // 0=Generic 1=USBCD2/TEAC 2=ESPUSBCD/Panasonic 3=DI1000DD/USBASPI
   bool     httpsEnabled;       // true = enable HTTPS
   char     httpsCertPath[64];  // SD path to TLS server certificate
   char     httpsKeyPath[64];   // SD path to TLS server private key
@@ -2981,7 +2981,7 @@ void printConfig(bool showRuntime = true) {
     const char* dosDriverName[] = {
       "0=Generic (no special identity)",
       "1=USBCD2/TEAC  [INQUIRY: TEAC CD-56E]",
-      "2=ESPUSB/Panasonic  [INQUIRY: MATSHITA CR-572]",
+      "2=ESPUSBCD/Panasonic  [INQUIRY: MATSHITA CR-572]",
       "3=DI1000DD/USBASPI 2.20  [data only, no audio]"
     };
     dualPrint.printf("  DOS driver    : %s\n",  dosDriverName[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
@@ -3167,15 +3167,15 @@ void printStatus() {
     const char* drvNames[] = {
       "0=Generic  (no special identity, works with any ASPI)",
       "1=USBCD2   TEAC CD-56E  [BROKEN: needs INT 13h hook]",
-      "2=ESPUSB  MATSHITA CR-572  [audio via CDP.COM/cdp.com]",
+      "2=ESPUSBCD  MATSHITA CR-572  [audio via CDP.COM/cdp.com]",
       "3=DI1000DD USBASPI 2.20  [data only, no audio]"
     };
     dualPrint.printf("  DOS driver    : %s\n",  drvNames[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
   }
   if (cfg.dosDriver == 2) {
     dualPrint.println(F("  USBASPI needed: usbaspi2.sys (Novac) or usbaspi1.sys"));
-    dualPrint.println(F("  Audio player  : use CDP.COM (cdplayer.exe aborts on IOCTL OUT sf3 without espusb.sys)"));
-    dualPrint.println(F("  Driver file   : espusb.sys  (sf3 fix + alloc patch)"));
+    dualPrint.println(F("  Audio player  : use CDP.COM (ESPUSBCD.SYS implements full IOCTL)"));
+    dualPrint.println(F("  Driver file   : ESPUSBCD.SYS  (custom driver — full audio)"));
   } else if (cfg.dosDriver == 3) {
     dualPrint.println(F("  USBASPI needed: usbaspi1.sys (Panasonic v2.20)"));
     dualPrint.println(F("  Note          : data-only, no MSCDEX audio commands"));
@@ -3230,13 +3230,13 @@ void printHelp() {
   dualPrint.println(F("  set dos-driver <0-3>      Set USB CD-ROM driver identity:"));
   dualPrint.println(F("    0 Generic     no special identity, universal"));
   dualPrint.println(F("    1 USBCD2/TEAC INQUIRY: TEAC CD-56E  [BROKEN: needs INT 13h]"));
-  dualPrint.println(F("    2 ESPUSB/Pan  INQUIRY: MATSHITA CR-572  [recommended for audio]"));
+  dualPrint.println(F("    2 ESPUSBCD/Pan  INQUIRY: MATSHITA CR-572  [recommended for audio]"));
   dualPrint.println(F("    3 DI1000DD    INQUIRY: generic  [data only, no audio]"));
-  dualPrint.println(F("  DOS driver 2 (ESPUSB) notes:"));
+  dualPrint.println(F("  DOS driver 2 (ESPUSBCD) notes:"));
   dualPrint.println(F("    USBASPI: usbaspi2.sys (Novac) or usbaspi1.sys (Panasonic v2.20)"));
-  dualPrint.println(F("    ESPUSB communicates via SCSIMGR$ DOS device (INT 21h IOCTL)"));
-  dualPrint.println(F("    ESPUSB scans ASPI target IDs: 0x18, 0x08, 0x10"));
-  dualPrint.println(F("    CDPlayer.exe works with espusb.sys (sf3 IOCTL OUT fix included)"));
+  dualPrint.println(F("    ESPUSBCD communicates via SCSIMGR$ DOS device (INT 21h IOCTL)"));
+  dualPrint.println(F("    ESPUSBCD scans ASPI target IDs: 0x18, 0x08, 0x10"));
+  dualPrint.println(F("    CDPlayer.exe works with ESPUSBCD.SYS (sf3 IOCTL OUT fix included)"));
   dualPrint.println(F("    Use CDP.COM if cdplayer.exe still fails"));
   dualPrint.println(F("  DOS driver 3 (DI1000DD) notes:"));
   dualPrint.println(F("    USBASPI: usbaspi1.sys (Panasonic v2.20)  assigns ID 0"));

@@ -20,7 +20,7 @@ Usage:
   python3 build_exfat_libs.py --dry-run           # show what would be done
   python3 build_exfat_libs.py --skip-usbmsc       # skip USBMSC patch
 
-Note: USBMSC.cpp patch (CD-ROM + Audio SCSI v13) is now integrated.
+Note: USBMSC.cpp patch (CD-ROM + Audio SCSI v14) is now integrated.
 """
 
 import os, sys, re, shutil, subprocess, glob, argparse
@@ -299,12 +299,12 @@ if args.test:
             check(f"USBMSC: {name}", passed)
 
         any_cdrom = any(p for _, p in checks_usbmsc)
-        is_v10 = "patched v13" in content.lower() or "patched v10" in content.lower() or "scsi_audio_play" in content
+        is_v10 = "patched v14" in content.lower() or "patched v10" in content.lower() or "scsi_audio_play" in content
         if is_v10:
-            check("USBMSC: CD-ROM + Audio SCSI patch v13", True)
+            check("USBMSC: CD-ROM + Audio SCSI patch v14", True)
         elif any_cdrom:
             check("USBMSC: CD-ROM patch applied (older version)", True,
-                  "-> Re-run build_exfat_libs.py --restore then --skip-full-build to upgrade to v13")
+                  "-> Re-run build_exfat_libs.py --restore then --skip-full-build to upgrade to v14")
         else:
             check("USBMSC: CD-ROM patch applied", False,
                   "-> Run build_exfat_libs.py to apply patch")
@@ -450,14 +450,14 @@ def patch_usbmsc(path):
             src = src[:tur_start] + new_tur + src[tur_end:]
             print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION (8-cycle counter)')
 
-    if 'CD-ROM SCSI patched v13' in src:
-        print("  Already patched v13")
+    if 'CD-ROM SCSI patched v14' in src:
+        print("  Already patched v14")
         return True
     # v10/v11 had audio gated on mode-2 only or non-DOS — v12 enables all modes except driver 3.
     # After restore-from-backup above, src is always clean so this only triggers
     # on first-ever run when no .bak exists yet and USBMSC.cpp is already v10-patched.
-    if 'CD-ROM SCSI patched v12' in src or 'CD-ROM SCSI patched v11' in src or 'CD-ROM SCSI patched v10' in src or 'scsi_audio_play' in src:
-        print("  Found older patch (v11/v10) — run --restore first, then --skip-full-build to upgrade to v13")
+    if 'CD-ROM SCSI patched v13' in src or 'CD-ROM SCSI patched v12' in src or 'CD-ROM SCSI patched v11' in src or 'CD-ROM SCSI patched v10' in src or 'scsi_audio_play' in src:
+        print("  Found older patch (v11/v10) — run --restore first, then --skip-full-build to upgrade to v14")
         return False  # cannot safely re-patch without clean original
 
     func_start = src.find('int32_t tud_msc_scsi_cb(')
@@ -511,7 +511,7 @@ def patch_usbmsc(path):
 
     # Switch block inserted inside the function (no extern declarations here)
     inner = (
-        "{ /* CD-ROM SCSI patched v13 */\n"
+        "{ /* CD-ROM SCSI patched v14 */\n"
         "  /* Audio/TOC active for: non-DOS (Windows/Win98/Linux) + DOS drivers 0/1/2. Driver 3 = data-only. */\n"
         "  /* DOS modes 0,1,3: universal handlers only (data access, no audio SCSI commands).             */\n"
         "  /* Universal handlers — all modes (Windows/Mac/Linux/DOS) */\n"
@@ -664,12 +664,18 @@ def patch_usbmsc(path):
         "        memset(buffer,0,actual_resp); uint8_t*b=(uint8_t*)buffer;\n"
         "        uint16_t dl=(uint16_t)(full_resp-2);  /* ALWAYS full length per spec */\n"
         "        bool clipped=(actual_resp<full_resp);\n"
+        "        /* skipData: when buffer too small to fit data+audio+lead-out (< 28 bytes),\n"
+        "         * skip the data track so audio tracks get priority in the small buffer.\n"
+        "         * DOS drivers (USBCD1/ESPUSB) often use a fixed 20-byte buffer and never\n"
+        "         * issue a follow-up request — skipping data track lets MSCDEX see audio.\n"
+        "         * Windows always uses a full-size buffer so skipData is never triggered. */\n"
+        "        bool skipData=(clipped&&hasData&&na>0&&actual_resp<28);\n"
         "        b[0]=dl>>8;b[1]=dl&0xFF;\n"
-        "        b[2]=1;                              /* First Track always = 1 */\n"
-        "        b[3]=(uint8_t)tot;                   /* Last track number */\n"
+        "        b[2]=(skipData)?(uint8_t)fat:1;  /* first track: first audio if skipping data, else 1 */\n"
+        "        b[3]=(uint8_t)tot;               /* last track number always full */\n"
         "        int off=4;\n"
-        "        /* Data track 1 */\n"
-        "        if(hasData&&req_track<=1&&off+8<=actual_resp){\n"
+        "        /* Data track 1 — included unless buffer too small (skipData) */\n"
+        "        if(hasData&&req_track<=1&&!skipData&&off+8<=actual_resp){\n"
 "          b[off+1]=0x14;b[off+2]=1;\n"
 "          if(msf){b[off+5]=0;b[off+6]=2;b[off+7]=0;}\n"
 "          else{b[off+7]=0;}\n"
@@ -1059,7 +1065,7 @@ def patch_usbmsc(path):
         "    }\n"
         "  }\n"
         "  }\n"
-"  /* end CD-ROM SCSI patched v13 */\n"
+"  /* end CD-ROM SCSI patched v14 */\n"
         "  "        "  "
     )
 
@@ -1068,7 +1074,7 @@ def patch_usbmsc(path):
 
     with open(path, 'w', encoding='utf-8') as f:
         f.write(new_src)
-    print("  Patched v13: READ TOC sequential fill, all tracks visible in DOS")
+    print("  Patched v14: READ TOC sequential fill, all tracks visible in DOS")
     return True
 
 
@@ -1199,12 +1205,12 @@ if not sdkconfig_h_files:
 
 # ── USBMSC patch (integrated from patch_usbmsc.py) ──────────────────────────
 if not args.skip_usbmsc:
-    step("Applying USBMSC.cpp CD-ROM + Audio SCSI patch v13")
+    step("Applying USBMSC.cpp CD-ROM + Audio SCSI patch v14")
     if usbmsc.exists():
         if not args.dry_run:
             result = patch_usbmsc(usbmsc)
             if result:
-                ok("USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v13 — non-DOS audio enabled)")
+                ok("USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v14 — non-DOS audio enabled)")
             else:
                 warn("USBMSC.cpp: patch failed or needs --restore first (v10 found without clean backup)")
         else:

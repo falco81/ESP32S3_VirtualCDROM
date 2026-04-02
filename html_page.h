@@ -438,7 +438,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           <select class="cfg-inp" id="cfgDosDriver" onchange="dosDriverChanged()">
             <option value="0">Generic &mdash; any ASPI driver [audio supported]</option>
             <option value="1">USBCD2.SYS &mdash; TEAC CD-56E [BROKEN &ndash; needs INT 13h hook]</option>
-            <option value="2">ESPUSB.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
+            <option value="2">ESPUSBCD.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
             <option value="3">DI1000DD.SYS + usbaspi1.sys &mdash; data only, no audio</option>
           </select>
         </div>
@@ -453,17 +453,17 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.<br>
           <b style="color:#e74c3c">Driver communication is broken:</b> USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) &mdash; standard USBASPI does not provide this hook.<br>
           Audio SCSI commands (READ&nbsp;TOC, PLAY, SUB-CHANNEL) are handled by firmware but unreachable via broken driver.<br>
-          <b>Not recommended</b> &mdash; use Generic or ESPUSB.SYS instead.
+          <b>Not recommended</b> &mdash; use Generic or ESPUSBCD.SYS instead.
         </div>
         <div id="dosDriverNote2" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(52,152,219,.1);border:1px solid rgba(52,152,219,.3);border-radius:4px;padding:8px 12px">
-          &#10003; <b>ESPUSB.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
+          &#10003; <b>ESPUSBCD.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
           Audio: PLAY, STOP, RESUME, READ_SUB-CHANNEL via MSCDEX IOCTL.<br>
           Communicates via <b>SCSIMGR$ DOS device</b> &mdash; works with usbaspi1.sys/usbaspi2.sys.<br>
           <b style="color:#e67e22">CD Player compatibility:</b><br>
           &bull; <b style="color:#e74c3c">cdplayer.exe fails with original USBCD1.SYS:</b> missing IOCTL OUT sf3 &rarr; <code>error 3</code><br>
           &bull; <b style="color:#27ae60">CDP.COM works:</b> tolerates missing sf3, continues to PLAY/STOP/SEEK<br>
-          &bull; <b style="color:#27ae60">espusb.sys:</b> includes sf3 fix + alloc patch &rarr; cdplayer.exe works<br>
-          CONFIG.SYS: <code>usbaspi2.sys /w /v</code> + <code>ESPUSB.SYS /D:USBCD0</code>
+          &bull; <b style="color:#27ae60">ESPUSBCD.SYS:</b> custom DOS driver — full IOCTL audio support, cdplayer.exe works<br>
+          CONFIG.SYS: <code>usbaspi2.sys /w /v</code> + <code>ESPUSBCD.SYS /D:USBCD0</code>
         </div>
         <div id="dosDriverNote3" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
           &#128190; <b>DI1000DD.SYS (NOVAC) + USBASPI 2.20:</b> Data-only USB storage &mdash; <b>no audio</b>.<br>
@@ -1277,7 +1277,7 @@ function loadSysinfo(){
       siRow(sy,'TLS protocol',verNames[s.tlsMinVer||0]||'TLS 1.2 only');
       siRow(sy,'TLS ciphers',cipNames[s.tlsCiphers||0]||'Auto');
     }
-    var dosDriverNames=['Generic','USBCD2.SYS (TEAC CD-56E)','ESPUSB.SYS (Panasonic CR-572)','DI1000DD.SYS (USBASPI 2.20)'];
+    var dosDriverNames=['Generic','USBCD2.SYS (TEAC CD-56E)','ESPUSBCD.SYS (Panasonic CR-572)','DI1000DD.SYS (USBASPI 2.20)'];
     var dosDriverName=dosDriverNames[s.dos_driver||0]||'Generic';
     siRow(sy,'DOS driver',s.dos_compat
       ?'<span style="color:var(--ok)">&#10003; '+dosDriverName+'</span>'
