@@ -27,6 +27,14 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [DOS Compatibility Mode](#dos-compatibility-mode)
 - [DOS / Retro PC Compatibility](#dos--retro-pc-compatibility)
   - [DOS Audio CD Player Compatibility](#dos-audio-cd-player-compatibility)
+- [ESPUSBCD.SYS — Custom DOS CD-ROM Driver](#espusbcdsys--custom-dos-cd-rom-driver)
+  - [Architecture](#architecture)
+  - [DOS CD-ROM Driver Interface](#dos-cd-rom-driver-interface)
+  - [ASPI Interface](#aspi-interface)
+  - [IOCTL Functions Implemented](#ioctl-functions-implemented)
+  - [SCSI Commands Used](#scsi-commands-used)
+  - [Memory Layout](#memory-layout)
+  - [Building from Source](#building-from-source)
 - [Web UI Authentication](#web-ui-authentication)
 - [HTTPS / TLS](#https--tls)
 - [Audio CD Playback](#audio-cd-playback)
@@ -324,7 +332,7 @@ Expected console output:
 >>> Patching sdkconfig.h (5 files)
   + Patched: dio_opi, dio_qspi, opi_opi, qio_opi, qio_qspi
 
->>> Applying USBMSC.cpp CD-ROM + Audio SCSI patch v4
+>>> Applying USBMSC.cpp CD-ROM + Audio SCSI patch v14
   + USBMSC.cpp patched: CD-ROM + Audio SCSI handlers (v4)
 
   RESULT: PASS -- all checks passed (18/18)
@@ -591,10 +599,10 @@ DOS driver mode is only available when DOS Compatibility Mode is enabled. Select
 |---|---|---|---|---|
 | Generic | `0` | ESP32-S3 / Virtual CD-ROM | ✅ Full | Works with any ASPI-compatible driver + MSCDEX |
 | USBCD2/TEAC | `1` | TEAC / CD-56E (SCSI-2) | ✅ Handled | Driver communication broken — USBCD2 uses INT 13h AH=0x50, standard USBASPI does not provide this hook |
-| ESPUSB/Panasonic | `2` | MATSHITA / CD-ROM CR-572 (SCSI-2) | ✅ Full | Requires `usbaspi1.sys` or `usbaspi2.sys` + `espusb.sys` |
+| ESPUSBCD/Panasonic | `2` | MATSHITA / CD-ROM CR-572 (SCSI-2) | ✅ Full | Requires `usbaspi1.sys` or `usbaspi2.sys` + `ESPUSBCD.SYS` (custom driver) |
 | DI1000DD | `3` | ESP32-S3 / Virtual CD-ROM (SCSI-2) | ❌ Data-only | Requires `usbaspi1.sys` (Panasonic v2.20); no MSCDEX audio commands |
 
-Via CLI: `set dos-driver 0` (Generic), `set dos-driver 2` (Panasonic/ESPUSB), etc.
+Via CLI: `set dos-driver 0` (Generic), `set dos-driver 2` (Panasonic/ESPUSBCD), etc.
 
 The web UI respects DOS compat mode: the **Mount** button automatically ejects (`/api/umount`), waits 2.5 s, then mounts the new image (`/api/mount`) — all without a USB disconnect.
 
@@ -630,49 +638,57 @@ The firmware has been tested on a real **DOS / Windows 98SE retro PC** — [DOSR
 
 ### DOS Driver Setup
 
-#### Generic (Driver 0) — recommended starting point
+> **Note:** Sample `CONFIG.SYS` and `AUTOEXEC.BAT` files with correct DOS CRLF line endings are included in the project as ready-to-use templates. All files below assume drivers are stored in `C:\DRIVERS\`.
 
-Add to `CONFIG.SYS`:
+#### ESPUSBCD/Panasonic (Driver 2) — recommended, full audio
+
+**CONFIG.SYS:**
 ```dos
-DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI.EXE /u /w /w
+DEVICE=C:\DRIVERS\USBASPI1.SYS /w /v
+DEVICE=C:\DRIVERS\ESPUSBCD.SYS /D:ESPUSBCD
 ```
 
-Add to `AUTOEXEC.BAT`:
+**AUTOEXEC.BAT:**
 ```dos
-LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:USBCD0 /Q
-```
-
-Set on ESP32: `set dos-compat on` + `set dos-driver 0`
-
-#### ESPUSB/Panasonic (Driver 2) — full audio in DOS
-
-Add to `CONFIG.SYS`:
-```dos
-DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI2.SYS /w /v
-DEVICEHIGH=C:\DRIVERS\USBCD\ESPUSB.SYS /D:USBCD0
-```
-
-Add to `AUTOEXEC.BAT`:
-```dos
-LH C:\DRIVERS\SHSUCDX\SHSUCDX.COM /D:USBCD0 /Q
-; For audio: use CDP.COM (cdplayer.exe requires espusb.sys for IOCTL OUT sf3 support)
+@ECHO OFF
+LH C:\DRIVERS\SHSUCDX.COM /D:ESPUSBCD /Q
 ```
 
 Set on ESP32: `set dos-compat on` + `set dos-driver 2`
 
-#### DI1000DD (Driver 3) — data-only
+This is the recommended configuration. ESPUSBCD.SYS is a custom DOS CD-ROM driver included in the project that provides complete MSCDEX audio and data support — see [ESPUSBCD.SYS — Custom DOS CD-ROM Driver](#espusbcdsys--custom-dos-cd-rom-driver) for full technical details.
 
-Add to `CONFIG.SYS`:
+#### Generic (Driver 0) — alternative identity
+
+**CONFIG.SYS:**
 ```dos
-DEVICEHIGH=C:\DRIVERS\USBCD\USBASPI1.SYS /w /v
-DEVICEHIGH=C:\DRIVERS\USBCD\DI1000DD.SYS
+DEVICE=C:\DRIVERS\USBASPI1.SYS /w /v
+DEVICE=C:\DRIVERS\ESPUSBCD.SYS /D:ESPUSBCD
+```
+
+**AUTOEXEC.BAT:**
+```dos
+@ECHO OFF
+LH C:\DRIVERS\SHSUCDX.COM /D:ESPUSBCD /Q
+```
+
+Set on ESP32: `set dos-compat on` + `set dos-driver 0`
+
+Uses the same ESPUSBCD.SYS driver as mode 2, but the ESP32 presents a generic INQUIRY identity (`ESP32-S3 / Virtual CD-ROM`) instead of the Panasonic identity. Use this if mode 2 causes compatibility issues with specific ASPI managers.
+
+#### DI1000DD (Driver 3) — data-only, no MSCDEX needed
+
+**CONFIG.SYS:**
+```dos
+DEVICE=C:\DRIVERS\USBASPI1.SYS /w /v
+DEVICE=C:\DRIVERS\DI1000DD.SYS
 ```
 
 Set on ESP32: `set dos-compat on` + `set dos-driver 3`
 
-No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively. Data access only — no audio SCSI commands.
+DI1000DD accepts USB device type 0x05 (CD-ROM) natively and presents the disc as a DOS drive letter without MSCDEX. Data access only — no audio SCSI commands supported.
 
-> **Tip**: The ESP32-S3 must be powered and connected **before** the PC boots — USBASPI only scans at init time.
+> **Important:** The ESP32-S3 must be powered and connected **before** the PC boots — USBASPI only scans the USB bus at driver init time during POST.
 
 ### DOS Audio CD Player Compatibility
 
@@ -683,7 +699,7 @@ The firmware has been tested with **CD Player for DOS 2.25e** (by Ben Lunt / For
 - MODE SELECT `15h`/`55h` — sent by CD Player to save volume settings
 - UNIT ATTENTION (`06h/28h`) — for disc detection after swap
 
-Without `MODE SENSE page 0x0E`, CD Player returns **"return error number: 3"** (MSCDEX error 3 = "Unknown command"). This is fixed in patch v8.
+Without `MODE SENSE page 0x0E`, CD Player returns **"return error number: 3"** (MSCDEX error 3 = "Unknown command"). This has been fixed since patch v8 and is present in all current builds (v14).
 
 ### Disc Swap in DOS Without Rebooting
 
@@ -704,6 +720,300 @@ PING -n 4 127.0.0.1 > NUL
 WGET "http://192.168.40.110/api/mount?file=%1" -q -O NUL
 ECHO Disc: %1
 ```
+
+---
+
+## ESPUSBCD.SYS — Custom DOS CD-ROM Driver
+
+`ESPUSBCD.SYS` is a custom DOS CD-ROM character device driver written from scratch in x86 16-bit assembly (NASM) specifically for the ESP32-S3 Virtual CD-ROM project. It replaces the older closed-source `ESPUSB.SYS` and provides complete MSCDEX-compatible audio and data CD-ROM support through the standard DOS ASPI interface.
+
+### Architecture
+
+The DOS CD-ROM software stack with ESPUSBCD.SYS:
+
+```
+DOS application (game, cdplayer.exe, etc.)
+        │  INT 2Fh (MSCDEX API)
+        ▼
+  SHSUCDX.COM / MSCDEX.EXE     ← CD-ROM redirector, file system layer
+        │  DOS IOCTL / device commands (INT 21h)
+        ▼
+  ESPUSBCD.SYS                  ← our driver (character device "ESPUSBCD")
+        │  INT 4Bh (ASPI SendASPICommand, SRB in DS:SI)
+        ▼
+  USBASPI1.SYS / USBASPI2.SYS  ← USB ASPI manager (unchanged, Panasonic)
+        │  USB Bulk-Only Transport (BOT)
+        ▼
+  ESP32-S3 Virtual CD-ROM       ← USB FS device, presents as CD-ROM (device type 05h)
+```
+
+ESPUSBCD.SYS sits between the MSCDEX redirector and the USBASPI transport layer. It translates every MSCDEX IOCTL request into the appropriate SCSI command, sends it via ASPI, and returns the result in the format MSCDEX expects. It does not contain any USB code — that is entirely handled by USBASPI.
+
+### DOS CD-ROM Driver Interface
+
+DOS CD-ROM drivers are character device drivers with a special interface documented in the Microsoft *Hardware-Independent Device Driver Specification for CD-ROM*. The driver presents itself to DOS via a 22-byte device header at offset 0 of the `.SYS` file:
+
+```
+Offset  Size  Content
+0       4     Next driver pointer (FFFF:FFFF = last in chain)
+4       2     Device attributes: 0xC800
+                bit 15 = 1 (character device)
+                bit 14 = 1 (IOCTL supported)
+                bit 11 = 1 (Open/Close/RM supported)
+6       2     Strategy routine offset
+8       2     Interrupt routine offset
+10      8     Device name 'ESPUSBCD' (overridden by /D: switch)
+18      2     Reserved (0)
+20      1     First drive letter (set by DOS)
+21      1     Number of subunits = 1
+```
+
+The device attributes `0xC800` mark the driver as a character device that supports IOCTL and open/close operations. MSCDEX locates the driver by scanning the DOS device chain for a character device whose 8-byte name matches the `/D:` parameter given to MSCDEX/SHSUCDX.
+
+**Request dispatch:** DOS calls the strategy routine (with ES:BX = request header address), then the interrupt routine. The interrupt routine dispatches by command code at offset +2 of the request header:
+
+| Command code | Function |
+|---|---|
+| 0 | INIT — parse switches, probe device, set end-of-resident pointer |
+| 3 | IOCTL INPUT — query drive state, TOC, audio info |
+| 12 | IOCTL OUTPUT — eject, lock, volume control |
+| 13 / 14 | OPEN / CLOSE — acknowledged, no action |
+| 128 / 130 | READ LONG / READ LONG PREFETCH — read data sectors |
+| 131 | SEEK — no-op (seek is instantaneous on virtual drive) |
+| 132 | PLAY AUDIO — play audio tracks by LBA or MSF address |
+| 133 | STOP AUDIO — stop playback |
+| 136 | RESUME AUDIO — resume from pause |
+
+All other command codes return `STAT_DONE | STAT_ERR | ERR_NOCMD` (0x8003).
+
+### ASPI Interface
+
+The driver communicates with the USB device through the DOS ASPI (Advanced SCSI Programming Interface) provided by USBASPI. Every SCSI command goes through a single `do_aspi` subroutine:
+
+```asm
+; Service Request Block layout (Adaptec ASPI for DOS, 74 bytes):
+; Offset  Size  Field
+;  0       1    SRB_Cmd    = 2 (Execute SCSI Command)
+;  1       1    SRB_Status (0=pending, 1=done, 4=error)
+;  2       1    SRB_HaId   (host adapter number, default 0)
+;  3       1    SRB_Flags  (08h=data-in, 10h=data-out, 18h=no data)
+;  4       2    Reserved   (0)
+;  6       1    SRB_Target (SCSI target ID, default 0)
+;  7       1    SRB_Lun    (LUN, default 0)
+;  8       4    SRB_BufLen (data buffer length in bytes)
+; 12       2    SRB_BufPtr offset (far pointer to data buffer)
+; 14       2    SRB_BufPtr segment
+; 16       1    SRB_SenseLen = 14
+; 17       1    SRB_CDBLen   (6 or 10)
+; 18       1    SRB_HaStat   (host adapter status, output)
+; 19       1    SRB_TargStat (target SCSI status, output)
+; 20       4    SRB_PostProc = 0 (synchronous poll mode)
+; 24      20    Reserved
+; 44      16    SRB_CDB      (SCSI Command Descriptor Block)
+; 60      14    SRB_SenseArea (auto request sense data)
+```
+
+Calling convention:
+
+```asm
+; Set DS:SI = address of SRB, then:
+int 4Bh          ; ASPI entry point installed by USBASPI
+
+; Poll SRB_Status with timeout (~500 000 iterations ≈ 5 seconds):
+.poll:
+    mov al, cs:[srb.sts]
+    test al, al
+    jnz .done
+    dec ecx
+    jnz .poll
+    ; timeout → return CF=1
+```
+
+The driver uses **synchronous polling** (`SRB_PostProc = 0`) rather than a callback, which is safe in the single-threaded DOS environment. All ASPI calls return CF=0 on success or CF=1 on error (timeout, host adapter error, or non-zero SCSI target status).
+
+The ASPI target ID and host adapter number default to 0 and can be overridden at load time with `/T:id` and `/H:ha` on the `DEVICE=` line in `CONFIG.SYS`.
+
+### IOCTL Functions Implemented
+
+IOCTL INPUT (command 3) and IOCTL OUTPUT (command 12) carry a data buffer whose first byte is a subfunction code. The driver implements the following subfunctions:
+
+**IOCTL INPUT:**
+
+| SF | Name | Action | SCSI command |
+|---|---|---|---|
+| 0 | Return Audio Channel Info | Returns port select/volume for 4 audio output ports | None (local state) |
+| 1 | Return Drive Head Location | Returns current playback position in LBA or MSF | READ SUB-CHANNEL (42h) |
+| 4 | Audio Status | Queries live playback state (playing/paused/stopped) and audio flags | READ SUB-CHANNEL (42h) |
+| 5 | Return Drive Bytes | Returns 128-byte SCSI INQUIRY response (vendor, product, revision) | INQUIRY (12h) |
+| 6 | Return Device Status | Reports door state, disc presence, audio capability; invalidates TOC and capacity cache on no-disc | TEST UNIT READY (00h) |
+| 9 | Return Volume Size | Returns disc size in 2048-byte logical blocks; result cached after first call | READ CAPACITY (25h) |
+| 10 | Return Audio Disk Info | Returns first track, last track, and lead-out MSF from cached TOC | READ TOC (43h) |
+| 11 | Return Audio Track Info | Returns start address MSF and control byte for a specific track number | READ TOC cache lookup |
+| 12/13 | Return Audio Q-Channel Info | Returns ADR/Control, track, index, absolute M/S/F, relative M/S/F | READ SUB-CHANNEL (42h) |
+
+**IOCTL OUTPUT:**
+
+| SF | Name | Action | SCSI command |
+|---|---|---|---|
+| 0 | Eject | Ejects disc; invalidates TOC and capacity caches | START/STOP UNIT (1Bh) LoEj=1 Start=0 |
+| 1 | Lock/Unlock Door | Prevents or allows medium removal | PREVENT/ALLOW MEDIUM REMOVAL (1Eh) |
+| 2 | Reset Drive | No-op probe | TEST UNIT READY (00h) |
+| 3 | Audio Channel Control | Stores per-port channel routing and volume (reported via SF0) | None (local state only) |
+| 5 | Close Tray | Loads disc | START/STOP UNIT (1Bh) LoEj=1 Start=1 |
+
+### SCSI Commands Used
+
+| Opcode | Command | Use in driver |
+|---|---|---|
+| 00h | TEST UNIT READY (6) | Disc presence check (SF6, INIT probe) |
+| 12h | INQUIRY (6) | Vendor/product strings for SF5 |
+| 1Bh | START/STOP UNIT (6) | Eject (SF0) and load tray (SF5) |
+| 1Eh | PREVENT/ALLOW MEDIUM REMOVAL (6) | Door lock/unlock (IOCTL OUT SF1) |
+| 25h | READ CAPACITY (10) | Disc sector count for SF9 |
+| 28h | READ (10) | Data sector reads — LBA and transfer count in CDB bytes 2–5 and 7–8 in big-endian; buffer is the caller's DOS buffer passed directly (no intermediate copy) |
+| 42h | READ SUB-CHANNEL (10) | Current position (SF1, SF4, SF12); requests MSF format, SubQ=1, format=01h (Current Position); 16-byte response |
+| 43h | READ TOC (10) | Full TOC into 804-byte resident buffer; MSF=1, alloc=804; response parsed for SF10/SF11/find_leadout/find_track |
+| 47h | PLAY AUDIO MSF (10) | Audio playback — CDB bytes 3–5=start M/S/F, bytes 6–8=end M/S/F; used for both PLAY AUDIO (cmd 132) and PLAY AUDIO TRACK INDEX (cmd 134) |
+| 4Bh | PAUSE/RESUME (10) | CDB byte 8 bit 0: 0=pause, 1=resume |
+| 4Eh | STOP PLAY/SCAN (10) | Stop audio (cmd 133) |
+
+**TOC caching:** The 804-byte TOC buffer is read once on first access and reused for all subsequent SF10, SF11, find_leadout, and find_track calls. The cache is invalidated (flag `toc_ok` cleared, `vol_sectors` zeroed) whenever SF6 (device status) detects no disc or when the tray is ejected via IOCTL OUT SF0. This ensures that after a disc swap the new TOC is always read fresh.
+
+**READ LONG addressing:** The driver supports both HSG (High Sierra Group, 0-based LBA) and Red Book (MSF) addressing modes. Red Book sector addresses in the request header follow the MSCDEX specification: the DWORD at offset +20 is stored as `{M, S, F, 00h}` in memory (M at lowest address). LBA is computed as `(M×60+S)×75+F−150`. The resulting LBA is stored big-endian in CDB bytes 2–5 using the x86 `BSWAP` instruction (requires 486+).
+
+**PLAY AUDIO addressing:** The starting sector DWORD for PLAY AUDIO (command 132) in Red Book mode is `{00h, M, S, F}` per the MSCDEX spec (00h at lowest address, M at +1). The end address is computed as start LBA + sector count, then both are converted to MSF for the SCSI PLAY AUDIO MSF command using:
+
+```
+abs = LBA + 150        ; add 2-second pregap offset
+F = abs mod 75
+S = (abs / 75) mod 60
+M = abs / 75 / 60
+```
+
+#### Minimum CPU requirement
+
+The driver uses the `BSWAP` instruction (introduced on the 80486) to convert 32-bit LBA values to big-endian for SCSI CDB construction. Any PC capable of running USBASPI-based USB drivers is at minimum a 486, so this is not a practical restriction.
+
+### Memory Layout
+
+After DOS loads the driver and INIT completes, only the resident section remains in memory. The INIT code, command line parser, and message strings are in a separate area past `end_resident` which DOS reclaims:
+
+```
+Offset 0x0000   Device header (22 bytes)
+Offset 0x0016   Resident variables (disc state, audio state, channel volumes, ASPI params)
+Offset 0x0050   ASPI SRB — 74 bytes (single shared SRB, safe because DOS is single-threaded)
+Offset 0x009A   HA-Inquiry SRB (INIT only, but in resident area for alignment)
+Offset 0x00B4   data_buf — 2048 bytes (SCSI response buffer: INQUIRY, RDCAP, SUB-CHANNEL)
+Offset 0x08B4   toc_buf  — 804 bytes  (READ TOC cache, max 99 tracks + lead-out + header)
+Offset 0x0BD8   end_resident ← DOS reclaims everything above this
+─────────────────────────────────────────────────────────────────
+Resident footprint: 3032 bytes (~3 KB) in conventional memory
+
+Offset 0x0BD8   _strategy, _interrupt, all command handlers, SCSI helpers, TOC/MSF utils
+Offset ~0x16xx  INIT (cmd_init, parse_cmdline, print_msg, strings)
+─────────────────────────────────────────────────────────────────
+Total .SYS file: ~5700 bytes
+```
+
+The data_buf and toc_buf are the largest consumers. The 2048-byte data_buf is used for all SCSI responses except READ LONG, where the application's own buffer is passed directly to ASPI as the DMA target (avoiding a second copy entirely).
+
+### Building from Source
+
+The pre-built `ESPUSBCD.SYS` is included in the project release and is ready to use without building. Building from source is only necessary if you modify `espusbcd.asm`.
+
+#### Requirements
+
+NASM 2.14 or newer. Install in the same AlmaLinux/WSL environment used for `build_exfat_libs.py`:
+
+```bash
+sudo dnf install -y nasm    # AlmaLinux / RHEL / Fedora
+sudo apt install -y nasm    # Ubuntu / Debian
+```
+
+Verify:
+```bash
+nasm --version
+# NASM version 2.16.x
+```
+
+#### Build command
+
+One command, no Makefile needed:
+
+```bash
+nasm -f bin -o ESPUSBCD.SYS espusbcd.asm
+```
+
+| Flag | Meaning |
+|---|---|
+| `-f bin` | Raw binary output — no ELF or COFF header, exactly what DOS expects for a `.SYS` device driver |
+| `-o ESPUSBCD.SYS` | Output filename |
+| `espusbcd.asm` | Source file |
+
+Expected result:
+
+```
+(no output = success)
+$ ls -l ESPUSBCD.SYS
+-rw-r--r-- 1 user user 5737 ... ESPUSBCD.SYS
+```
+
+#### Copy to DOS machine
+
+Place `ESPUSBCD.SYS` on the DOS machine alongside `USBASPI1.SYS` or `USBASPI2.SYS`, for example in `C:\DRIVERS\USBCD\`.
+
+#### Build script
+
+The project includes `build_espusbcd.py` which automates the build and verifies the output:
+
+```bash
+python3 build_espusbcd.py                          # build in current directory
+python3 build_espusbcd.py --install-nasm           # install NASM automatically then build
+python3 build_espusbcd.py --src /path/espusbcd.asm --out /path/ESPUSBCD.SYS
+python3 build_espusbcd.py --verify ESPUSBCD.SYS    # verify existing .SYS without rebuilding
+```
+
+The script:
+1. Locates NASM in PATH (optionally installs it via `dnf` or `apt` with `--install-nasm`)
+2. Checks NASM version is ≥ 2.14
+3. Runs `nasm -f bin`
+4. Verifies the compiled binary by parsing the DOS device driver header and checking all six fields (next-driver pointer, device attributes `0xC800`, strategy/interrupt offsets within file bounds, device name `ESPUSBCD`, subunit count = 1)
+5. Prints the exact `CONFIG.SYS` and `AUTOEXEC.BAT` lines needed
+
+Example output on success:
+
+```
+============================================================
+  Building ESPUSBCD.SYS
+============================================================
+  [OK]  Source: espusbcd.asm
+  [OK]  NASM 2.16 at /usr/bin/nasm
+  ...   Compiling: nasm -f bin -o ESPUSBCD.SYS espusbcd.asm
+  [OK]  Compiled: ESPUSBCD.SYS  (5737 bytes)
+
+  ...   Verifying device driver header...
+  [OK]  Next driver = 0xFFFFFFFF  (end of chain ✓)
+  [OK]  Attributes  = 0xC800  (char device | IOCTL | Open/Close ✓)
+  [OK]  Strategy offset = 0x0BD8  (within file ✓)
+  [OK]  Interrupt offset = 0x0BE3  (within file ✓)
+  [OK]  Device name = 'ESPUSBCD'  ✓
+  [OK]  Subunits    = 1  ✓
+  [OK]  All 6/6 header checks passed.
+
+============================================================
+  BUILD SUCCESSFUL
+============================================================
+
+  ESPUSBCD.SYS is ready.
+
+  Copy to DOS machine and add to CONFIG.SYS:
+    DEVICE=ESPUSBCD.SYS /D:ESPUSBCD
+
+  Add to AUTOEXEC.BAT:
+    LH SHSUCDX.COM /D:ESPUSBCD /Q
+```
+
+The driver uses the `BSWAP` instruction (introduced on the 80486) to convert 32-bit LBA values to big-endian for SCSI CDB construction. Any PC capable of running USBASPI-based USB drivers is at minimum a 486, so this is not a practical restriction.
 
 ---
 
@@ -821,7 +1131,7 @@ Red Book audio sectors are **raw 16-bit signed stereo PCM, little-endian, 44100 
 | Non-DOS (Windows, Windows 98, Linux) | ✅ Full |
 | DOS compat, driver 0 Generic | ✅ Full |
 | DOS compat, driver 1 USBCD2/TEAC | ✅ SCSI handled (driver communication broken via INT 13h) |
-| DOS compat, driver 2 ESPUSB/Panasonic | ✅ Full |
+| DOS compat, driver 2 ESPUSBCD/Panasonic | ✅ Full |
 | DOS compat, driver 3 DI1000DD | ❌ Data-only by design |
 
 ### Virtual Disc Layout (CUE/BIN)
@@ -1026,10 +1336,10 @@ python3 build_exfat_libs.py --restore
 python3 build_exfat_libs.py --skip-full-build
 ```
 
-**Current patch version: v13.** The patch modifies `tud_msc_scsi_cb` in `USBMSC.cpp` to inject:
+**Current patch version: v14.** The patch modifies `tud_msc_scsi_cb` in `USBMSC.cpp` to inject:
 - Full CD-ROM SCSI command set (READ TOC, PLAY AUDIO, READ SUB-CHANNEL, START/STOP, …)
 - Audio and TOC SCSI commands active for: non-DOS mode (Windows/Linux) and DOS drivers 0, 1, 2; driver 3 (DI1000DD) receives universal handlers only (data-only)
-- READ TOC response fills tracks sequentially from Track 1 regardless of allocation length; `Data Length` always reflects the full TOC size so the OS can issue a correctly-sized follow-up request and see all tracks
+- READ TOC response fills tracks sequentially from Track 1; for small-buffer DOS drivers (alloc < 28 bytes) the data track is skipped so audio tracks are prioritised — `Data Length` always reflects the full TOC size so the OS can request all tracks with a follow-up call
 - MODE SENSE pages `0x0D`, `0x0E`, `0x2A` (6-byte and 10-byte variants) — required by DOS audio players and Windows
 - MODE SELECT `15h`/`55h` — accepted without error
 - UNIT ATTENTION (`06h/28h`) via a 3-cycle counter — persists across multiple OS poll cycles to ensure reliable disc-change detection
@@ -1041,6 +1351,10 @@ Always run `--restore` before `--skip-full-build` to avoid double-patching.
 ### `patch_usbmsc.py` (Windows)
 
 A standalone backup script included for reference. Not used in the standard workflow — `build_exfat_libs.py` handles the USBMSC patch as part of the exFAT build.
+
+### `build_espusbcd.py` (WSL/Linux or any Python 3)
+
+Build script for the ESPUSBCD.SYS DOS CD-ROM driver. Locates or installs NASM, compiles `espusbcd.asm`, and verifies the resulting binary. See [Building from Source](#building-from-source) for full usage.
 
 ---
 
@@ -1102,7 +1416,7 @@ A standalone backup script included for reference. Not used in the standard work
 
 - The **right** USB connector must be plugged in (OTG, not UART)
 - Tools -> USB Mode: **USB-OTG (TinyUSB)** (not Hardware CDC)
-- Verify `build_exfat_libs.py` completed — USBMSC patch v13 must be applied
+- Verify `build_exfat_libs.py` completed — USBMSC patch v14 must be applied
 - Delete the build cache and re-upload firmware after patching
 - Try `umount` then `mount` from the serial CLI
 
@@ -1171,7 +1485,7 @@ This replaces the USB re-enumeration with a UNIT ATTENTION signal so MSCDEX/USBA
 
 ### DOS CD player shows only one audio track
 
-This is caused by an older USBMSC patch (v12 or earlier). The READ TOC handler previously used a `skipData` optimisation that caused MSCDEX to receive only one audio track when it issued its first TOC request with a small allocation length. The patch now always fills tracks sequentially from Track 1 and always sets `Data Length` to the full TOC size, so MSCDEX correctly issues a second request and sees all tracks.
+This is caused by an older USBMSC patch (v13 or earlier). The READ TOC handler in older versions did not correctly handle the small allocation length used by DOS drivers such as USBCD1 — MSCDEX received only one audio track on the first TOC request. Since v14 the patch skips the data track when the allocation length is too small (< 28 bytes) so audio tracks are prioritised, and `Data Length` always reflects the full TOC. With ESPUSBCD.SYS this issue does not occur because the driver uses a full 804-byte TOC buffer.
 
 Re-apply the patch:
 ```bash
@@ -1330,9 +1644,14 @@ Upload the folder as a `.zip` file attached to the GitHub Release.
 | `ESP32S3_VirtualCDROM.ino` | Main firmware (Arduino C++) |
 | `html_page.h` | Web interface as an inline C string |
 | `partitions.csv` | Custom partition table (6 MB app) |
-| `build_exfat_libs.py` | exFAT + USBMSC patch script -- run in WSL |
-| `patch_usbmsc.py` | Standalone USBMSC patch -- run on Windows |
-| `flash_windows.bat` | Windows flash script -- double-click to flash |
+| `build_exfat_libs.py` | exFAT + USBMSC patch script — run in WSL (current patch: v14) |
+| `patch_usbmsc.py` | Standalone USBMSC patch — run on Windows (backup/reference only) |
+| `espusbcd.asm` | ESPUSBCD.SYS source — x86 16-bit NASM assembly |
+| `build_espusbcd.py` | Build script for ESPUSBCD.SYS — compiles and verifies the driver |
+| `ESPUSBCD.SYS` | Pre-built DOS CD-ROM driver binary (ready to use, 5737 bytes) |
+| `CONFIG.SYS` | Sample DOS CONFIG.SYS with correct CRLF line endings |
+| `AUTOEXEC.BAT` | Sample DOS AUTOEXEC.BAT with correct CRLF line endings |
+| `flash_windows.bat` | Windows flash script — double-click to flash |
 | `flash_linux.sh` | Linux/macOS flash script |
 | `doc/arduino_ide_settings.png` | Arduino IDE settings screenshot |
 | `doc/esp32s3.png` | ESP32-S3 DevKitC-1 board photo |
