@@ -495,42 +495,130 @@ Available at `http://cd.local` or via the device IP address.
 
 ## Serial CLI
 
-Connect any serial terminal at **115 200 baud, 8N1**.
+Connect any serial terminal at **115 200 baud, 8N1, no flow control** to the UART USB connector (left port, labelled UART/COM). Every command is plain text followed by Enter. Commands are case-insensitive.
+
+### General Commands
 
 | Command | Description |
 |---|---|
-| `help` | Command list (sections: 802.1x / Web Auth / Commands) |
-| `show config` | Full configuration + runtime state |
-| `status` | Current Wi-Fi, SD, disc image, audio state |
-| `show files [path]` | Recursive SD card listing |
-| `mount <file>` | Mount ISO/BIN/CUE |
-| `umount` | Eject current disc |
-| `sd reinit` | Reinitialize SD card |
-| `wifi reconnect` | Disconnect and reconnect Wi-Fi |
-| `reboot` | Restart device |
-| `clear config` | Factory reset (erases all NVS settings) |
+| `help` | Print all commands grouped by category |
+| `show config` | Full configuration dump: all `set` keys, runtime state, Wi-Fi, audio, DOS |
+| `status` | Short status: Wi-Fi connection, IP, SD card, current disc image, audio state |
+| `show files [path]` | Recursive SD card listing. Omit path for root. Example: `show files /Earth` |
+| `reboot` | Restart the device |
+| `clear config` | Factory reset: erase all NVS settings and reboot. Restores all defaults. |
 
-**`set` commands:**
+### Disc Management
 
-| Key | Description |
+| Command | Description |
 |---|---|
-| `ssid` | Wi-Fi network name |
-| `pass` | WPA2-Personal password |
-| `dhcp on/off` | Enable/disable DHCP |
-| `ip / mask / gw / dns` | Static network settings |
-| `hostname` | Hostname or FQDN |
-| `eap-mode 0/1/2` | 0=off, 1=PEAP, 2=EAP-TLS |
-| `eap-id / eap-user / eap-pass` | EAP credentials |
-| `eap-ca / eap-cert / eap-key` | Paths to certificates on SD card |
-| `eap-kpass` | Passphrase for an encrypted private key |
-| `audio-module on/off` | PCM5102 I2S audio module (takes effect immediately, no reboot required) |
-| `dos-compat on/off` | DOS compatibility mode — no USB re-enum on mount; automatically set when a DOS driver is selected; disabling resets driver to 0 (default: off) |
-| `dos-driver 0/1/2/3` | DOS CD-ROM driver identity (requires dos-compat on; see DOS Compatibility Mode) |
-| `web-auth on/off` | HTTP Basic Auth (default: off) |
-| `web-user <name>` | Web UI username (default: admin) |
-| `web-pass <password>` | Web UI password (default: admin) |
+| `mount <path>` | Mount a disc image. Absolute path on SD card. Supports `.iso`, `.bin`, `.cue`. Example: `mount /games/TombRaider.cue` |
+| `umount` | Eject the currently mounted disc. Signals no-media to the host. |
+| `sd reinit` | Reinitialize the SD card driver without rebooting. Use if the card was hot-swapped or the SD bus reports errors. |
 
----
+### Wi-Fi Commands
+
+| Command | Description |
+|---|---|
+| `wifi reconnect` | Disconnect from Wi-Fi and reconnect with current settings. |
+| `wifi scan` | Scan for nearby networks and print SSID, BSSID, RSSI, channel, security. |
+
+### `set` — Configuration Keys
+
+All `set` commands save the value to NVS immediately. Most take effect after `reboot`; exceptions are noted.
+
+#### Wi-Fi / Network
+
+| Command | Default | Notes |
+|---|---|---|
+| `set ssid <name>` | *(empty)* | Wi-Fi network name. Apply with `wifi reconnect`. |
+| `set pass <password>` | *(empty)* | WPA2-Personal password. Apply with `wifi reconnect`. |
+| `set dhcp on\|off` | `on` | DHCP client. When `off`, static IP settings are used. |
+| `set ip <a.b.c.d>` | `0.0.0.0` | Static IP address. Requires `set dhcp off`. |
+| `set mask <a.b.c.d>` | `255.255.255.0` | Subnet mask. Requires `set dhcp off`. |
+| `set gw <a.b.c.d>` | `0.0.0.0` | Default gateway. Requires `set dhcp off`. |
+| `set dns <a.b.c.d>` | `8.8.8.8` | DNS server. Requires `set dhcp off`. |
+| `set hostname <name>` | `espcd` | Hostname for DHCP and mDNS (`hostname.local`). A FQDN like `cd.corp.net` also registers `cd.local`. |
+
+#### 802.1x Enterprise Wi-Fi
+
+| Command | Default | Notes |
+|---|---|---|
+| `set eap-mode 0\|1\|2` | `0` | `0` = WPA2-Personal, `1` = PEAP, `2` = EAP-TLS |
+| `set eap-id <identity>` | *(empty)* | Outer EAP identity, e.g. `user@corp.net`. In EAP-TLS mode the CN from the certificate is used if empty. |
+| `set eap-user <username>` | *(empty)* | Inner PEAP username (PEAP only). |
+| `set eap-pass <password>` | *(empty)* | Inner PEAP password (PEAP only). |
+| `set eap-ca <path>` | *(empty)* | Path to CA certificate on SD card, e.g. `/wifi/ca.pem`. PEM format. |
+| `set eap-cert <path>` | *(empty)* | Path to client certificate (EAP-TLS only). PEM, RSA 2048 or 4096. |
+| `set eap-key <path>` | *(empty)* | Path to client private key (EAP-TLS only). PEM, PKCS#1 or PKCS#8. |
+| `set eap-kpass <passphrase>` | *(empty)* | Passphrase for encrypted private key. Leave empty if key is unencrypted. |
+
+#### Audio Module
+
+| Command | Default | Notes |
+|---|---|---|
+| `set audio-module on\|off` | `off` | Enable or disable the GY-PCM5102 I2S DAC. Takes effect **immediately** without reboot. GPIO 14=BCK, 15=WS, 16=DIN. |
+| `set audio-volume 0-100` | `80` | Playback volume percentage. Takes effect immediately. |
+
+#### DOS Compatibility
+
+| Command | Default | Notes |
+|---|---|---|
+| `set dos-compat on\|off` | `off` | DOS compatibility mode. When `on`, disc swaps use UNIT ATTENTION instead of USB re-enumeration. Automatically enabled when `dos-driver` is set to 1, 2, or 3. Disabling resets `dos-driver` to 0. |
+| `set dos-driver 0\|1\|2\|3` | `0` | SCSI INQUIRY identity for DOS. Setting any non-zero value automatically enables `dos-compat`. See [DOS Compatibility Mode](#dos-compatibility-mode). |
+
+#### Web UI Security
+
+| Command | Default | Notes |
+|---|---|---|
+| `set web-auth on\|off` | `off` | Enable HTTP Basic Authentication. Takes effect immediately. |
+| `set web-user <username>` | `admin` | Web UI username. Takes effect immediately. |
+| `set web-pass <password>` | `admin` | Web UI password. Write-only. Takes effect immediately. |
+
+#### HTTPS / TLS
+
+| Command | Default | Notes |
+|---|---|---|
+| `set https-enable on\|off` | `off` | Enable HTTPS on port 443. HTTP on port 80 redirects to HTTPS. Requires reboot. |
+| `set https-cert <path>` | *(empty)* | Path to TLS server certificate, e.g. `/certs/server.crt`. PEM, RSA 2048-bit. |
+| `set https-key <path>` | *(empty)* | Path to TLS private key, e.g. `/certs/server.key`. PEM format. |
+
+### Typical Workflows
+
+**Initial setup:**
+```
+set ssid MyNetwork
+set pass MyPassword
+wifi reconnect
+status
+```
+
+**Mount a disc image:**
+```
+mount /games/Tomb_Raider.cue
+status
+```
+
+**Enable DOS compat with ESPUSBCD.SYS (driver 2):**
+```
+set dos-compat on
+set dos-driver 2
+reboot
+```
+
+**Enable HTTPS:**
+```
+set https-enable on
+set https-cert /certs/server.crt
+set https-key /certs/server.key
+reboot
+```
+
+**Factory reset:**
+```
+clear config
+```
+
 
 ## Wi-Fi Configuration
 
@@ -638,7 +726,7 @@ The firmware has been tested on a real **DOS / Windows 98SE retro PC** — [DOSR
 
 ### DOS Driver Setup
 
-> **Note:** Sample `CONFIG.SYS` and `AUTOEXEC.BAT` files with correct DOS CRLF line endings are included in the project as ready-to-use templates. All files below assume drivers are stored in `C:\DRIVERS\`.
+> **Note:** Ready-to-use `CONFIG.SYS` and `AUTOEXEC.BAT` files with correct DOS CRLF line endings are in the project `driver/` folder. All paths below assume drivers are stored in `C:\DRIVERS\`.
 
 #### ESPUSBCD/Panasonic (Driver 2) — recommended, full audio
 
@@ -919,7 +1007,7 @@ The data_buf and toc_buf are the largest consumers. The 2048-byte data_buf is us
 
 ### Building from Source
 
-The pre-built `ESPUSBCD.SYS` is included in the project release and is ready to use without building. Building from source is only necessary if you modify `espusbcd.asm`.
+The pre-built `ESPUSBCD.SYS` can be built from source using NASM — the source file is in the `driver/` folder of the project. Building from source is only necessary if you modify `espusbcd.asm`.
 
 #### Requirements
 
@@ -941,6 +1029,7 @@ nasm --version
 One command, no Makefile needed:
 
 ```bash
+cd driver
 nasm -f bin -o ESPUSBCD.SYS espusbcd.asm
 ```
 
@@ -960,16 +1049,17 @@ $ ls -l ESPUSBCD.SYS
 
 #### Copy to DOS machine
 
-Place `ESPUSBCD.SYS` on the DOS machine alongside `USBASPI1.SYS` or `USBASPI2.SYS`, for example in `C:\DRIVERS\USBCD\`.
+Place `ESPUSBCD.SYS` on the DOS machine alongside `USBASPI1.SYS` or `USBASPI2.SYS`, for example in `C:\DRIVERS\`. The `driver/CONFIG.SYS` and `driver/AUTOEXEC.BAT` files in the project are ready-made templates with correct DOS CRLF line endings.
 
 #### Build script
 
-The project includes `build_espusbcd.py` which automates the build and verifies the output:
+The project includes `driver/build_espusbcd.py` which automates the build and verifies the output:
 
 ```bash
+cd driver
 python3 build_espusbcd.py                          # build in current directory
 python3 build_espusbcd.py --install-nasm           # install NASM automatically then build
-python3 build_espusbcd.py --src /path/espusbcd.asm --out /path/ESPUSBCD.SYS
+python3 build_espusbcd.py --src espusbcd.asm --out ESPUSBCD.SYS
 python3 build_espusbcd.py --verify ESPUSBCD.SYS    # verify existing .SYS without rebuilding
 ```
 
@@ -1352,44 +1442,269 @@ Always run `--restore` before `--skip-full-build` to avoid double-patching.
 
 A standalone backup script included for reference. Not used in the standard workflow — `build_exfat_libs.py` handles the USBMSC patch as part of the exFAT build.
 
-### `build_espusbcd.py` (WSL/Linux or any Python 3)
+### `driver/build_espusbcd.py`
 
-Build script for the ESPUSBCD.SYS DOS CD-ROM driver. Locates or installs NASM, compiles `espusbcd.asm`, and verifies the resulting binary. See [Building from Source](#building-from-source) for full usage.
+Build script for the ESPUSBCD.SYS DOS CD-ROM driver. Located in the `driver/` folder alongside `espusbcd.asm`. Locates or installs NASM, compiles `espusbcd.asm`, and verifies the resulting binary. See [Building from Source](#building-from-source) for full usage.
+
+---
 
 ---
 
 ## API Reference
 
-| Endpoint | Description |
-|---|---|
-| `GET /api/sysinfo` | Full device status (JSON) |
-| `GET /api/status` | Mounted image state |
-| `GET /api/mount?file=` | Mount a disc image |
-| `GET /api/umount` | Eject disc |
-| `GET /api/isos` | List disc images on SD card |
-| `GET /api/ls?path=` | Directory listing |
-| `GET /api/config/get` | Read configuration (password omitted) |
-| `GET /api/config/save?key=val` | Save configuration (includes webAuth/webUser/webPass) |
-| `GET /api/wifi/scan` | Scan for Wi-Fi networks |
-| `GET /api/audio/status` | Playback state + track list |
-| `GET /api/audio/play?track=N` | Play track N |
-| `GET /api/audio/play?lba=L&end=E` | Play LBA range |
-| `GET /api/audio/stop` | Stop playback |
-| `GET /api/audio/pause` | Pause playback |
-| `GET /api/audio/resume` | Resume playback |
-| `GET /api/audio/volume?v=0-100` | Set volume |
-| `GET /api/audio/mute` | Toggle mute |
-| `GET /api/audio/seek?track=N&rel=0.0-1.0` | Seek within a track |
-| `GET /api/reboot` | Restart device |
-| `GET /api/factory` | Factory reset |
-| `GET /api/download?path=` | Download file from SD card |
-| `POST /api/upload?path=` | Upload file to SD card |
-| `GET /api/delete?path=` | Delete file |
-| `GET /api/mkdir?path=` | Create folder |
-| `GET /api/sd/unmount` | Safely unmount SD card |
-| `GET /api/sd/mount` | Remount SD card |
+All endpoints are available over HTTP (port 80) or HTTPS (port 443 if enabled). Base URL: `http://espcd.local` or `http://<IP>`. All responses are JSON unless stated otherwise. HTTP Basic Auth applies to all endpoints when `web-auth` is enabled.
 
----
+### Disc Management
+
+#### `GET /api/status`
+
+Returns current disc image state.
+
+```json
+{
+  "mounted": true,
+  "file": "/games/TombRaider.cue",
+  "image": "/games/TombRaider (Track 01).bin",
+  "sectors": 204923,
+  "blockSize": 2048,
+  "rawSectorSize": 2352,
+  "headerOffset": 16,
+  "mediaPresent": true,
+  "dosCompat": true,
+  "dosDriver": 2,
+  "default": "/games/TombRaider.cue"
+}
+```
+
+#### `GET /api/mount?file=<path>`
+
+Mount a disc image. `path` is the absolute path on the SD card.
+
+```
+GET /api/mount?file=/games/Earth.cue
+→ {"ok": true}
+```
+
+#### `GET /api/umount`
+
+Eject the currently mounted disc. Returns `{"ok": true}`.
+
+#### `GET /api/isos`
+
+List all mountable disc images (`.iso`, `.bin`, `.cue`) found recursively on the SD card.
+
+```json
+{
+  "files": [
+    {"name": "Earth.cue",      "path": "/Earth/Earth.cue",      "size": 1022},
+    {"name": "TombRaider.cue", "path": "/games/TombRaider.cue", "size": 3845},
+    {"name": "Hospital.iso",   "path": "/Hospital.iso",         "size": 213073920}
+  ]
+}
+```
+
+#### `GET /api/ls?path=<dir>`
+
+Directory listing for the file manager. `path` defaults to `/`.
+
+```json
+{
+  "path": "/games",
+  "items": [
+    {"name": "TombRaider.cue", "dir": false, "size": 3845},
+    {"name": "assets",         "dir": true,  "size": 0}
+  ]
+}
+```
+
+### Default Image
+
+#### `GET /api/default/set?file=<path>`
+
+Set the default disc image (mounted automatically on every boot).
+
+```
+GET /api/default/set?file=/games/TombRaider.cue
+→ {"ok": true}
+```
+
+#### `GET /api/default/clear`
+
+Clear the default — no auto-mount on boot. Returns `{"ok": true}`.
+
+### System
+
+#### `GET /api/sysinfo`
+
+Full device status used by the Status tab in the web UI.
+
+```json
+{
+  "hostname": "espcd",
+  "ip": "192.168.1.42",
+  "mac": "AA:BB:CC:DD:EE:FF",
+  "mdns": "espcd.local",
+  "fqdn": "espcd.local",
+  "wifi": {"connected": true, "ssid": "MyNetwork", "rssi": -62, "channel": 6},
+  "sd":   {"ready": true, "type": "exFAT", "sizeMB": 14900, "usedMB": 3200},
+  "disc": {"mounted": true, "file": "/games/TombRaider.cue", "sectors": 204923},
+  "audio":{"moduleEnabled": true, "state": "playing", "track": 2, "volume": 80},
+  "dosCompat": true, "dosDriver": 2,
+  "uptime": 3742, "freeHeap": 184320, "exfat": true
+}
+```
+
+#### `GET /api/reboot`
+
+Reboot immediately. Returns `{"ok": true}` before restarting.
+
+#### `GET /api/factory`
+
+Factory reset: erase all NVS settings and reboot. Returns `{"ok": true}`.
+
+#### `GET /api/wifi/scan`
+
+Scan for Wi-Fi networks (~2 second blocking scan).
+
+```json
+{
+  "networks": [
+    {"ssid": "MyNetwork", "bssid": "AA:BB:CC:DD:EE:FF", "rssi": -58, "channel": 6,  "auth": "WPA2"},
+    {"ssid": "Corp-5GHz",  "bssid": "11:22:33:44:55:66", "rssi": -71, "channel": 36, "auth": "WPA2-EAP"}
+  ]
+}
+```
+
+### Configuration
+
+#### `GET /api/config/get`
+
+Read all configuration keys. Password fields (`pass`, `eap-pass`, `web-pass`, `eap-kpass`) are always returned as empty strings — they are never echoed back.
+
+```json
+{
+  "ssid": "MyNetwork", "pass": "", "dhcp": "on",
+  "ip": "0.0.0.0", "mask": "255.255.255.0", "gw": "0.0.0.0", "dns": "8.8.8.8",
+  "hostname": "espcd",
+  "eap-mode": "0", "eap-id": "", "eap-user": "", "eap-pass": "",
+  "eap-ca": "", "eap-cert": "", "eap-key": "", "eap-kpass": "",
+  "audio-module": "off",
+  "dos-compat": "on", "dos-driver": "2",
+  "web-auth": "off", "web-user": "admin", "web-pass": "",
+  "https-enable": "off", "https-cert": "", "https-key": ""
+}
+```
+
+#### `GET /api/config/save?<key>=<value>[&<key>=<value>...]`
+
+Save one or more configuration keys to NVS. Multiple keys can be set in a single request. Returns `{"ok": true}` or `{"error": "..."}`.
+
+```
+GET /api/config/save?dos-compat=on&dos-driver=2
+GET /api/config/save?ssid=MyNetwork&pass=secret&dhcp=on
+GET /api/config/save?web-auth=on&web-user=admin&web-pass=newpassword
+GET /api/config/save?https-enable=on&https-cert=/certs/server.crt&https-key=/certs/server.key
+```
+
+Keys that take effect immediately without reboot: `web-auth`, `web-user`, `web-pass`, `audio-module`. All other keys require a reboot.
+
+### Audio
+
+All audio endpoints require a CUE image with audio tracks to be mounted and the audio module to be enabled.
+
+#### `GET /api/audio/status`
+
+Returns full audio state. Polled by the web UI every 400 ms when the Audio tab is open, every 2 s in background.
+
+```json
+{
+  "state": "playing",
+  "track": 2,
+  "trackCount": 9,
+  "positionSec": 47,
+  "durationSec": 286,
+  "volume": 80,
+  "muted": false,
+  "tracks": [
+    {"number": 2, "title": "Track 02", "durationSec": 286, "startLba": 204923},
+    {"number": 3, "title": "Track 03", "durationSec": 174, "startLba": 226384}
+  ]
+}
+```
+
+`state` is one of: `"stopped"`, `"playing"`, `"paused"`.
+
+#### `GET /api/audio/play?track=<N>`
+
+Start playback of track number N (track 1 is always the data track; audio tracks start from 2).
+
+#### `GET /api/audio/play?lba=<L>&end=<E>`
+
+Start playback of a specific LBA range. `lba` = start sector, `end` = end sector (exclusive).
+
+```
+GET /api/audio/play?lba=204923&end=226384
+```
+
+#### `GET /api/audio/stop`
+
+Stop playback. Returns `{"ok": true}`.
+
+#### `GET /api/audio/pause`
+
+Pause playback. Returns `{"ok": true}`.
+
+#### `GET /api/audio/resume`
+
+Resume paused playback. Returns `{"ok": true}`.
+
+#### `GET /api/audio/volume?v=<0-100>`
+
+Set playback volume. Takes effect immediately. Returns `{"ok": true, "volume": 75}`.
+
+#### `GET /api/audio/mute`
+
+Toggle mute on/off. Returns `{"ok": true, "muted": true}`.
+
+#### `GET /api/audio/seek?track=<N>&rel=<0.0-1.0>`
+
+Seek within a track. `rel` = 0.0 (start) to 1.0 (end). Returns `{"ok": true}`.
+
+### File Manager
+
+#### `GET /api/download?path=<path>`
+
+Download a file from the SD card. Returns raw file content with `Content-Disposition: attachment`. Large files stream directly without buffering.
+
+#### `POST /api/upload?path=<path>`
+
+Upload a file to the SD card. Send file content as POST body (`Content-Type: application/octet-stream`). Path must include the target filename.
+
+```
+POST /api/upload?path=/games/MyGame.iso
+Content-Type: application/octet-stream
+[binary data]
+→ {"ok": true, "bytes": 481978896}
+```
+
+#### `GET /api/delete?path=<path>`
+
+Delete a file or empty directory. Returns `{"ok": true}`.
+
+#### `GET /api/mkdir?path=<path>`
+
+Create a directory. Returns `{"ok": true}`.
+
+### SD Card
+
+#### `GET /api/sd/unmount`
+
+Safely unmount the SD card so it can be physically removed. Returns `{"ok": true}`.
+
+#### `GET /api/sd/mount`
+
+Remount the SD card after reinsertion. Returns `{"ok": true}`.
+
 
 ## RGB LED Status Codes
 
@@ -1554,7 +1869,7 @@ Arduino IDE creates a `build/` subfolder in the sketch directory. The file you n
 build/esp32.esp32.esp32s3/ESP32S3_VirtualCDROM.ino.merged.bin
 ```
 
-This is a **single merged image** (16 MB) containing the bootloader, partition table, boot stub and firmware at the correct offsets. Rename it to `firmware_merged.bin` for distribution.
+This is a **single merged image** (16 MB) containing the bootloader, partition table, boot stub and firmware at the correct offsets. Rename it to `firmware_merged.bin` for distribution and place it in the project `build/` folder alongside the flash scripts.
 
 > The `merged.bin` is all you need -- no separate bootloader/partitions/boot_app0 files required.
 
@@ -1572,14 +1887,14 @@ The merged image is pre-assembled at the correct internal offsets. Flash it to a
 
 ### Flashing with the Included Scripts
 
-Place `firmware_merged.bin` in the same folder as the flash scripts and run:
+Place `firmware_merged.bin` in the `build/` folder and run:
 
-**Windows** -- double-click `flash_windows.bat`
+**Windows** -- double-click `build\flash_windows.bat`
 
 **Linux / macOS:**
 ```bash
-chmod +x flash_linux.sh
-./flash_linux.sh
+chmod +x build/flash_linux.sh
+./build/flash_linux.sh
 ```
 
 Both scripts automatically install `esptool` via pip if it is not already available.
@@ -1624,15 +1939,16 @@ Add one file: `firmware_merged.bin` at address `0x0000`, then click **START**.
 
 ### GitHub Release Structure
 
-When publishing a release, include:
+The project `build/` folder is structured for direct distribution:
+
 ```
-release/
+build/
 ├── firmware_merged.bin   <- complete firmware image (single file, 16 MB)
 ├── flash_windows.bat     <- Windows flash script (double-click)
 └── flash_linux.sh        <- Linux/macOS flash script
 ```
 
-Upload the folder as a `.zip` file attached to the GitHub Release.
+Upload the `build/` folder contents as a `.zip` file attached to the GitHub Release.
 
 ---
 
@@ -1646,16 +1962,21 @@ Upload the folder as a `.zip` file attached to the GitHub Release.
 | `partitions.csv` | Custom partition table (6 MB app) |
 | `build_exfat_libs.py` | exFAT + USBMSC patch script — run in WSL (current patch: v14) |
 | `patch_usbmsc.py` | Standalone USBMSC patch — run on Windows (backup/reference only) |
-| `espusbcd.asm` | ESPUSBCD.SYS source — x86 16-bit NASM assembly |
-| `build_espusbcd.py` | Build script for ESPUSBCD.SYS — compiles and verifies the driver |
-| `ESPUSBCD.SYS` | Pre-built DOS CD-ROM driver binary (ready to use, 5737 bytes) |
-| `CONFIG.SYS` | Sample DOS CONFIG.SYS with correct CRLF line endings |
-| `AUTOEXEC.BAT` | Sample DOS AUTOEXEC.BAT with correct CRLF line endings |
-| `flash_windows.bat` | Windows flash script — double-click to flash |
-| `flash_linux.sh` | Linux/macOS flash script |
+| `driver/espusbcd.asm` | ESPUSBCD.SYS source — x86 16-bit NASM assembly |
+| `driver/build_espusbcd.py` | Build script for ESPUSBCD.SYS — compiles and verifies the driver |
+| `driver/CONFIG.SYS` | Sample DOS CONFIG.SYS with correct CRLF line endings |
+| `driver/AUTOEXEC.BAT` | Sample DOS AUTOEXEC.BAT with correct CRLF line endings |
+| `driver/espusb.zip` | Legacy ESPUSB.SYS driver archive (reference / older systems) |
+| `build/firmware_merged.bin` | Pre-built firmware image — single 16 MB file for direct flashing |
+| `build/flash_windows.bat` | Windows flash script — double-click to flash |
+| `build/flash_linux.sh` | Linux/macOS flash script |
 | `doc/arduino_ide_settings.png` | Arduino IDE settings screenshot |
 | `doc/esp32s3.png` | ESP32-S3 DevKitC-1 board photo |
 | `doc/GY-PCM5102.png` | GY-PCM5102 I2S module photo |
+| `doc/sd_front.png` | LOLIN MicroSD Shield — front |
+| `doc/sd_back.png` | LOLIN MicroSD Shield — back (pinout) |
 | `doc/wiring.svg` | Wiring diagram |
+
+All `.ino` and `.h` files must be in the same folder. The `driver/` folder contains the DOS driver source and pre-made config files. The `build/` folder contains the pre-built firmware and flash scripts.
 
 All `.ino` and `.h` files must be in the same folder.
