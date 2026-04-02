@@ -303,6 +303,19 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
       <div class="cfg-row"><label class="cfg-lbl">SSID</label><input class="cfg-inp" id="cfgSsid" type="text" placeholder="Network name" autocomplete="off"><span id="cfgSsidHint" style="font-size:.78rem;color:var(--accent);margin-left:4px"></span></div>
       <div class="cfg-row"><label class="cfg-lbl">Password</label><input class="cfg-inp" id="cfgPass" type="password" placeholder="Leave empty to keep current" autocomplete="new-password"></div>
+      <div class="cfg-row" style="margin-top:8px">
+        <label class="cfg-lbl">TX power</label>
+        <select class="cfg-inp" id="cfgWifiTxPower" style="width:100%">
+          <option value="8">2 dBm &mdash; minimum</option>
+          <option value="20">5 dBm</option>
+          <option value="40">10 dBm &mdash; default</option>
+          <option value="60">15 dBm</option>
+          <option value="80">20 dBm &mdash; maximum (ESP32-S3 factory)</option>
+        </select>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:4px">
+        &#9432; Applied immediately without reboot. Lower power reduces RF coupling into PCM5102 analog output. Default is 10 dBm.
+      </div>
     </div>
 
     <!-- Network: DHCP / Static IP -->
@@ -621,6 +634,10 @@ var curTab=0;
 //  AUDIO PLAYER
 // ══════════════════════════════════════════════════════
 var apState=0, apTrack=0, apTracks=[], apPollTimer=null, apVolume=80, apMuted=false;
+// apPendingTrack: track the user just clicked — held for up to 1.5 s while the firmware
+// is still reporting the old track.  Prevents apLoad() from clobbering the optimistic
+// highlight with stale server data and makes the UI feel instant.
+var apPendingTrack=0, apPendingTime=0;
 
 function apFmt(m,s,f){return m+':'+(s<10?'0':'')+s;}
 function apSectToMs(sects){var t=Math.floor(sects/75);return apFmt(Math.floor(t/60),t%60,0);}
@@ -662,9 +679,16 @@ function apLoad(status){
 
   // Current track info
   var sub=status.sub||{};
-  var curTrk=apTracks.find(function(t){return t.num===sub.track;});
+
+  // Pending-track guard: if the user clicked a track recently and the server hasn't
+  // caught up yet, keep the optimistic highlight instead of reverting to the old track.
+  var pendingActive = apPendingTrack>0 && (Date.now()-apPendingTime)<1500;
+  if(pendingActive && sub.track===apPendingTrack){ apPendingTrack=0; pendingActive=false; }
+  var displayTrack = pendingActive ? apPendingTrack : sub.track;
+
+  var curTrk=apTracks.find(function(t){return t.num===displayTrack;});
   if(curTrk){
-    apTrack=curTrk.num;
+    if(!pendingActive) apTrack=curTrk.num;  // don't clobber apTrack while pending
     $('apTrackName').textContent='Track '+curTrk.num+'  '+curTrk.title;
     $('apTimeRel').textContent=apFmt(sub.relM,sub.relS,sub.relF);
     $('apTimeAbs').textContent=apFmt(sub.absM,sub.absS,sub.absF);
@@ -694,10 +718,10 @@ function apLoad(status){
       tl.appendChild(row);
     });
   }
-  // Highlight current track row
+  // Highlight current track row (use displayTrack so pending clicks stay highlighted)
   apTracks.forEach(function(t){
     var row=$('aptr'+t.num);
-    if(row) row.classList.toggle('playing', t.num===sub.track&&apState>0);
+    if(row) row.classList.toggle('playing', t.num===displayTrack&&apState>0);
   });
 }
 
@@ -733,6 +757,23 @@ function apBgPoll(){
 }
 
 function apPlayTrack(n){
+  // Optimistic UI: highlight immediately, keep for up to 1.5 s
+  // even if the server still reports the old track during the switch.
+  apPendingTrack=n; apPendingTime=Date.now();
+  // Optimistic UI update — highlight immediately so user gets instant feedback.
+  // Without this the 400ms background poll returns stale state and the row
+  // appears unresponsive, causing users to click repeatedly.
+  apTrack=n;
+  apTracks.forEach(function(t){
+    var row=$('aptr'+t.num);
+    if(row) row.classList.toggle('playing', t.num===n);
+  });
+  $('apProgFill').style.width='0%';
+  $('apStateBadge').textContent='PLAYING';
+  $('apStateBadge').style.background='#e94560';
+  $('apStateBadge').style.color='#fff';
+  var trk=apTracks.find(function(t){return t.num===n;});
+  if(trk){ $('apTrackName').textContent='Track '+trk.num+'  '+trk.title; $('apTimeTotal').textContent=apSectToMs(trk.len); }
   fetch('/api/audio/play?track='+n).then(function(){apPoll();});
 }
 function apPlayPause(){
@@ -767,11 +808,14 @@ function apSeek(evt){
   if(rel<0)rel=0;if(rel>1)rel=1;
   var t=apTracks.find(function(t){return t.num===apTrack;})||apTracks[0];
   if(!t) return;
-  fetch('/api/audio/seek?track='+t.num+'&rel='+rel.toFixed(4));
+  // Optimistic progress bar update
+  $('apProgFill').style.width=(rel*100).toFixed(1)+'%';
+  // seek API now calls audioPlay() internally — works from stopped/paused/playing
+  fetch('/api/audio/seek?track='+t.num+'&rel='+rel.toFixed(4)).then(function(){apPoll();});
 }
 function apSeekRel(rel){
   var t=apTracks.find(function(t){return t.num===apTrack;})||apTracks[0];
-  if(t) fetch('/api/audio/seek?track='+t.num+'&rel='+rel);
+  if(t) fetch('/api/audio/seek?track='+t.num+'&rel='+rel).then(function(){apPoll();});
 }
 
 function dosCompatChanged(){
@@ -1090,6 +1134,7 @@ function cfgLoad(){
     $('cfgEapKey')._savedVal  = c.eapKeyPath  || '';
     $('cfgEapKPass').value = '';  // never pre-fill password
     $('cfgAudioModule').value = c.audioModule ? '1' : '0';
+    var txpEl=$('cfgWifiTxPower'); if(txpEl) txpEl.value=c.wifiTxPower||40;
     var ddEl=$('cfgDosDriver'); if(ddEl) ddEl.value=c.dosDriver||0;
     $('cfgDosCompat').value = c.dosCompat ? '1' : '0'; dosCompatChanged();
     var heEl=$('cfgHttpsEnabled'); if(heEl){heEl.value=c.httpsEnabled?'1':'0'; httpsToggle();}
@@ -1138,6 +1183,7 @@ function cfgSave(){
   var hps=$('cfgHttpsPort'); if(hps) params.set('httpsPort',hps.value);
   var tv=$('cfgTlsMinVer'); if(tv) params.set('tlsMinVer',tv.value);
   var tc=$('cfgTlsCiphers'); if(tc) params.set('tlsCiphers',tc.value);
+  var txp=$('cfgWifiTxPower'); if(txp) params.set('wifiTxPower',txp.value);
   params.set('webAuth',$('cfgWebAuth').value);
   if($('cfgWebUser').value.trim()) params.set('webUser',$('cfgWebUser').value.trim());
   if($('cfgWebPass').value.trim()) params.set('webPass',$('cfgWebPass').value.trim());
@@ -1210,6 +1256,7 @@ function loadSysinfo(){
       siRow(tw,'SSID',s.wifi_ssid);
       siRow(tw,'Band / Channel',(s.wifi_band||'?')+' &nbsp;·&nbsp; Ch '+s.wifi_channel);
       siRow(tw,'Signal',s.wifi_quality+' ('+s.wifi_rssi+' dBm)'+rssiBar(s.wifi_rssi),qcls);
+      siRow(tw,'TX power',s.wifi_tx_power+' dBm');
       siRow(tw,'IP address',s.wifi_ip);
       siRow(tw,'Subnet mask',s.wifi_mask);
       siRow(tw,'Gateway',s.wifi_gw);

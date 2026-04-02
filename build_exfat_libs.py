@@ -506,6 +506,7 @@ def patch_usbmsc(path):
         "extern bool     scsi_get_dos_compat();\n"
         "extern uint8_t  scsi_first_audio_track();\n"
         "extern bool     scsi_has_data_track();\n"
+        "extern void     scsi_dae_read(uint32_t lba, uint32_t count);\n"
         "/* end audio bridge */\n\n"
     )
 
@@ -808,6 +809,28 @@ def patch_usbmsc(path):
         "      }\n"
         "      case 0x4B:{if(scsi_cmd[8]&1){scsi_log(\"[SCSI] RESUME\\n\");scsi_audio_resume();}else{scsi_log(\"[SCSI] PAUSE\\n\");scsi_audio_pause();}return 0;}\n"
         "      case 0x4E:{scsi_log(\"[SCSI] STOP\\n\");scsi_audio_stop();return 0;}\n"
+        "      case 0xBE:{ /* READ CD (MMC-3) — Windows Digital Audio Extraction (DAE)   */\n"
+        "        /* CDB: byte[1]=sector type, bytes[2-5]=LBA, bytes[6-8]=transfer length */\n"
+        "        uint32_t lba=((uint32_t)scsi_cmd[2]<<24)|((uint32_t)scsi_cmd[3]<<16)|\n"
+        "                     ((uint32_t)scsi_cmd[4]<<8)|scsi_cmd[5];\n"
+        "        uint32_t cnt=((uint32_t)scsi_cmd[6]<<16)|((uint32_t)scsi_cmd[7]<<8)|scsi_cmd[8];\n"
+        "        if(cnt==0) return 0;\n"
+        "        { char _dc[72];\n"
+        "          snprintf(_dc,sizeof(_dc),\"[SCSI] READ_CD lba=%lu cnt=%lu buf=%u\\n\",\n"
+        "            (unsigned long)lba,(unsigned long)cnt,(unsigned)bufsize);\n"
+        "          scsi_log(_dc); }\n"
+        "        /* Notify DAE bridge: sequential reads start PCM5102 playback in sync.  */\n"
+        "        /* In DOS compat mode scsi_dae_read() is a no-op (guard inside .ino).   */\n"
+        "        scsi_dae_read(lba,cnt);\n"
+        "        /* Return zeros so Windows gets a valid response and keeps tracking time.*/\n"
+        "        /* If TinyUSB buffer is smaller than needed, return ILLEGAL REQUEST      */\n"
+        "        /* instead of a short transfer which would cause Windows to reset USB.   */\n"
+        "        uint32_t needed=cnt*2352;\n"
+        "        if((uint32_t)bufsize<needed){\n"
+        "          scsi_log(\"[SCSI] READ_CD: buf too small, returning err\\n\");\n"
+        "          return setSense(0x05,0x20,0x00);}\n"
+        "        memset(buffer,0,needed);\n"
+        "        return(int32_t)needed;}\n"
         "      case 0x46:{if(bufsize>=8){memset(buffer,0,8);((uint8_t*)buffer)[3]=4;((uint8_t*)buffer)[7]=8;return 8;}break;}\n"
         "      case 0xA9:{ /* PLAY AUDIO TRACK RELATIVE(12) per SCSI-2 Table 245 */\n"
         "        /* bytes 2-5: TRLBA (signed), bytes 6-9: transferLen, byte 10: startTrack */\n"
@@ -1110,6 +1133,27 @@ if patched_count == 0:
 # ── Delete fatfs cache and recompile fatfs only ──────────────────────────────
 step("Recompiling fatfs target only (~10 seconds)")
 
+# ── PATCH defconfig: enable CONFIG_I2S_ISR_IRAM_SAFE ─────────────────────────
+# By default the I2S interrupt handler lives in flash cache.
+# When SDMMC DMA reads audio data, it can momentarily disable the flash cache,
+# deferring the I2S EOF interrupt → DMA descriptor not updated in time → audio
+# glitch / crackling.  Setting CONFIG_I2S_ISR_IRAM_SAFE=y moves the I2S ISR to
+# IRAM so it always runs regardless of flash cache state — same fix Espressif
+# recommends in their I2S docs for real-time audio applications.
+defconfig_paths = list(BUILDER_DIR.rglob("defconfig.common")) + \
+                  list(BUILDER_DIR.rglob("defconfig.esp32s3"))
+for dc in defconfig_paths:
+    if ".bak" in str(dc): continue
+    txt = dc.read_text(errors="replace")
+    if "CONFIG_I2S_ISR_IRAM_SAFE" in txt:
+        ok(f"CONFIG_I2S_ISR_IRAM_SAFE already in {dc.name}")
+    else:
+        bak = Path(str(dc) + ".bak")
+        if not bak.exists(): shutil.copy2(str(dc), str(bak))
+        if not args.dry_run:
+            dc.write_text(txt + "\nCONFIG_I2S_ISR_IRAM_SAFE=y\n", encoding="utf-8")
+        ok(f"Patched {dc.name}: added CONFIG_I2S_ISR_IRAM_SAFE=y (I2S ISR in IRAM — fixes SD crackling)")
+
 fatfs_cache = BUILDER_DIR / "build" / "esp-idf" / "fatfs"
 if fatfs_cache.exists() and not args.dry_run:
     shutil.rmtree(str(fatfs_cache))
@@ -1123,6 +1167,32 @@ if not args.dry_run:
     )
     run(full_cmd, cwd=str(BUILDER_DIR))
     ok("fatfs compiled")
+
+# ── Recompile I2S driver (for CONFIG_I2S_ISR_IRAM_SAFE) ──────────────────────
+step("Recompiling I2S driver (CONFIG_I2S_ISR_IRAM_SAFE — I2S ISR in IRAM)")
+
+i2s_targets = [
+    "esp-idf/esp_driver_i2s/libesp_driver_i2s.a",  # ESP-IDF 5.x
+    "esp-idf/driver/libdriver.a",                    # ESP-IDF 4.x fallback
+]
+if not args.dry_run:
+    for tgt in i2s_targets:
+        # Delete cache so ninja forces recompile
+        tgt_dir = BUILDER_DIR / "build" / Path(tgt).parent
+        if tgt_dir.exists():
+            shutil.rmtree(str(tgt_dir))
+            ok(f"Deleted I2S cache: {tgt_dir.name}")
+        i2s_cmd = (
+            f"bash -c 'source esp-idf/export.sh 2>/dev/null "
+            f"&& cd build "
+            f"&& ninja {tgt}'"
+        )
+        r = subprocess.run(i2s_cmd, shell=True, cwd=str(BUILDER_DIR))
+        if r.returncode == 0:
+            ok(f"I2S driver compiled: {Path(tgt).name}")
+            break
+        else:
+            warn(f"Target not found: {tgt} — trying next")
 
 # ── Verify exFAT in new libfatfs.a ───────────────────────────────────────────
 step("Verifying exFAT symbols in new libfatfs.a")
@@ -1155,6 +1225,38 @@ if not args.dry_run:
     shutil.copy2(str(build_lib), str(lib_file))
     ok(f"Installed: {lib_file}")
 
+# ── Install I2S driver library to Arduino15 ───────────────────────────────────
+step("Installing I2S driver library to Arduino15 (CONFIG_I2S_ISR_IRAM_SAFE)")
+
+i2s_build_candidates = [
+    BUILDER_DIR / "build" / "esp-idf" / "esp_driver_i2s" / "libesp_driver_i2s.a",
+    BUILDER_DIR / "build" / "esp-idf" / "driver" / "libdriver.a",
+]
+i2s_installed = False
+for i2s_build_lib in i2s_build_candidates:
+    if not i2s_build_lib.exists():
+        continue
+    # Find corresponding installed library in Arduino15
+    i2s_name = i2s_build_lib.name
+    installed_matches = list(libs_dir.rglob(i2s_name))
+    if not installed_matches:
+        warn(f"No installed {i2s_name} found in Arduino15 — skipping")
+        continue
+    for dst in installed_matches:
+        if ".bak" in str(dst): continue
+        bak = Path(str(dst) + ".bak")
+        if not bak.exists():
+            shutil.copy2(str(dst), str(bak))
+            ok(f"Backup: {bak.name}")
+        if not args.dry_run:
+            shutil.copy2(str(i2s_build_lib), str(dst))
+            ok(f"Installed I2S driver: {dst}")
+        i2s_installed = True
+    break
+
+if not i2s_installed:
+    warn("I2S driver library not found in build output — CONFIG_I2S_ISR_IRAM_SAFE will apply on next full build.sh run")
+
 # ── Patch installed ffconf.h ─────────────────────────────────────────────────
 step("Patching installed ffconf.h in Arduino15")
 
@@ -1186,8 +1288,13 @@ for sdk_h in sdkconfig_h_files:
     try:
         txt = sdk_h.read_text(encoding="utf-8", errors="ignore")
     except: continue
-    if "#define CONFIG_FATFS_EXFAT_SUPPORT 1" in txt:
-        ok(f"Already has exFAT define: {sdk_h.name}"); continue
+    needs_patch = False
+    if "#define CONFIG_FATFS_EXFAT_SUPPORT 1" not in txt:
+        needs_patch = True
+    if "#define CONFIG_I2S_ISR_IRAM_SAFE 1" not in txt:
+        needs_patch = True
+    if not needs_patch:
+        ok(f"Already has exFAT + I2S_ISR_IRAM_SAFE defines: {sdk_h.name}"); continue
     bak = Path(str(sdk_h) + ".bak")
     if not bak.exists(): shutil.copy2(str(sdk_h), str(bak))
     new_txt = _re.sub(r"#define\s+CONFIG_FATFS_EXFAT_SUPPORT\s+\S+",
@@ -1196,9 +1303,14 @@ for sdk_h in sdkconfig_h_files:
         idx = txt.rfind("#endif")
         ins = "\n#define CONFIG_FATFS_EXFAT_SUPPORT 1\n\n"
         new_txt = (txt[:idx] + ins + txt[idx:]) if idx >= 0 else txt + ins
+    # Add I2S ISR IRAM-safe define (fixes I2S interrupt deferred when cache disabled)
+    if "#define CONFIG_I2S_ISR_IRAM_SAFE" not in new_txt:
+        idx2 = new_txt.rfind("#endif")
+        ins2 = "\n/* I2S ISR in IRAM: interrupt runs even when flash cache is disabled (SD/PSRAM access) */\n#define CONFIG_I2S_ISR_IRAM_SAFE 1\n\n"
+        new_txt = (new_txt[:idx2] + ins2 + new_txt[idx2:]) if idx2 >= 0 else new_txt + ins2
     if not args.dry_run:
         sdk_h.write_text(new_txt, encoding="utf-8")
-    ok(f"Patched sdkconfig.h: {sdk_h}")
+    ok(f"Patched sdkconfig.h: {sdk_h} (exFAT + I2S_ISR_IRAM_SAFE)")
     patched_sdk += 1
 if not sdkconfig_h_files:
     warn("sdkconfig.h not found in libs_dir")

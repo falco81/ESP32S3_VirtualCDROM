@@ -97,10 +97,17 @@ enum AudioPlayState { AUDIO_STOP = 0, AUDIO_PLAY = 1, AUDIO_PAUSE = 2 };
 volatile AudioPlayState audioState     = AUDIO_STOP;
 volatile uint32_t       audioCurrentLba = 0;   // current playback position
 volatile uint32_t       audioEndLba     = 0;   // stop when reaching this LBA
+// Sequence counter: incremented by audioPlay() on every new play command.
+// The audio task captures mySeq at the start of each batch; if audioPlaySeq
+// changes mid-batch the task aborts the current write loop immediately and
+// re-reads audioCurrentLba (which points to the new position).  This replaces
+// the old vTaskDelay(5ms) hack which was far too short to interrupt a 49 ms SD read.
+volatile uint32_t       audioPlaySeq    = 0;
 static  TaskHandle_t      audioTaskHandle = nullptr;
 static volatile i2s_chan_handle_t i2sTx   = nullptr;  // volatile: written from core 1, read from core 0
 static volatile int             audioVolume = 80;      // volatile: written from core 1, read from core 0
 static volatile bool            audioMuted  = false;   // volatile: written from core 1, read from core 0
+static volatile bool            audioCloseFile = false; // set by doUmount → task closes BIN handle
 
 // ── Sub-channel data (updated by audio task, read by SCSI READ SUB-CHANNEL) ──
 // MSF = Minutes:Seconds:Frames  (1 frame = 1 sector = 1/75 s)
@@ -160,6 +167,10 @@ struct Config {
   uint16_t httpsPort;          // HTTPS server port (default 443)
   uint8_t  tlsMinVer;          // 0=TLS1.2  1=TLS1.2+1.3
   uint8_t  tlsCiphers;         // 0=Auto 1=Strong(GCM) 2=Medium(CBC) 3=All
+  // WiFi TX power — units are 0.25 dBm (ESP-IDF convention).
+  // Lower power = less RF interference into PCM5102 analog section.
+  // 8=2dBm  20=5dBm  40=10dBm  60=15dBm  80=20dBm
+  uint8_t  wifiTxPower;        // default 40 = 10 dBm
 };
 Config cfg;
 
@@ -198,6 +209,7 @@ void loadConfig() {
   cfg.httpsPort = (uint16_t)prefs.getUInt("httpsPort", 443);
   cfg.tlsMinVer = (uint8_t) prefs.getUInt("tlsMinVer", 0);
   cfg.tlsCiphers= (uint8_t) prefs.getUInt("tlsCiphers",0);
+  cfg.wifiTxPower = (uint8_t)constrain((int)prefs.getUChar("wifiTxPow", 40), 8, 80);
   cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
   strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
   strlcpy(cfg.httpsKeyPath,  prefs.getString("httpsKey",  "").c_str(), sizeof(cfg.httpsKeyPath));
@@ -239,6 +251,7 @@ void saveConfig() {
   prefs.putUInt("httpsPort",  cfg.httpsPort ? cfg.httpsPort : 443);
   prefs.putUInt("tlsMinVer",  cfg.tlsMinVer);
   prefs.putUInt("tlsCiphers", cfg.tlsCiphers);
+  prefs.putUChar("wifiTxPow", cfg.wifiTxPower);
   prefs.putBool("httpsEnabled", cfg.httpsEnabled);
   prefs.putString("httpsCert", cfg.httpsCertPath);
   prefs.putString("httpsKey",  cfg.httpsKeyPath);
@@ -349,6 +362,7 @@ void clearConfig() {
   cfg.httpsPort  = 443;
   cfg.tlsMinVer  = 0;
   cfg.tlsCiphers = 0;
+  cfg.wifiTxPower = 40;  // 10 dBm default — reduces RF→PCM5102 interference
   defaultMount = "";
   dualPrint.println(F("[OK]  All NVS configuration cleared."));
 }
@@ -389,13 +403,13 @@ bool initSD() {
 #endif
   SD_MMC.setPins(SD_SCK_PIN, SD_MOSI_PIN, SD_MISO_PIN);
   pinMode(SD_CS_PIN, INPUT_PULLUP);
-  if (SD_MMC.begin("/sdcard", true, false, 40000000)) {  // 40 MHz clock
+  if (SD_MMC.begin("/sdcard", true, false, 40000000)) {  // 40 MHz — maximum for reliable CD-ROM data reads
     uint8_t t = SD_MMC.cardType();
     const char* tn = t==CARD_MMC?"MMC":t==CARD_SD?"SD":t==CARD_SDHC?"SDHC/SDXC":"UNKNOWN";
     uint64_t mb = SD_MMC.cardSize() / (1024*1024);
     uint64_t freeMb = (SD_MMC.totalBytes()-SD_MMC.usedBytes()) / (1024*1024);
     uint64_t totalMb = SD_MMC.totalBytes() / (1024*1024);
-    dualPrint.printf("[SD]   OK  Type: %-10s  Size: %llu MB\n", tn, mb);
+    dualPrint.printf("[SD]   OK  Type: %-10s  Size: %llu MB  CLK: 40 MHz\n", tn, mb);
     dualPrint.printf("[SD]   Used: %llu MB  Free: %llu MB  Total: %llu MB\n",
                   totalMb - freeMb, freeMb, totalMb);
     return true;
@@ -883,6 +897,8 @@ bool doMount(const String &filename) {
 
 void doUmount() {
   audioStop();
+  audioCloseFile = true;   // signal audio task to close its open BIN file handle
+  vTaskDelay(pdMS_TO_TICKS(30)); // wait one audio task tick (20ms) for the close to happen
   mscMediaPresent = false;
   closeIso();
   mountedFile = ""; mountedBlocks = 0;
@@ -1077,17 +1093,53 @@ void initI2S() {
     dualPrint.println(F("[I2S]  Audio module disabled — I2S not initialized."));
     return;
   }
+  // PCM5102A SCK (system clock) pin fix:
+  // In 3-wire I2S mode (no MCLK), PCM5102 requires SCK to be held LOW for
+  // ≥16 LRCK periods so its internal PLL can start.  A floating SCK pin is
+  // picked up as noise, causing PCM5102 to periodically detect/lose an
+  // "external clock" signal → PLL instability → soft-mute → audible crackling.
+  //
+  // Hardware fix (preferred): solder the SCK bridge on the GY-PCM5102 module,
+  // or connect the SCK pin to GND with a wire.
+  //
+  // Software fix (backup): drive the MCLK GPIO LOW as an output so the SCK
+  // line is actively held at GND even if the hardware bridge is missing.
+  // GPIO 7 is the MCLK pin defined in our I2S config.
+#ifndef I2S_MCLK_PIN
+#define I2S_MCLK_PIN 7   // connected to PCM5102 SCK — hold LOW for 3-wire PLL mode
+#endif
+  gpio_config_t sck_cfg = {};
+  sck_cfg.pin_bit_mask = (1ULL << I2S_MCLK_PIN);
+  sck_cfg.mode         = GPIO_MODE_OUTPUT;
+  sck_cfg.pull_down_en = GPIO_PULLDOWN_ENABLE;
+  sck_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+  sck_cfg.intr_type    = GPIO_INTR_DISABLE;
+  gpio_config(&sck_cfg);
+  gpio_set_level((gpio_num_t)I2S_MCLK_PIN, 0);  // SCK = LOW → internal PLL mode
+  dualPrint.printf("[I2S]  SCK (GPIO%d) held LOW — PCM5102 internal PLL mode\n", I2S_MCLK_PIN);
+  dualPrint.println(F("[I2S]  Hardware fix: solder SCK bridge on module or wire SCK pin to GND"));
   i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
   chan_cfg.auto_clear    = true;   // output silence when DMA buffer drains (pause/stop)
-  chan_cfg.dma_desc_num  = 8;      // 8 DMA descriptors
-  chan_cfg.dma_frame_num = 1024;   // 8 × 1024 frames × 4 bytes = 32 KB ≈ 185 ms buffer
-                                   // absorbs worst-case SD card read latency without underrun
-  // Use local non-volatile temp — i2s_new_channel requires i2s_chan_handle_t* (non-volatile)
+  chan_cfg.dma_desc_num  = 8;
+  // Try 131KB DMA buffer (743ms) to absorb exFAT cluster-boundary SD latency spikes.
+  // Fall back to 65KB (371ms) or 32KB (185ms) if heap is insufficient.
+  chan_cfg.dma_frame_num = 4096;
   i2s_chan_handle_t txTmp = nullptr;
   if (i2s_new_channel(&chan_cfg, &txTmp, nullptr) != ESP_OK) {
-    dualPrint.println(F("[I2S]  Failed to create channel!")); return;
+    chan_cfg.dma_frame_num = 2048;
+    if (i2s_new_channel(&chan_cfg, &txTmp, nullptr) != ESP_OK) {
+      chan_cfg.dma_frame_num = 1024;
+      if (i2s_new_channel(&chan_cfg, &txTmp, nullptr) != ESP_OK) {
+        dualPrint.println(F("[I2S]  Failed to create channel!")); return;
+      }
+    }
   }
+  uint32_t dmaBufMs = (chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 4 * 1000UL) / 176400UL;
+  dualPrint.printf("[I2S]  DMA buffer: %u KB = %u ms\n",
+                   chan_cfg.dma_desc_num * chan_cfg.dma_frame_num * 4 / 1024, dmaBufMs);
   i2s_std_config_t std_cfg = {
+    // ESP32-S3 has no APLL — use default PLL_160M clock source.
+    // The driver uses fractional dividers to approximate 44100 Hz with < 0.1% error.
     .clk_cfg  = I2S_STD_CLK_DEFAULT_CONFIG(44100),
     .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
@@ -1108,6 +1160,11 @@ void initI2S() {
   dualPrint.printf("[I2S]  Ready — BCK=%d WS=%d DATA=%d\n",
                 I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
   dualPrint.println(F("[I2S]  XSMT must be HIGH (3V3) — if no audio, check XSMT pin or H3L bridge on module."));
+#ifdef CONFIG_I2S_ISR_IRAM_SAFE
+  dualPrint.println(F("[I2S]  CONFIG_I2S_ISR_IRAM_SAFE=y — ISR in IRAM, patch applied correctly."));
+#else
+  dualPrint.println(F("[I2S]  CONFIG_I2S_ISR_IRAM_SAFE=n — ISR in flash cache (run build_exfat_libs.py to fix)."));
+#endif
 }
 
 // ── Audio playback FreeRTOS task ────────────────────────────────
@@ -1115,23 +1172,74 @@ void initI2S() {
 // and writes all 2352 bytes to the I2S DMA buffer.
 // Red Book audio sectors contain raw 16-bit stereo PCM with NO header —
 // all 2352 bytes are usable audio data (588 stereo samples × 4 bytes each).
-#define AUDIO_BUF_SECTORS 8   // 8 × 2352 = 18 816 B ≈ 106 ms — larger batch reduces SD seek overhead
-static uint8_t audioBuf[2352 * AUDIO_BUF_SECTORS];
+// AUDIO_BUF_SECTORS = 32 = LCM(2352, 512) / 2352 = 75264 / 2352.
+// FatFs has an internal 512-byte sector buffer that tracks how many bytes of the
+// current SD sector have been consumed.  After reading N × 2352 bytes, the buffer
+// state is (N × 2352) mod 512.  This state repeats with period 32 audio sectors
+// (= 147 SD sectors = 75264 bytes = LCM(2352,512)).
+// With AUDIO_BUF_SECTORS < 32, the internal buffer state changes on each batch,
+// and at every 32nd sector the state transitions from non-zero to zero — causing
+// a brief FatFs timing irregularity that manifests as a periodic phase-jump crackle
+// audible roughly every 430 ms.
+// Reading exactly 32 sectors per batch guarantees the buffer state is always 0
+// (SD-sector aligned) after every read, eliminating the periodic irregularity.
+// 32 × 2352 = 75264 bytes ≈ 426 ms of audio.
+//
+// DMA bus contention fix:
+// audioBuf is allocated in PSRAM (if available).  When the SDMMC driver sees a
+// buffer that is not DMA-capable (PSRAM is not), it automatically uses an internal
+// 512-byte SRAM bounce buffer and copies sector-by-sector.  This means each
+// SDMMC DMA transaction is only 512 bytes (~0.05 ms at 10 MB/s) instead of
+// 75 264 bytes (~7.5 ms).  The short transactions leave the AHB bus available
+// for I2S DMA refills every 1.45 ms, eliminating the bus-contention crackle.
+// If PSRAM is not present the buffer falls back to internal SRAM.
+#define AUDIO_BUF_SECTORS 32
+static uint8_t* audioBuf = nullptr;   // allocated in PSRAM in audioTask (see below)
+
+// Runtime-adjustable batch size (1–32). Change via "set audio-sectors <n>".
+// Diagnostic: if crackling disappears at n=1, the issue is in batch/FatFs boundary handling.
+static volatile int audioReadSectors = AUDIO_BUF_SECTORS;
+
+// Static volume-scaling buffer — kept out of audioTask stack (2352 B on stack was too large)
+static int16_t audioScaled[2352 / 2];
 
 static void audioTask(void* arg) {
+  // Allocate SD read buffer in PSRAM — forces SDMMC driver to use 512-byte
+  // bounce buffers on AHB, reducing each DMA burst from ~7.5 ms to ~0.05 ms.
+  // This prevents SDMMC DMA from starving I2S DMA (which needs AHB every 1.45 ms).
+  if (!audioBuf) {
+    audioBuf = (uint8_t*)heap_caps_malloc(2352 * AUDIO_BUF_SECTORS,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (audioBuf)
+      dualPrint.println(F("[AUDIO] audioBuf → PSRAM (SDMMC bounce-buffer mode, min AHB contention)"));
+    else {
+      audioBuf = (uint8_t*)heap_caps_malloc(2352 * AUDIO_BUF_SECTORS,
+                                            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      dualPrint.println(audioBuf
+        ? F("[AUDIO] audioBuf → SRAM (PSRAM not available)")
+        : F("[AUDIO] ERROR: audioBuf alloc failed — no audio!"));
+    }
+  }
+
   File audioFile;
   String openedFile;
 
   while (true) {
-    // Wait if not playing — close file only on STOP, keep it open during PAUSE
-    // (closing on PAUSE forces reopen+seek on resume → DMA underrun → crackling)
+    // If buffer allocation failed, nothing we can do — just idle.
+    if (!audioBuf) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    // Wait if not playing.
+    // Do NOT close the file on STOP — rapid Stop/Play cycles (e.g. Tomb Raider audio loops)
+    // would force an expensive file reopen+seek on every cycle, draining the DMA buffer
+    // and causing crackling.  The file is only closed when we need to switch to a
+    // different BIN file (handled below by the openedFile != trk->binFile check).
     if (audioState != AUDIO_PLAY) {
-      if (audioState == AUDIO_STOP && audioFile) { audioFile.close(); openedFile = ""; }
+      if (audioCloseFile && audioFile) { audioFile.close(); openedFile = ""; audioCloseFile = false; }
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
 
     uint32_t lba = audioCurrentLba;
+    uint32_t mySeq = audioPlaySeq;   // capture: if this changes, our batch is stale
 
     // Find which audio track this LBA belongs to
     AudioTrack* trk = nullptr;
@@ -1184,21 +1292,23 @@ static void audioTask(void* arg) {
       }
     }
 
-    // Seek to LBA position in the BIN file using fileSectorBase:
-    //   single-BIN:   fileSectorBase = absolute BIN sector (= startLba), so
-    //                 fileSector = fileSectorBase + (lba - startLba) = lba  → correct absolute seek
-    //   separate-BIN: fileSectorBase = pregapSectors within track file, so
-    //                 fileSector = pregap + (lba - virtualStartLba)          → correct relative seek
+    // Seek to LBA position in the BIN file using fileSectorBase.
+    // OPTIMISATION: skip the seek when file position already matches expected offset
+    // (sequential reads). This avoids FatFs FAT-chain traversal at every cluster
+    // boundary (~every 0.74 s for 128 KB exFAT clusters) which is the main cause
+    // of ~1-second periodic crackling.
     uint64_t fileSector = (uint64_t)trk->fileSectorBase + (lba - trk->startLba);
     uint64_t fileOffset = fileSector * 2352;
-    if (!audioFile.seek(fileOffset)) {
-      audioState = AUDIO_STOP;
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
+    if ((uint64_t)audioFile.position() != fileOffset) {
+      if (!audioFile.seek(fileOffset)) {
+        audioState = AUDIO_STOP;
+        vTaskDelay(pdMS_TO_TICKS(10));
+        continue;
+      }
     }
 
     // Stream sectors in chunks — clamp to track boundary AND end LBA
-    int sectorsToRead = AUDIO_BUF_SECTORS;
+    int sectorsToRead = audioReadSectors;  // runtime-adjustable (default=32, see "set audio-sectors")
     uint32_t remaining = (audioEndLba > lba) ? (audioEndLba - lba) : 0;
     if (remaining == 0) { audioState = AUDIO_STOP; continue; }
     if ((uint32_t)sectorsToRead > remaining) sectorsToRead = (int)remaining;
@@ -1207,7 +1317,21 @@ static void audioTask(void* arg) {
     if ((uint32_t)sectorsToRead > trackRemaining) sectorsToRead = (int)trackRemaining;
     if (sectorsToRead <= 0) { audioCurrentLba++; continue; } // advance past boundary
 
+    // ── Diagnostic: measure SD read time ──────────────────────────────────
+    uint32_t sdReadStart = millis();
     int bytesRead = audioFile.read(audioBuf, sectorsToRead * 2352);
+    uint32_t sdReadMs = millis() - sdReadStart;
+    // Expected read time: sectorsToRead*2352 bytes / ~1.4 MB/s ≈ 1.37 ms/sector.
+    // Alert when the read took noticeably longer — any spike here is a direct DMA
+    // underrun risk.  Use an absolute 25 ms slack to avoid false positives on
+    // scheduler jitter; the important thing is catching spikes >50 ms.
+    {
+      uint32_t expectedMs = (uint32_t)sectorsToRead * 2352 / 1400; // 1400 KB/s lower bound
+      if (sdReadMs > expectedMs + 10) {
+        dualPrint.printf("[AUDIO] SLOW SD: %lums (exp ~%lums, %d sectors, LBA %lu)\n",
+                         sdReadMs, expectedMs, sectorsToRead, lba);
+      }
+    }
     if (bytesRead <= 0) { audioState = AUDIO_STOP; continue; }
 
     int sectorsGot = bytesRead / 2352;
@@ -1220,7 +1344,7 @@ static void audioTask(void* arg) {
       audioState = AUDIO_STOP;
       continue;
     }
-    for (int s = 0; s < sectorsGot && audioState == AUDIO_PLAY; s++) {
+    for (int s = 0; s < sectorsGot && audioState == AUDIO_PLAY && audioPlaySeq == mySeq; s++) {
       // Red Book audio sectors: 2352 bytes = raw 16-bit stereo PCM, NO header
       uint8_t* pcm    = audioBuf + s * 2352;
       size_t   pcmLen = 2352;  // 588 stereo samples × 2ch × 2 bytes = 2352
@@ -1230,39 +1354,48 @@ static void audioTask(void* arg) {
         static uint8_t silence[2352] = {};
         i2s_channel_write(i2sHandle, silence, pcmLen, &written, pdMS_TO_TICKS(100));
       } else if (audioVolume < 100) {
-        // Scale in-place in a stack buffer to avoid modifying audioBuf
-        int16_t scaled[2352/2];
+        // Scale into pre-allocated static buffer (avoids 2352-byte stack allocation per sector)
         int16_t* src16 = (int16_t*)pcm;
         for (int si = 0; si < (int)(pcmLen/2); si++)
-          scaled[si] = (int16_t)((int32_t)src16[si] * audioVolume / 100);
-        i2s_channel_write(i2sHandle, scaled, pcmLen, &written, pdMS_TO_TICKS(100));
+          audioScaled[si] = (int16_t)((int32_t)src16[si] * audioVolume / 100);
+        i2s_channel_write(i2sHandle, audioScaled, pcmLen, &written, pdMS_TO_TICKS(100));
       } else {
         i2s_channel_write(i2sHandle, pcm, pcmLen, &written, pdMS_TO_TICKS(100));
       }
+      // Incomplete write = DMA timeout → audible glitch (missing samples)
+      if (written < pcmLen) {
+        dualPrint.printf("[AUDIO] DMA underwrite: %u/%u bytes at LBA %lu (DMA stall?)\n",
+                         written, pcmLen, lba);
+      }
 
-      // Update playback position and sub-channel
+      // Update playback position and sub-channel ONLY if still our batch.
+      // If audioPlaySeq changed we must NOT touch audioCurrentLba — the new value
+      // set by audioPlay() would be clobbered with our stale lba.
       lba++;
-      audioCurrentLba = lba;
+      if (audioPlaySeq == mySeq) {
+        audioCurrentLba = lba;
 
-      // Compute sub-channel MSF
-      uint8_t am, as_, af;
-      lbaToMsf(lba + 150, am, as_, af);  // +150 = standard 2-sec pregap offset
-      uint32_t relLba = lba - trk->startLba;
-      uint8_t rm, rs, rf;
-      lbaToMsf(relLba, rm, rs, rf);
+        // Compute sub-channel MSF
+        uint8_t am, as_, af;
+        lbaToMsf(lba + 150, am, as_, af);  // +150 = standard 2-sec pregap offset
+        uint32_t relLba = lba - trk->startLba;
+        uint8_t rm, rs, rf;
+        lbaToMsf(relLba, rm, rs, rf);
 
-      // Atomic-ish update of sub-channel struct
-      subChannel.trackNum = trk->number;
-      subChannel.indexNum = 1;
-      subChannel.absM = am; subChannel.absS = as_; subChannel.absF = af;
-      subChannel.relM = rm; subChannel.relS = rs; subChannel.relF = rf;
+        // Atomic-ish update of sub-channel struct
+        subChannel.trackNum = trk->number;
+        subChannel.indexNum = 1;
+        subChannel.absM = am; subChannel.absS = as_; subChannel.absF = af;
+        subChannel.relM = rm; subChannel.relS = rs; subChannel.relF = rf;
+      }
     }
 
-    audioCurrentLba = lba;
-
-    // Check if we've reached end LBA
-    if (audioEndLba > 0 && audioCurrentLba >= audioEndLba) {
-      audioState = AUDIO_STOP;
+    // Final position sync + end-of-track detection — skip if seq changed.
+    if (audioPlaySeq == mySeq) {
+      audioCurrentLba = lba;
+      if (audioEndLba > 0 && audioCurrentLba >= audioEndLba) {
+        audioState = AUDIO_STOP;
+      }
     }
 
     // Yield briefly to allow Wi-Fi/HTTP to run
@@ -1273,7 +1406,7 @@ static void audioTask(void* arg) {
 
 void startAudioTask() {
   if (audioTaskHandle) return;
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 5, &audioTaskHandle, 0);
+  xTaskCreatePinnedToCore(audioTask, "audio", 16384, nullptr, 5, &audioTaskHandle, 0);
   dualPrint.println(F("[AUDIO] Task started on core 0."));
 }
 
@@ -1301,8 +1434,13 @@ void audioPlay(uint32_t startLba, uint32_t endLba) {
     if (startLba >= ts && startLba < ts + audioTracks[i].lengthSectors)
       break;  // already in a valid track, no snap needed
   }
-  audioState      = AUDIO_STOP;  // pause task momentarily
-  vTaskDelay(pdMS_TO_TICKS(5));
+  // Increment sequence counter FIRST so the audio task's write loop immediately
+  // aborts its current batch (the loop checks audioPlaySeq == mySeq).  The task
+  // will NOT update audioCurrentLba after the batch (seq mismatch guard), so our
+  // new value below is preserved.  No vTaskDelay needed — the task self-corrects
+  // on the very next sector boundary (≤ 13 ms).
+  audioPlaySeq++;
+  audioState      = AUDIO_STOP;
   audioCurrentLba = startLba;
   audioEndLba     = endLba;
   audioState      = AUDIO_PLAY;
@@ -1337,6 +1475,48 @@ void audioPause() {
 }
 void audioResume(){ audioState = AUDIO_PLAY;  dualPrint.println(F("[AUDIO] Resume.")); }
 
+// ── Test tone generator ───────────────────────────────────────────────────────
+// Plays a sine wave directly from RAM (no SD, no file) to isolate hardware.
+// If crackling occurs here too → pure hardware issue (power/PCM5102).
+// If this plays clean → issue is in SD→I2S data pipeline.
+static volatile bool audioTestActive = false;
+
+void audioTestTone(int freqHz, int durationSec) {
+  if (!i2sTx) { dualPrint.println(F("[AUDIO] Test tone: I2S not initialized.")); return; }
+  audioStop();
+  vTaskDelay(pdMS_TO_TICKS(50));
+  audioTestActive = true;
+
+  const int   SR      = 44100;
+  const int   BUFSIZE = 512;          // stereo frames per chunk
+  int16_t     buf[BUFSIZE * 2];       // L+R interleaved
+  const float scale   = 16000.0f;    // amplitude (~50% full scale)
+  float       phase   = 0.0f;
+  const float inc     = 2.0f * 3.14159265f * freqHz / SR;
+  int32_t     totalFrames = (int32_t)SR * durationSec;
+
+  dualPrint.printf("[AUDIO] Test tone: %d Hz, %d s — listen for crackling\n", freqHz, durationSec);
+  dualPrint.println(F("[AUDIO]   Clean tone = hardware OK, crackle = hardware problem"));
+
+  i2s_chan_handle_t h = i2sTx;
+  while (totalFrames > 0 && audioTestActive && h) {
+    int frames = (totalFrames > BUFSIZE) ? BUFSIZE : (int)totalFrames;
+    for (int i = 0; i < frames; i++) {
+      int16_t s = (int16_t)(sinf(phase) * scale);
+      buf[i*2]   = s;   // L
+      buf[i*2+1] = s;   // R
+      phase += inc;
+      if (phase > 2.0f * 3.14159265f) phase -= 2.0f * 3.14159265f;
+    }
+    size_t written = 0;
+    i2s_channel_write(h, buf, frames * 4, &written, pdMS_TO_TICKS(200));
+    totalFrames -= frames;
+    h = i2sTx;  // re-check in case module was disabled
+  }
+  audioTestActive = false;
+  dualPrint.println(F("[AUDIO] Test tone done."));
+}
+
 // =============================================================================
 //  SCSI DEBUG BRIDGE — volána z USBMSC.cpp patche, výstup jde do dualPrint (Serial + HTML)
 // =============================================================================
@@ -1360,6 +1540,82 @@ void scsi_audio_play(uint32_t startLba, uint32_t endLba) {
   audioPlay(startLba, endLba);
 }
 void scsi_audio_stop()   { audioStop(); }
+
+// ── DAE (Digital Audio Extraction) mirror ────────────────────────────────────
+// Called from USBMSC.cpp SCSI patch every time Windows reads audio sectors via
+// READ CD (0xBE).  Windows plays them through the PC sound card; we mirror the
+// same position to PCM5102 so audio comes out of the hardware DAC as well.
+//
+// Detection logic:
+//  • If LBA is inside an audio track and the position is new (seek or start),
+//    call audioPlay() to start PCM5102 from that position.
+//  • If LBA is sequential (Windows advancing through the track), let the audio
+//    task continue — it self-corrects via audioCurrentLba tracking.
+//  • If no DAE read arrives for >3 s, stop PCM5102 (Windows stopped).
+//
+// To enable: in patch_usbmsc.py, after the READ CD handler successfully fills
+// the response buffer with audio data, add ONE call:
+//   scsi_dae_read(lba, transfer_length);
+// ─────────────────────────────────────────────────────────────────────────────
+static volatile uint32_t daeLastLba   = 0;
+static volatile uint32_t daeLastTime  = 0;   // millis() of last DAE read
+static volatile bool     daeActive    = false;
+
+void scsi_dae_read(uint32_t lba, uint32_t count) {
+  if (count == 0) return;
+
+  // ── DOS compat mode guard ─────────────────────────────────────────────────
+  // In DOS compat mode the DOS audio pipeline (MSCDEX/CDPLAYER) owns audio
+  // playback via PLAY AUDIO (0x47/0x45/0x48) SCSI commands.  Calling
+  // audioPlay() here from the USB task context would race with the audio task
+  // holding the FatFS mutex → USB task stalls → TinyUSB timeout → USB
+  // disconnect / reconnect.  Skip entirely in DOS mode; PLAY AUDIO is handled
+  // separately and works correctly.
+  if (cfg.dosCompat) return;
+
+  // Is this LBA inside an audio track?
+  AudioTrack* trk = nullptr;
+  for (int i = 0; i < audioTrackCount; i++) {
+    if (audioTracks[i].valid &&
+        lba >= audioTracks[i].startLba &&
+        lba <  audioTracks[i].startLba + audioTracks[i].lengthSectors) {
+      trk = &audioTracks[i]; break;
+    }
+  }
+  if (!trk) return;  // data sector, ignore
+
+  uint32_t now = millis();
+  // Allowed drift: Windows reads in bursts; tolerate gaps up to 500 ms
+  bool sequential = daeActive &&
+                    (lba >= daeLastLba) &&
+                    (lba <= daeLastLba + 150) &&   // ≤ 150 secs ahead = sequential
+                    (now - daeLastTime < 500);
+
+  daeLastLba  = lba + count;
+  daeLastTime = now;
+  daeActive   = true;
+
+  if (!sequential || audioState != AUDIO_PLAY) {
+    // New position or audio task was stopped — (re)start from current LBA
+    uint32_t endLba = trk->startLba + trk->lengthSectors;
+    dualPrint.printf("[DAE] Windows DAE → LBA %lu  Track %d — mirroring to PCM5102\n",
+                     lba, trk->number);
+    audioPlay(lba, endLba);
+  }
+  // If sequential and already playing, audio task tracks position itself — no action needed.
+}
+
+// Call from a periodic task or main loop to detect DAE stop:
+// if daeActive && millis()-daeLastTime > 3000 → audioStop(), daeActive=false
+void scsi_dae_check_timeout() {
+  if (daeActive && (millis() - daeLastTime > 3000)) {
+    daeActive = false;
+    if (audioState == AUDIO_PLAY) {
+      dualPrint.println(F("[DAE] Windows DAE stopped — stopping PCM5102"));
+      audioStop();
+    }
+  }
+}
 void scsi_audio_pause()  { audioPause(); }
 void scsi_audio_resume() { audioResume(); }
 
@@ -1613,8 +1869,14 @@ void startWiFi() {
   dualPrint.println();
   if (WiFi.status() == WL_CONNECTED) {
     wifiConnected = true;
-    dualPrint.printf("[WiFi] Connected!  IP: %s  RSSI: %d dBm  Ch: %d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    // Disable WiFi modem sleep — prevents DTIM-interval wakeups (~100ms or ~1s with DTIM=10)
+    // from briefly blocking DMA and causing periodic I2S audio crackling.
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    // TX power (0.25 dBm units). Lower = less RF interference into PCM5102 analog section.
+    uint8_t txp = constrain(cfg.wifiTxPower, 8, 80);
+    esp_wifi_set_max_tx_power(txp);
+    dualPrint.printf("[WiFi] Connected!  IP: %s  RSSI: %d dBm  Ch: %d  TXpow: %d dBm\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel(), txp/4);
     // Start mDNS so device is reachable as hostname.local
     // mDNS uses only the first label of an FQDN (before first dot)
     char mdnsLabel[32];
@@ -1790,6 +2052,7 @@ void handleApiSysinfo() {
     j += ",\"wifi_gw\":\""      + WiFi.gatewayIP().toString()             + "\"";
     j += ",\"wifi_dns\":\""     + WiFi.dnsIP().toString()                 + "\"";
     j += ",\"wifi_channel\":"   + String(wch);
+    j += ",\"wifi_tx_power\":"  + String(cfg.wifiTxPower / 4);  // dBm
     j += ",\"wifi_bssid\":\""   + jsonEsc(WiFi.BSSIDstr().c_str())        + "\"";
     j += ",\"wifi_hostname\":\"" + jsonEsc(cfg.hostname) + "\""; 
     // mDNS label = first part of FQDN
@@ -1868,6 +2131,7 @@ void handleApiSysinfo() {
   j += ",\"httpsPort\":" + String(cfg.httpsPort ? cfg.httpsPort : 443);
   j += ",\"tlsMinVer\":" + String(cfg.tlsMinVer);
   j += ",\"tlsCiphers\":" + String(cfg.tlsCiphers);
+  j += ",\"wifiTxPower\":" + String(cfg.wifiTxPower);
   j += ",\"httpsKPassSet\":" + String(strlen(cfg.httpsKeyPass) ? "true" : "false");
   j += ",\"audio_module\":" + String(cfg.audioModule ? "true" : "false");
   j += ",\"i2s_ready\":" + String(i2sTx ? "true" : "false");
@@ -2071,6 +2335,7 @@ void handleApiGetConfig() {
   j += ",\"httpsPort\":" + String(cfg.httpsPort ? cfg.httpsPort : 443);
   j += ",\"tlsMinVer\":" + String(cfg.tlsMinVer);
   j += ",\"tlsCiphers\":" + String(cfg.tlsCiphers);
+  j += ",\"wifiTxPower\":" + String(cfg.wifiTxPower);
   // webPass intentionally omitted from GET response
   j += "}";
   httpServer.send(200, "application/json", j);
@@ -2148,6 +2413,10 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("httpsPort"))  { int v=httpServer.arg("httpsPort").toInt(); if(v>0&&v<65536) cfg.httpsPort=(uint16_t)v; changed=true; }
   if (httpServer.hasArg("tlsMinVer"))  { cfg.tlsMinVer=(uint8_t)constrain(httpServer.arg("tlsMinVer").toInt(),0,1); changed=true; }
   if (httpServer.hasArg("tlsCiphers")) { cfg.tlsCiphers=(uint8_t)constrain(httpServer.arg("tlsCiphers").toInt(),0,3); changed=true; }
+  if (httpServer.hasArg("wifiTxPower")) {
+    cfg.wifiTxPower=(uint8_t)constrain(httpServer.arg("wifiTxPower").toInt(),8,80); changed=true;
+    if (wifiConnected) esp_wifi_set_max_tx_power(cfg.wifiTxPower); // apply live without reboot
+  }
   if (httpServer.hasArg("httpsKPass")){ strlcpy(cfg.httpsKeyPass, httpServer.arg("httpsKPass").c_str(), sizeof(cfg.httpsKeyPass)); changed=true; }
   if (httpServer.hasArg("webUser") && httpServer.arg("webUser").length()) { strlcpy(cfg.webUser, httpServer.arg("webUser").c_str(), sizeof(cfg.webUser)); changed=true; }
   if (httpServer.hasArg("webPass") && httpServer.arg("webPass").length()) { strlcpy(cfg.webPass, httpServer.arg("webPass").c_str(), sizeof(cfg.webPass)); changed=true; }
@@ -2353,8 +2622,12 @@ void handleApiAudioSeek() {
   if (rel < 0) rel = 0; if (rel > 1) rel = 1;
   for (int i = 0; i < audioTrackCount; i++) {
     if (audioTracks[i].number == tn) {
-      audioCurrentLba = audioTracks[i].startLba +
+      uint32_t newLba = audioTracks[i].startLba +
                         (uint32_t)(rel * audioTracks[i].lengthSectors);
+      uint32_t endLba = audioTracks[i].startLba + audioTracks[i].lengthSectors;
+      // Use audioPlay() not just audioCurrentLba — this works from any state
+      // (stopped, paused, playing) and takes effect within one batch cycle.
+      audioPlay(newLba, endLba);
       httpServer.send(200,"application/json","{\"ok\":true}"); return;
     }
   }
@@ -2957,7 +3230,7 @@ void printConfig(bool showRuntime = true) {
     if (char* d = strchr(lbl, '.')) *d = 0;
     dualPrint.printf("  mDNS address  : %s.local\n", lbl);
   }
-  // EAP / 802.1x
+  dualPrint.printf("  WiFi TX power : %d dBm\n", cfg.wifiTxPower / 4);
   const char* eapLabel = cfg.eapMode==1?"PEAP":cfg.eapMode==2?"EAP-TLS":"disabled";
   dualPrint.printf("  802.1x EAP    : %s\n", eapLabel);
   if (cfg.eapMode) {
@@ -3013,6 +3286,7 @@ void printConfig(bool showRuntime = true) {
     dualPrint.printf("  IP address    : %s\n",  WiFi.localIP().toString().c_str());
     dualPrint.printf("  WiFi RSSI     : %d dBm\n", WiFi.RSSI());
     dualPrint.printf("  WiFi channel  : %d\n",  WiFi.channel());
+    dualPrint.printf("  WiFi TX power : %d dBm  (set wifi-txpower to adjust)\n", cfg.wifiTxPower/4);
     dualPrint.printf("  BSSID         : %s\n",  WiFi.BSSIDstr().c_str());
     dualPrint.printf("  Web interface : http://%s\n", WiFi.localIP().toString().c_str());
     // Show hostname/FQDN and mDNS
@@ -3044,6 +3318,7 @@ void printStatus() {
     int rssi = WiFi.RSSI();
     const char* quality = rssi > -50 ? "Excellent" : rssi > -65 ? "Good" : rssi > -75 ? "Fair" : "Weak";
     dualPrint.printf("  WiFi          : Connected  (%s, %d dBm)\n", quality, rssi);
+    dualPrint.printf("  TX power      : %d dBm\n", cfg.wifiTxPower / 4);
     dualPrint.printf("  IP            : %s\n", WiFi.localIP().toString().c_str());
     dualPrint.printf("  Mask          : %s\n", WiFi.subnetMask().toString().c_str());
     dualPrint.printf("  Gateway       : %s\n", WiFi.gatewayIP().toString().c_str());
@@ -3205,6 +3480,7 @@ void printHelp() {
   dualPrint.println(F("  set gw <addr>         Set default gateway"));
   dualPrint.println(F("  set dns <addr>        Set DNS server"));
   dualPrint.println(F("  set hostname <n>      Set hostname or FQDN (e.g. espcd or espcd.falco81.net)"));
+  dualPrint.println(F("  set wifi-txpower <dBm>  2/5/10/15/20 dBm TX power (lower = less RF noise)"));
   dualPrint.println(F(""));
   dualPrint.println(F("  ┌─ 802.1x Enterprise WiFi ───────────────────────┐"));
   dualPrint.println(F("  set eap-mode <0|1|2>  0=off 1=PEAP 2=EAP-TLS"));
@@ -3260,6 +3536,10 @@ void printHelp() {
   dualPrint.println(F("  umount                Eject current CD-ROM"));
   dualPrint.println(F("  sd reinit             Reinitialize SD card"));
   dualPrint.println(F("  wifi reconnect        Disconnect and reconnect WiFi"));
+  dualPrint.println(F("  audio test [Hz] [s]   Play sine wave from RAM (no SD) — isolates HW crackling"));
+  dualPrint.println(F("  audio stop            Stop test tone or playback"));
+  dualPrint.println(F("  wifi off              Disable WiFi (test if PLL shared clock causes crackling)"));
+  dualPrint.println(F("  set audio-sectors <n> SD read batch: 1..32 sectors (diagnostic, not saved)"));
   dualPrint.println(F("  clear config          Erase ALL NVS settings (factory reset)"));
   dualPrint.println(F("  reboot                Restart ESP32"));
   dualPrint.println(F("  help                  Show this help"));
@@ -3344,6 +3624,24 @@ void processCommand(String &line) {
   else if (line.equalsIgnoreCase("umount"))         doUmount();
   else if (line.equalsIgnoreCase("sd reinit"))      reinitSD();
   else if (line.equalsIgnoreCase("reboot"))         { delay(300); ESP.restart(); }
+  else if (line.startsWith("audio test") || line.startsWith("AUDIO TEST")) {
+    // audio test [freq_hz] [duration_sec]
+    // Plays a pure sine wave from RAM — no SD, no WiFi needed.
+    // Clean tone = hardware OK.  Crackling = hardware problem (power/PCM5102).
+    String rest = line.substring(10); rest.trim();
+    int freq = 1000, dur = 10;
+    int sp = rest.indexOf(' ');
+    if (sp >= 0) { freq = rest.substring(0,sp).toInt(); dur = rest.substring(sp+1).toInt(); }
+    else if (rest.length()) { freq = rest.toInt(); }
+    if (freq < 20 || freq > 20000) freq = 1000;
+    if (dur  < 1  || dur  > 120)  dur  = 10;
+    audioTestTone(freq, dur);
+  }
+  else if (line.equalsIgnoreCase("audio stop")) {
+    audioTestActive = false;
+    audioStop();
+    dualPrint.println(F("[AUDIO] Stopped."));
+  }
   else if (line.equalsIgnoreCase("clear config")) {
     clearConfig();
     dualPrint.println(F("[INFO] Reboot to apply factory defaults."));
@@ -3351,6 +3649,16 @@ void processCommand(String &line) {
   else if (line.equalsIgnoreCase("wifi reconnect")) {
     WiFi.disconnect(true); delay(400); startWiFi();
     if (wifiConnected) setupWebServer();
+  }
+  else if (line.equalsIgnoreCase("wifi off")) {
+    // Disable WiFi completely — diagnostic test for PLL_160M interference with I2S clock.
+    // If audio crackling disappears → WiFi is disturbing the shared PLL → hardware shielding needed.
+    // Restore with: wifi reconnect
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiConnected = false;
+    dualPrint.println(F("[WiFi] Disabled. Play audio and check for crackling."));
+    dualPrint.println(F("[WiFi] Restore with: wifi reconnect"));
   }
   else if (line.startsWith("mount ") || line.startsWith("MOUNT ")) {
     String f = line.substring(6); f.trim();
@@ -3385,6 +3693,16 @@ void processCommand(String &line) {
     else if (key=="eap-cert")  strlcpy(cfg.eapCertPath,  val.c_str(), sizeof(cfg.eapCertPath));
     else if (key=="eap-key")   strlcpy(cfg.eapKeyPath,   val.c_str(), sizeof(cfg.eapKeyPath));
     else if (key=="eap-kpass") strlcpy(cfg.eapKeyPass,  val.c_str(), sizeof(cfg.eapKeyPass));
+    else if (key=="audio-sectors") {
+      // Diagnostic: change SD read batch size at runtime without recompile.
+      // Test: set audio-sectors 1  → if crackling stops, batch/FatFs boundary is the cause.
+      //       set audio-sectors 32 → restore default (LCM-aligned, best quality).
+      int n = constrain(val.toInt(), 1, AUDIO_BUF_SECTORS);
+      audioReadSectors = n;
+      dualPrint.printf("[AUDIO] Batch size: %d sectors = %d ms per read\n",
+                       n, n * 2352 * 1000 / 176400);
+      ok = false; // don't save to NVS — diagnostic only
+    }
     else if (key=="audio-module") {
       String v=val; v.toLowerCase();
       bool newVal=(v=="on"||v=="1"||v=="yes");
@@ -3422,6 +3740,15 @@ void processCommand(String &line) {
     else if (key=="https-port")   { cfg.httpsPort = (uint16_t)constrain(val.toInt(),1,65535); }
     else if (key=="tls-ver")      { cfg.tlsMinVer = (uint8_t)constrain(val.toInt(),0,1); }
     else if (key=="tls-ciphers")  { cfg.tlsCiphers= (uint8_t)constrain(val.toInt(),0,3); }
+    else if (key=="wifi-txpower") {
+      // Accept dBm value 2–20, converted to ESP-IDF units (×4).
+      // ESP32-S3 supports 2–20 dBm. Default is 10 dBm (40 units).
+      int dbm = constrain(val.toInt(), 2, 20);
+      cfg.wifiTxPower = (uint8_t)(dbm * 4);
+      if (wifiConnected) esp_wifi_set_max_tx_power(cfg.wifiTxPower);
+      dualPrint.printf("[WiFi] TX power set to %d dBm (units=%d)%s\n",
+                       dbm, cfg.wifiTxPower, wifiConnected ? " — applied live" : " — applied on next connect");
+    }
     else if (key=="web-user")  { strlcpy(cfg.webUser, val.c_str(), sizeof(cfg.webUser)); }
     else if (key=="web-pass")  { strlcpy(cfg.webPass, val.c_str(), sizeof(cfg.webPass)); }
     else { dualPrint.printf("[ERR] Unknown key: '%s'\n", key.c_str()); ok=false; }
@@ -3509,5 +3836,6 @@ void loop() {
     else serialBuf += c;
   }
   if (wifiConnected) httpServer.handleClient();
+  scsi_dae_check_timeout();  // stop PCM5102 when Windows DAE stops
   delay(1);
 }
