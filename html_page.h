@@ -401,6 +401,19 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
         &#9432; Requires reboot. BCK&#8594;GPIO8 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
       </div>
+      <!-- Win98 Stop/Pause detection -->
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+        <div class="cfg-row">
+          <label class="cfg-lbl">&#9200; Win98 Stop/Pause</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" class="cfg-inp" id="cfgWin98StopMs" min="0" max="9999" step="100" style="width:90px" placeholder="ms">
+            <span style="color:var(--muted);font-size:0.82em">ms &nbsp;(0&nbsp;=&nbsp;off)</span>
+          </div>
+        </div>
+        <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+          &#9432; Detekce Stop/Pause Win98 CDPlayer. Pokud READ_SUB_CHANNEL polling ustane na tuto dobu, PCM5102 se zastaví. Default: 1200 ms.
+        </div>
+      </div>
     </div>
 
     <!-- Web UI Authentication -->
@@ -1137,6 +1150,7 @@ function cfgLoad(){
     var txpEl=$('cfgWifiTxPower'); if(txpEl) txpEl.value=c.wifiTxPower||40;
     var ddEl=$('cfgDosDriver'); if(ddEl) ddEl.value=c.dosDriver||0;
     $('cfgDosCompat').value = c.dosCompat ? '1' : '0'; dosCompatChanged();
+    if($('cfgWin98StopMs')) $('cfgWin98StopMs').value = c.win98StopMs !== undefined ? c.win98StopMs : 1200;
     var heEl=$('cfgHttpsEnabled'); if(heEl){heEl.value=c.httpsEnabled?'1':'0'; httpsToggle();}
     var hcEl=$('cfgHttpsCert'); if(hcEl){hcEl._savedVal=c.httpsCert||''; if(c.httpsCert){var o=document.createElement('option');o.value=c.httpsCert;o.textContent=c.httpsCert+' (saved)';hcEl.appendChild(o);hcEl.value=c.httpsCert;}}
     var hkEl=$('cfgHttpsKey'); if(hkEl){hkEl._savedVal=c.httpsKey||''; if(c.httpsKey){var o=document.createElement('option');o.value=c.httpsKey;o.textContent=c.httpsKey+' (saved)';hkEl.appendChild(o);hkEl.value=c.httpsKey;}}
@@ -1175,6 +1189,7 @@ function cfgSave(){
   params.set('audioModule',$('cfgAudioModule').value);
   params.set('dosDriver',$('cfgDosDriver')?$('cfgDosDriver').value:'0');
   params.set('dosCompat',$('cfgDosCompat').value);
+    if($('cfgWin98StopMs')) params.set('win98StopMs',$('cfgWin98StopMs').value||'1200');
   params.set('httpsEnabled',$('cfgHttpsEnabled')?$('cfgHttpsEnabled').value:'0');
   params.set('httpsCert',$('cfgHttpsCert')?$('cfgHttpsCert').value:'');
   params.set('httpsKey',$('cfgHttpsKey')?$('cfgHttpsKey').value:'');
@@ -1330,12 +1345,18 @@ function loadSysinfo(){
       ?'<span style="color:var(--ok)">&#10003; '+dosDriverName+'</span>'
       :'<span style="color:var(--muted)">Disabled</span>');
     dosCompatOn=s.dos_compat||false;
+    siRow(sy,'Debug logging',s.debug_mode
+      ?'<span style="color:var(--warn)">&#9888; ON &mdash; verbose SCSI/API logs</span>'
+      :'<span style="color:var(--ok)">OFF &mdash; quiet</span>');
       // Audio section
       var ta=$('siAudio')&&$('siAudio').querySelector('tbody');
       if(ta){
         ta.innerHTML='';
         var audioModLabel=s.audio_module?'<span style="color:var(--ok)">&#10003; PCM5102 enabled</span>':'<span style="color:var(--muted)">disabled</span>';
         siRow(ta,'Module',audioModLabel);
+        siRow(ta,'Win98 Stop',s.win98_stop_ms>0
+          ?'<span style="color:var(--ok)">'+s.win98_stop_ms+' ms</span>'
+          :'<span style="color:var(--muted)">disabled</span>');
         if(s.audio_module){
           siRow(ta,'I2S',s.i2s_ready?'<span style="color:var(--ok)">initialized</span>':'<span style="color:#e74c3c">init failed</span>');
           var astL={0:'STOPPED',1:'<span style="color:var(--ok)">PLAYING</span>',2:'<span style="color:#f5a623">PAUSED</span>'};
