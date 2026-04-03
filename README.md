@@ -51,23 +51,32 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 
 ## Features
 
-- **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; the PC sees an optical drive without any drivers
-- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with full multi-track support including all raw sector formats
-- **Audio CD** — playback of audio tracks via GY-PCM5102 I2S DAC; full SCSI-2 audio command set per Pioneer OB-U0077C spec (PLAY AUDIO, READ TOC, READ SUB-CHANNEL, PAUSE/RESUME, STOP, TRACK RELATIVE); audio enabled for non-DOS mode (Windows/Linux) and DOS drivers 0, 1, 2; driver 3 (DI1000DD) is data-only by design
-- **CUE parser** — supports all sector formats (MODE1/2352, MODE2/2352, MODE2/2336, MODE1/2048, MODE2/2048, CDG/2448), physical pregap via INDEX 00, virtual pregap via PREGAP directive, single-BIN and separate-BIN-per-track layouts
-- **Web file manager** — upload, download, delete, create folders, drag-and-drop
-- **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with full certificate management
-- **mDNS** — device reachable at `hostname.local`; FQDN support
+- **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; seen as optical drive on any OS without drivers
+- **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with full multi-track support and all raw sector formats
+- **Audio CD playback** — via GY-PCM5102 I2S DAC; full SCSI-2 audio command set (PLAY AUDIO, READ TOC, READ SUB-CHANNEL, PAUSE/RESUME, STOP); clean output on DOS PCs; HTML player for any OS
+- **Win98 Stop/Pause detection** — detects Win98 CDPlayer Stop/Pause via READ_SUB_CHANNEL polling absence; configurable timeout
+- **CUE parser** — all sector formats, physical/virtual pregap, single-BIN and per-track-BIN layouts
+- **Web file manager** — upload, download, delete, folders, drag-and-drop
+- **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with certificate management
+- **mDNS** — device reachable at `hostname.local`
 - **NVS persistence** — all settings survive reboot
 - **Serial CLI** — complete configuration and diagnostics at 115 200 baud
 - **exFAT SD cards** — supported after applying the `build_exfat_libs.py` patch
-- **Web UI authentication** — HTTP Basic Auth, enable/disable, username/password via web or CLI, disabled by default
-- **HTTPS / TLS** — optional encrypted HTTPS on port 443; certificate and key loaded from SD card; HTTP auto-redirects to HTTPS; ESP32-S3 hardware AES/SHA/RSA acceleration
-- **Bidirectional audio sync** — PC controls playback via SCSI, HTML syncs within 400 ms
-- **Audio module runtime toggle** — enable or disable the I2S module without reboot via web UI or CLI
+- **Web UI authentication** — HTTP Basic Auth, disabled by default
+- **HTTPS / TLS** — optional encrypted HTTPS on port 443 with hardware AES/SHA acceleration
+- **Debug mode** — `set debug on` enables verbose SCSI/API logging; off by default
 - **RGB LED** — boot / Wi-Fi / error state indication
 
----
+## Known Limitations
+
+| Issue | Status | Workaround |
+|---|---|---|
+| Crackling on Windows PC connected simultaneously | SDMMC CLK→I2S BCK coupling + WiFi ISR preemption | Use DOS PC for clean audio; `set audio-sectors 1` reduces bursts |
+| WDT crash with dosCompat=ON + Windows PC connected | Windows floods GET CONFIGURATION during UNIT ATTENTION loop | Use dosCompat=ON **only** on DOS PCs — never connect Windows with it on |
+| Windows 10/11 DAE (READ CD) — no audio on PC speakers | Windows USB MSC stack does not forward `IOCTL_CDROM_RAW_READ` as SCSI READ CD | Audio plays on PCM5102 only; use HTML web player |
+| Win98 Stop/Pause ~1–2 s delay | Detected via READ_SUB_CHANNEL polling timeout, not SCSI command | Configurable via `set win98-stop <ms>` |
+| Win98 RESUME not supported | MCICDA treats RESUME same as PLAY from saved position | Transparent — works correctly |
+
 
 ## Hardware Requirements
 
@@ -116,13 +125,18 @@ The project uses the **LOLIN/Wemos MicroSD Card Shield** connected to the ESP32-
 
 | ESP32-S3 | PCM5102 | Signal |
 |---|---|---|
-| GPIO 14 | BCK | Bit Clock |
-| GPIO 15 | LCK | Word Select (WS) |
-| GPIO 16 | DIN | Data In |
-| 3V3 | VIN | Power |
-| GND | GND | Ground |
-| GND | FMT | I2S Philips format |
-| GND | SCK | No master clock |
+| GPIO 8  | BCK  | Bit Clock |
+| GPIO 15 | LCK  | Word Select (WS) |
+| GPIO 16 | DIN  | Data In |
+| 3V3     | VIN  | Power (3.3 V — **not 5 V**) |
+| 3V3     | XSMT | Soft unmute — **must be HIGH or output is muted** |
+| GND     | GND  | Ground |
+| GND     | FMT  | I2S Philips format (LOW) |
+| GND     | SCK  | No external master clock (LOW) |
+
+> **⚠️ SCK solder bridge (most common cause of no audio):** The GY-PCM5102 module has a solder bridge labelled **SCK** on the front of the PCB. **This bridge must be shorted with a blob of solder** before the module will produce any sound. Without it the PCM5102 cannot generate its internal clock from BCK and produces no output even when all wiring is correct.
+>
+> **⚠️ XSMT:** Connect XSMT to 3.3 V. If left floating or tied to GND the DAC output is permanently muted. Alternatively solder the **H3L** bridge on the back of the module to pull XSMT high internally — but do not do both at the same time.
 
 > **Important:** The SD module must be powered from **3.3 V**, not 5 V. The ESP32-S3 DevKitC-1 has **two** USB connectors -- the left one is UART (programming and serial monitor), the right one is USB OTG (virtual CD-ROM for the target PC). Never swap them.
 
@@ -446,7 +460,7 @@ Via serial:
 set audio-module on
 ```
 
-Or via web: **Config tab -> Audio Module -> GY-PCM5102 I2S -- GPIO 14/15/16 -> Save**.
+Or via web: **Config tab -> Audio Module -> GY-PCM5102 I2S -- GPIO 8/15/16 -> Save**.
 
 The I2S module is initialised immediately at runtime — no reboot required. Disabling the module also takes effect immediately and stops any active playback.
 
@@ -557,15 +571,23 @@ All `set` commands save the value to NVS immediately. Most take effect after `re
 
 | Command | Default | Notes |
 |---|---|---|
-| `set audio-module on\|off` | `off` | Enable or disable the GY-PCM5102 I2S DAC. Takes effect **immediately** without reboot. GPIO 14=BCK, 15=WS, 16=DIN. |
+| `set audio-module on\|off` | `off` | Enable or disable the GY-PCM5102 I2S DAC. Takes effect **immediately** without reboot. GPIO 8=BCK, 15=WS, 16=DIN. |
 | `set audio-volume 0-100` | `80` | Playback volume percentage. Takes effect immediately. |
+| `set audio-sectors <1-4>` | `4` | SD read batch size. **Not saved to NVS.** Smaller = shorter SDMMC CLK burst = less I2S interference. Use `1` for cleanest audio on Windows PC. |
+| `set win98-stop <ms>` | `1200` | Win98 Stop/Pause detection timeout in milliseconds. Win98 CDPlayer stops polling READ_SUB_CHANNEL when Stop/Pause is pressed — ESP32 infers Stop after this period of silence. Set to `0` to disable. Safe range: ≥ 800 ms. |
 
 #### DOS Compatibility
 
 | Command | Default | Notes |
 |---|---|---|
 | `set dos-compat on\|off` | `off` | DOS compatibility mode. When `on`, disc swaps use UNIT ATTENTION instead of USB re-enumeration. Automatically enabled when `dos-driver` is set to 1, 2, or 3. Disabling resets `dos-driver` to 0. |
-| `set dos-driver 0\|1\|2\|3` | `0` | SCSI INQUIRY identity for DOS. Setting any non-zero value automatically enables `dos-compat`. See [DOS Compatibility Mode](#dos-compatibility-mode). |
+| `set dos-driver 0\|1\|2\|3` | `0` | SCSI INQUIRY identity for DOS. Setting any non-zero value automatically enables `dos-compat`. See table below for full mode matrix. |
+
+#### Debug & Diagnostics
+
+| Command | Default | Notes |
+|---|---|---|
+| `set debug on\|off` | `off` | Verbose SCSI/API logging. When off: no `[SCSI]`, `[AUDIO] SLOW BATCH` or `[API]` lines. Saved to NVS. |
 
 #### Web UI Security
 
@@ -668,33 +690,38 @@ VALUES ('identity', 'Auth-Type', 'EAP', ':=');
 
 ## DOS Compatibility Mode
 
-When **DOS Compatibility Mode** is enabled, the drive never disconnects from USB when you switch disc images. Instead:
+DOS Compatibility mode changes how the firmware handles **disc swaps**. Normally a disc swap triggers a USB re-enumeration (the device briefly disconnects). DOS operating systems cannot handle USB re-enumeration — the driver crashes. With DOS Compat enabled, the firmware instead signals a **UNIT ATTENTION (06h/28h)** condition while keeping the USB connection active, exactly as a real CD-ROM would when the disc tray is opened and closed.
 
-1. Host sends READ(10) — `mscReadCb` is disabled immediately at the start of the mount operation
-2. Firmware parses and opens the new image file
-3. `msc.mediaPresent(false)` is signalled briefly — MSCDEX detects no media
-4. After a short wait, `msc.mediaPresent(true)` + SCSI UNIT ATTENTION (`06h/28h`) is signalled
-5. UNIT ATTENTION persists across 3 consecutive TUR poll cycles to ensure the OS catches the disc-change event
-6. MSCDEX re-reads the TOC — new disc appears without any USB re-enumeration
+### Driver Mode Reference
 
-Enable via CLI: `set dos-compat on`, or via the web Config tab.
-
-### DOS Driver Modes
-
-DOS driver mode is only available when DOS Compatibility Mode is enabled. Selecting a driver mode automatically enables DOS compat; disabling DOS compat resets the driver to Generic.
-
-| Driver | Value | INQUIRY Identity | Audio | Notes |
+| dosDriver | INQUIRY Identity | Audio | DOS driver required | Recommended for |
 |---|---|---|---|---|
-| Generic | `0` | ESP32-S3 / Virtual CD-ROM | ✅ Full | Works with any ASPI-compatible driver + MSCDEX |
-| USBCD2/TEAC | `1` | TEAC / CD-56E (SCSI-2) | ✅ Handled | Driver communication broken — USBCD2 uses INT 13h AH=0x50, standard USBASPI does not provide this hook |
-| ESPUSBCD/Panasonic | `2` | MATSHITA / CD-ROM CR-572 (SCSI-2) | ✅ Full | Requires `usbaspi1.sys` or `usbaspi2.sys` + `ESPUSBCD.SYS` (custom driver) |
-| DI1000DD | `3` | ESP32-S3 / Virtual CD-ROM (SCSI-2) | ❌ Data-only | Requires `usbaspi1.sys` (Panasonic v2.20); no MSCDEX audio commands |
+| **0** Generic | `ESP32-S3 Virtual CD-ROM` | ✅ Full | ESPUSBCD.SYS (any ASPI) | Generic / testing |
+| **1** USBCD2/TEAC | `TEAC CD-56E` | ⚠️ SCSI handled, unreachable | USBCD2.SYS | ❌ Broken — do not use |
+| **2** Panasonic | `MATSHITA CD-ROM CR-572` | ✅ Full | ESPUSBCD.SYS | ✅ **Recommended** |
+| **3** DI1000DD | `NOVAC USB Storage Device` | ❌ Data-only | DI1000DD.SYS | Data-only access, no MSCDEX |
 
-Via CLI: `set dos-driver 0` (Generic), `set dos-driver 2` (Panasonic/ESPUSBCD), etc.
+### DOS Compat + dosDriver Full Matrix
 
-The web UI respects DOS compat mode: the **Mount** button automatically ejects (`/api/umount`), waits 2.5 s, then mounts the new image (`/api/mount`) — all without a USB disconnect.
+| dosCompat | dosDriver | DOS result | Windows 98 | Notes |
+|---|---|---|---|---|
+| OFF | 0 | Works, no UNIT ATTENTION | ✅ Play works | Disc swap requires reboot |
+| ON | 0 Generic | ✅ Full audio + data | ⚠️ WDT risk | Generic INQUIRY identity |
+| ON | 1 TEAC | ⚠️ Partial | ⚠️ WDT risk | USBCD2 INT13h broken |
+| ON | 2 Panasonic | ✅ Full audio + data | ⚠️ WDT risk | **Best DOS choice** |
+| ON | 3 DI1000DD | Data-only, no audio | ⚠️ WDT risk | FAT drive letter, no MSCDEX |
 
----
+> **⚠️ Important:** Never connect a Windows PC while `dosCompat=ON`. Windows floods the device with `GET CONFIGURATION` commands during the UNIT ATTENTION loop, causing a WDT reset. DOS Compat is exclusively for real DOS / retro PC use.
+
+### CLI Commands
+
+```
+set dos-compat on|off   Enable/disable (default: off)
+set dos-driver 0|1|2|3  Set driver identity (automatically enables dos-compat)
+```
+
+Setting `dos-driver` to any non-zero value automatically enables `dos-compat`. Disabling `dos-compat` resets `dos-driver` to 0.
+
 
 ## DOS / Retro PC Compatibility
 
@@ -876,50 +903,60 @@ All other command codes return `STAT_DONE | STAT_ERR | ERR_NOCMD` (0x8003).
 
 ### ASPI Interface
 
-The driver communicates with the USB device through the DOS ASPI (Advanced SCSI Programming Interface) provided by USBASPI. Every SCSI command goes through a single `do_aspi` subroutine:
+The driver communicates with USBASPI through the SCSIMGR$ character device. The ASPI entry point (a far function pointer) is obtained at INIT time by opening `SCSIMGR$` with INT 21h and reading 4 bytes via IOCTL — identical to what the reference ESPUSB.SYS driver does.
 
-```asm
-; Service Request Block layout (Adaptec ASPI for DOS, 74 bytes):
-; Offset  Size  Field
-;  0       1    SRB_Cmd    = 2 (Execute SCSI Command)
-;  1       1    SRB_Status (0=pending, 1=done, 4=error)
-;  2       1    SRB_HaId   (host adapter number, default 0)
-;  3       1    SRB_Flags  (08h=data-in, 10h=data-out, 18h=no data)
-;  4       2    Reserved   (0)
-;  6       1    SRB_Target (SCSI target ID, default 0)
-;  7       1    SRB_Lun    (LUN, default 0)
-;  8       4    SRB_BufLen (data buffer length in bytes)
-; 12       2    SRB_BufPtr offset (far pointer to data buffer)
-; 14       2    SRB_BufPtr segment
-; 16       1    SRB_SenseLen = 14
-; 17       1    SRB_CDBLen   (6 or 10)
-; 18       1    SRB_HaStat   (host adapter status, output)
-; 19       1    SRB_TargStat (target SCSI status, output)
-; 20       4    SRB_PostProc = 0 (synchronous poll mode)
-; 24      20    Reserved
-; 44      16    SRB_CDB      (SCSI Command Descriptor Block)
-; 60      14    SRB_SenseArea (auto request sense data)
+#### Panasonic ASPI SRB layout
+
+**Panasonic USBASPI does not use the standard Adaptec ASPI SRB format.** The field offsets are completely different. This was confirmed by disassembling ESPUSB.SYS and cross-checking every field write against the reference driver.
+
+```
+Offset  Size  Field            Notes
+ 0x00    1    SRB_Cmd          = 2 (EXEC_SCSI_CMD)
+ 0x01    1    SRB_Status       0=pending, 1=done; poll this field
+ 0x02    1    Host adapter     = 0
+ 0x03    1    Flags            0x08=data-in  0x10=data-out  0x18=no data
+ 0x04    4    (reserved)
+ 0x08    1    Target ID        ← Adaptec has this at 0x06
+ 0x09    1    LUN              ← Adaptec has this at 0x07
+ 0x0A    2    Transfer length  WORD (bytes) ← Adaptec: DWORD at 0x08
+ 0x0C    2    (reserved)
+ 0x0E    1    Sense length     always 0x12 = 18 ← Adaptec: at 0x10, value 14
+ 0x0F    2    Buffer offset    ← Adaptec: at 0x0C
+ 0x11    2    Buffer segment   ← Adaptec: at 0x0E
+ 0x13    4    (reserved)
+ 0x17    1    CDB length       ← Adaptec: at 0x11 (same name, wrong offset!)
+ 0x18   40    (reserved)
+ 0x40   12    CDB              ← Adaptec: CDB starts at 0x2C
+ 0x4C    4    (padding)
+ 0x50   18    Sense data       (18 bytes = SenseLen 0x12)
+              Total = 98 bytes
 ```
 
-Calling convention:
+Using the Adaptec layout with Panasonic USBASPI causes every SCSI command to fail:
+- USBASPI reads CDB length from offset **0x17** — in an Adaptec SRB, that byte is zero (end of `SRB_PostProc`). A CDB length of 0 causes USBASPI to send an empty command and hang.
+- USBASPI reads CDB opcode from offset **0x40** — in a 74-byte Adaptec SRB, that is beyond the end of the buffer, reading garbage.
+
+The warm-up TUR at INIT accidentally worked with the old Adaptec layout because opcode 0x00 (TEST UNIT READY) happened to be at offset 0x40 in memory (zeroed sense area), and a 0-length TUR was accepted. Every other command (INQUIRY, READ TOC, etc.) failed silently, causing SHSUCDX to hang waiting for a valid response.
+
+#### Calling convention
 
 ```asm
-; Set DS:SI = address of SRB, then:
-int 4Bh          ; ASPI entry point installed by USBASPI
+; Set SRB fields, then:
+push  cs                ; SRB segment = our CS
+push  word srb          ; SRB offset
+call  far [cs:aspi_off] ; call USBASPI function (from SCSIMGR$ IOCTL)
+add   sp, 4             ; clean stack
+sti                     ; USBASPI may leave interrupts disabled
 
-; Poll SRB_Status with timeout (~500 000 iterations ≈ 5 seconds):
+; Poll SRB_Status (offset 0x01):
 .poll:
     mov al, cs:[srb.sts]
     test al, al
     jnz .done
-    dec ecx
-    jnz .poll
-    ; timeout → return CF=1
+    ; ... loop with timeout
+.done:
+    cmp al, 1           ; 1 = ASPI_DONE = success
 ```
-
-The driver uses **synchronous polling** (`SRB_PostProc = 0`) rather than a callback, which is safe in the single-threaded DOS environment. All ASPI calls return CF=0 on success or CF=1 on error (timeout, host adapter error, or non-zero SCSI target status).
-
-The ASPI target ID and host adapter number default to 0 and can be overridden at load time with `/T:id` and `/H:ha` on the `DEVICE=` line in `CONFIG.SYS`.
 
 ### IOCTL Functions Implemented
 
@@ -1189,80 +1226,119 @@ The ESP32-S3 includes hardware accelerators for AES, SHA and RSA — verified at
 
 ## Audio CD Playback
 
-The firmware implements a full Red Book-compatible audio CD subsystem: SCSI commands are handled per the **Pioneer OB-U0077C CD-ROM SCSI-2 Command Set v3.1** specification.
+The firmware implements a full Red Book-compatible audio CD subsystem. SCSI commands follow the **Pioneer OB-U0077C CD-ROM SCSI-2 Command Set v3.1** specification.
 
-### Hardware
-
-Connect a **GY-PCM5102 I2S DAC** module to the ESP32-S3:
+### Hardware — GY-PCM5102 I2S DAC
 
 | ESP32-S3 GPIO | PCM5102 Pin | Signal |
 |---|---|---|
-| GPIO 14 | BCK | Bit clock |
+| GPIO 8  | BCK  | Bit clock |
 | GPIO 15 | LCK/WS | Word select |
-| GPIO 16 | DIN | Data |
-| 3V3 | VIN | Power |
-| GND | GND | Ground |
-| GND | FMT | I2S Philips format |
-| GND | SCK | No master clock |
+| GPIO 16 | DIN  | Data |
+| 3V3     | VIN  | Power (3.3 V) |
+| 3V3     | XSMT | Soft unmute — **must be HIGH** |
+| GND     | GND  | Ground |
+| GND     | FMT  | I2S Philips format |
+| GND     | SCK  | No external master clock |
 
-Enable via CLI: `set audio-module on`, or via the web Config tab. The module is initialised immediately — no reboot required. Disabling also takes effect immediately.
+> **⚠️ SCK solder bridge (most common cause of no audio):** Solder the **SCK bridge** on the front of the GY-PCM5102 PCB before anything else. Without it the chip has no internal clock and produces silence.
+>
+> **⚠️ XSMT:** Must be HIGH (3.3 V). When LOW the DAC is permanently muted. Close the **H3L** bridge on the back of the module as an alternative to wiring the pin.
+
+Enable: `set audio-module on` or via the web Config tab. Takes effect immediately — no reboot required.
+
+---
+
+### Complete Audio Mode Matrix
+
+This table covers every meaningful combination of OS, `dosCompat`, `dosDriver`, and audio module state.
+
+| OS / Player | dosCompat | dosDriver | Audio command path | PCM5102 output | PC speakers | Notes |
+|---|---|---|---|---|---|---|
+| **DOS** — any ASPI player | OFF | — | SCSI PLAY_AUDIO_MSF | ✅ clean | ❌ | dosCompat=OFF works but disc swap requires reboot |
+| **DOS** — ESPUSBCD.SYS | ON | 0 Generic | SCSI PLAY_AUDIO_MSF | ✅ clean | ❌ | Generic INQUIRY identity; full audio |
+| **DOS** — ESPUSBCD.SYS | ON | 2 Panasonic | SCSI PLAY_AUDIO_MSF | ✅ clean | ❌ | ✅ **Recommended** — MATSHITA CR-572 INQUIRY; cdplayer.exe + CDP.COM both work |
+| **DOS** — USBCD2.SYS | ON | 1 TEAC | SCSI PLAY_AUDIO_MSF | ✅ SCSI handled | ❌ | ⚠️ USBCD2 uses INT 13h AH=50h hook — driver broken; audio unreachable in practice |
+| **DOS** — DI1000DD.SYS | ON | 3 DI1000DD | ❌ no audio commands | ❌ | ❌ | Data-only by design; no MSCDEX needed |
+| **DOS** — any | ON | any | — | — | — | ⚠️ **Never connect Windows while dosCompat=ON** — WDT crash risk |
+| **DOS game** (SCSI PLAY direct) | any | 0/1/2 | SCSI PLAY_AUDIO_MSF | ✅ clean | ❌ | Games call PLAY directly via ASPI — always works |
+| **DOS game** | any | 3 | ❌ | ❌ | ❌ | DI1000DD passes no SCSI audio commands |
+| **Windows 98** — CDPlayer.exe | OFF | — | SCSI PLAY_AUDIO_MSF | ✅ | ❌ | ✅ Play works; Stop/Pause detected via READ_SUB_CHANNEL timeout (~1.2 s) |
+| **Windows 98** — CDPlayer.exe | ON | 0/1/2 | SCSI PLAY_AUDIO_MSF | ✅ | ❌ | ⚠️ WDT crash risk if Windows stays connected during UNIT ATTENTION loop |
+| **Windows 98** — CDPlayer.exe Stop | OFF | — | (no SCSI command sent) | ⏹ after 1.2 s | ❌ | Win98 USB stack never sends SCSI STOP (0x4E); firmware detects via poll absence |
+| **Windows 98** — CDPlayer.exe Pause | OFF | — | (no SCSI command sent) | ⏹ after 1.2 s | ❌ | Same as Stop — CDPlayer saves position internally; Play resumes from correct LBA |
+| **Windows 10/11** — WMP / Groove | OFF | — | SCSI READ_CD (0xBE) → zeros | ❌ silence | ❌ | Windows USB MSC stack never forwards `IOCTL_CDROM_RAW_READ` as SCSI READ CD |
+| **Windows 10/11** — WMP | ON | any | SCSI READ_CD → ILLEGAL REQUEST | ❌ | ❌ | dosCompat=ON returns error; prevents WDT crash |
+| **VLC** (Windows, any version) | OFF | — | READ_CD → silence | ❌ | ❌ | Same Windows MSC stack limitation |
+| **Linux** — cdparanoia / VLC | OFF | — | SCSI READ_CD (0xBE) | ✅ DAE works | ✅ (via DAE) | Linux kernel forwards READ_CD correctly over USB MSC; **PC speakers work** |
+| **HTML web player** | any | any | HTTP API `/api/audio/*` | ✅ | ❌ | Always works regardless of OS or dosCompat; independent of USB connection |
+
+**Legend:** ✅ works · ❌ does not work · ⏹ stops after timeout · ⚠️ risk/partial
+
+---
+
+### Why Win98 Stop/Pause Need Special Handling
+
+Windows 98 CDPlayer.exe (MCICDA driver) sends `PLAY_AUDIO_MSF` via USB, but **never sends SCSI STOP (0x4E) or PAUSE (0x4B)** for USB MSC devices. The Windows 98 USB CD-ROM stack was designed for drives with an analog audio cable — Stop was signalled by muting the analog input on the sound card, not via SCSI.
+
+**Detection method:** Win98 CDPlayer polls `READ_SUB_CHANNEL (0x42)` every ~100 ms in bursts of 5 while playing. When the user presses Stop or Pause, polling ceases. The firmware tracks the last poll timestamp and calls `audioStop()` when no poll arrives for longer than `win98StopMs` (default 1200 ms).
+
+| Event | What Win98 sends | ESP32 action |
+|---|---|---|
+| Play clicked | `PLAY_AUDIO_MSF` | Start PCM5102 from given LBA |
+| Stop clicked | *(nothing)* | `audioStop()` after 1.2 s of no READ_SUB_CHANNEL |
+| Pause clicked | *(nothing)* | `audioStop()` after 1.2 s; CDPlayer saves position |
+| Play after Stop | `PLAY_AUDIO_MSF` from track start | Restart from beginning |
+| Play after Pause | `PLAY_AUDIO_MSF` from saved LBA | Resume from correct position |
+
+Normal inter-burst gap is ≤ 580 ms. The 1200 ms timeout gives a 620 ms safety margin — no false stops during normal playback or track transitions. Adjust with `set win98-stop <ms>` (0 = disable).
+
+---
+
+### Why Windows 10/11 PC Speakers Do Not Work
+
+Windows `cdrom.sys` sends `IOCTL_CDROM_RAW_READ` for digital audio extraction, but for USB MSC devices this IOCTL is silently dropped by the USB class driver stack — it never becomes a SCSI READ CD command. READ TOC works (different IOCTL path) but READ CD never reaches the ESP32. This is an architectural limitation of the Windows USB MSC stack and cannot be worked around in firmware.
+
+**Linux** does not have this limitation — `cdparanoia` and VLC/Linux use a direct SCSI passthrough that correctly forwards READ CD over USB, giving full DAE (digital audio extraction) with audio on PC speakers.
+
+---
+
+### Audio Quality
+
+On a **DOS/retro PC** USB traffic is minimal (only PLAY/STOP commands). The audio task runs undisturbed on Core 1 — **no crackling**.
+
+On a **Windows PC** connected simultaneously, GET CONFIGURATION, READ TOC, and HTTP API polling compete for Core 0. Occasional SLOW BATCH delays cause brief crackling. To reduce: use `set audio-sectors 1`, or disconnect the Windows PC while listening.
+
+The I2S audio task runs on **Core 1 at priority 24** (above the WiFi task). DMA buffer: 14 descriptors × 2352 bytes = 128 KB = 746 ms. Each SD read batch (default 1 sector) completes in ~6 ms — well within the DMA drain period.
+
+---
 
 ### Audio Data Format
 
-Red Book audio sectors are **raw 16-bit signed stereo PCM, little-endian, 44100 Hz**:
-- 2352 bytes per sector = 588 stereo samples × 4 bytes (16-bit L + 16-bit R)
-- **No header** — all 2352 bytes are usable PCM data
-- I2S configured: 44100 Hz, 16-bit, stereo, Philips format
+Red Book audio sectors: **raw 16-bit signed stereo PCM, little-endian, 44100 Hz**:
+- 2352 bytes/sector = 588 stereo samples × 4 bytes (16-bit L + 16-bit R)
+- No header — all 2352 bytes are usable PCM
+- I2S: 44100 Hz, 16-bit, stereo, Philips format
 
-### Audio Support by Mode
-
-| Mode | Audio |
-|---|---|
-| Non-DOS (Windows, Windows 98, Linux) | ✅ Full |
-| DOS compat, driver 0 Generic | ✅ Full |
-| DOS compat, driver 1 USBCD2/TEAC | ✅ SCSI handled (driver communication broken via INT 13h) |
-| DOS compat, driver 2 ESPUSBCD/Panasonic | ✅ Full |
-| DOS compat, driver 3 DI1000DD | ❌ Data-only by design |
-
-### Virtual Disc Layout (CUE/BIN)
-
-For **separate BIN files** (one `.bin` per track — e.g. Tomb Raider):
-```
-LBA 0          … dataTrackSectors-1   → Track 01 (data)
-LBA dataEnd    … dataEnd+len02-1      → Track 02 (audio, pregap stripped)
-LBA …          … …                    → Track 03 … N
-LBA leadOut                           → Lead-out (reported in READ TOC as 0xAA)
-```
-
-For **single BIN file** (all tracks in one file):
-- Track LBAs come directly from CUE `INDEX 01` positions (absolute BIN sector)
-- Audio seek: `fileSector = fileSectorBase + (lba - trackStartLba)` where `fileSectorBase = trackStartLba` for single-BIN
-- `mscReadCb` uses `dataTrackStartSect = 0` for single-BIN (DOS navigates via Track 01 LBA from TOC)
-
-**Pregap handling:**
-- Physical pregap (INDEX 00 in CUE): `fileSectorBase = INDEX01_position`; length excludes the pregap
-- Virtual pregap (PREGAP directive): `fileSectorBase = 0`; pregap LBA space reserved in virtual layout but no file seek needed
+---
 
 ### Bidirectional Synchronisation
-
-HTML player and PC player are kept in sync via shared firmware state:
 
 | Direction | Path | Latency |
 |---|---|---|
 | PC → HTML | SCSI command → `audioState` → `/api/audio/status` poll | ≤ 400 ms |
 | HTML → PC | `/api/audio/*` → `audioState` → SCSI READ SUB-CHANNEL | < 1 ms |
 
-The HTML player polls `/api/audio/status` every **400 ms** when the Audio tab is open, every **2 s** in the background. Sub-channel MSF position updates every sector (every **13 ms**) in the audio task.
+HTML player polls `/api/audio/status` every **400 ms** when the Audio tab is open, every **2 s** in background.
+
+---
 
 ### Without the I2S Module
 
-CUE tracks are still parsed and all SCSI commands work correctly. The audio task tracks position in real time at 75 frames/sec using `vTaskDelay`. PC games see a correctly working CD player (TOC, sub-channel, play/stop/pause) — just no analogue audio output.
-
-### Connecting to a Mixer
-
-PCM5102 output is line level (~2 Vrms). Connect to **line-in** (AUX input), not microphone. Set firmware volume to 100 and regulate gain at the mixer.
+CUE tracks are parsed and all SCSI audio commands work correctly. The audio task tracks position in real time at 75 frames/sec using `vTaskDelay`. PC games see a fully working CD player (TOC, sub-channel, play/stop/pause) — just no analogue audio output.
 
 ---
+
 
 ## SCSI Command Reference
 
@@ -1303,6 +1379,8 @@ The firmware implements the USB MSC CD-ROM profile with SCSI-2 commands per **Pi
 | `4Bh` | PAUSE/RESUME | Byte 8 bit 0: `1`=resume, `0`=pause. |
 | `4Eh` | STOP PLAY/SCAN | Stops audio playback. |
 | `A5h` | PLAY AUDIO (12) | Same as `45h` but 32-bit transfer length in bytes 6–9. |
+| `A9h` | PLAY AUDIO TRACK RELATIVE (12) | Same as `49h` but 12-byte CDB with 32-bit transfer length. |
+| `BEh` | READ CD | Digital Audio Extraction — Windows/Linux DAE. Triggers PCM5102 playback mirrored from the audio track. Zeros returned to host (silence on PC speakers). Not used by DOS drivers 0/1/2 (they use PLAY AUDIO). |
 
 ### Sense Key Reference
 
@@ -1789,6 +1867,31 @@ The device may not be in download mode:
 3. Release **BOOT**
 4. Run the flash script immediately
 
+### PC completely freezes during firmware flashing (NumLock unresponsive, Ctrl+Alt+Del not working)
+
+This is caused by a USB interrupt storm triggered by the esptool `hard_reset` sequence. After writing the firmware, esptool toggles the DTR/RTS serial lines to reset the ESP32. Some CH343/CP2102 USB-serial modules respond with a USB disconnect/reconnect sequence. If the host USB driver handles this at an elevated interrupt priority (DPC level on Windows, interrupt context on Linux), it can deadlock the entire USB stack and freeze the OS completely — not just the flashing process.
+
+The flash scripts use `--after no_reset` to prevent this. After a successful flash, a separate `esptool run` command triggers the boot without going through the USB serial reset path. If you are using an older version of the scripts, replace `--after hard_reset` with `--after no_reset` manually.
+
+### PC completely freezes when SHSUCDX.COM or MSCDEX.EXE loads (NumLock unresponsive)
+
+Earlier versions called `INT 4Bh` for ASPI. On many DOS systems INT 4Bh is the Virtual DMA Services interrupt (HIMEM.SYS), not the ASPI entry point. VDS misinterpreted the SRB as a DMA request and froze the PC. Fixed by using the `SCSIMGR$` device interface instead — confirmed by disassembling ESPUSB.SYS.
+
+### SHSUCDX loads but hangs (NumLock still responds)
+
+This was caused by using the Adaptec ASPI SRB field layout with Panasonic USBASPI, which uses completely different offsets. Most critically:
+
+- **Panasonic reads CDB length from SRB offset 0x17.** In an Adaptec SRB that byte is part of the `SRB_PostProc` field and is always zero. USBASPI received CDB length = 0 and either sent an empty command or waited indefinitely for a valid command.
+- **Panasonic reads CDB opcode from SRB offset 0x40.** In a 74-byte Adaptec SRB that is beyond the buffer boundary — USBASPI read garbage as the SCSI opcode.
+
+The Panasonic SRB is 98 bytes with CDB at offset 0x40 and CDB length at offset 0x17. The current driver uses the correct layout. If this hang recurs, verify that `USBASPI1.SYS` or `USBASPI2.SYS` loads successfully before `ESPUSBCD.SYS` in CONFIG.SYS.
+
+### ESPUSBCD.SYS shows "no disc" at DOS boot even though the ESP32 has an image mounted
+
+This was a timing issue in earlier driver versions. USBASPI scans the USB bus at its own init time during POST, but the ESP32 may still be completing USB enumeration and mounting the default boot image when the ESPUSBCD.SYS driver loads a few milliseconds later. A TEST UNIT READY sent this early returns CHECK CONDITION (not ready) even though the drive is healthy — causing a spurious "no disc" warning.
+
+The current driver sends a warm-up TUR at INIT but ignores the result. It always loads successfully and prints `ESPUSBCD: Loaded. Ready for MSCDEX/SHSUCDX.` The actual disc detection happens on the first command from MSCDEX/SHSUCDX, by which time the ESP32 is fully ready.
+
 ### Disc swap in DOS causes device to disappear
 
 Enable DOS Compatibility Mode:
@@ -1811,6 +1914,21 @@ python3 build_exfat_libs.py --skip-full-build
 ### After several remounts the drive appears empty or disappears
 
 This is caused by the OS not catching the disc-change signal in time. The firmware signals UNIT ATTENTION across 3 consecutive TUR poll cycles and sequences the `msc.mediaPresent(false)` / `msc.mediaPresent(true)` transition carefully to minimise the window during which no media is visible. In non-DOS mode, USB callbacks are re-registered before every `msc.begin()` call to prevent callback loss across remounts.
+
+### Crackling / audio noise on Windows PC
+
+The audio task and WiFi compete on Core 0. Reduce noise by:
+1. `set audio-sectors 1` — smallest SDMMC burst duration (~1.6 ms vs ~6 ms default)
+2. `wifi off` — disables WiFi entirely (diagnostic; use serial CLI while connected via UART)
+3. Use a **DOS / retro PC** for listening — no WiFi traffic means clean audio
+
+The root cause (GPIO12 SDMMC CLK coupling into GPIO8 I2S BCK) is a hardware limitation. Permanent fix: rewire I2S to GPIO17/18/21 (far from GPIO12).
+
+### WDT crash in dosCompat mode
+
+When `dosCompat=ON` and a Windows PC connects, Windows enters a rapid UNIT ATTENTION loop (7× GET CONFIGURATION + MODE SENSE). This causes a WDT reset after ~5 seconds.
+
+**Workaround:** Never connect a Windows PC when dosCompat is enabled. dosCompat is designed exclusively for DOS/retro systems.
 
 ### Forgotten web UI password
 
