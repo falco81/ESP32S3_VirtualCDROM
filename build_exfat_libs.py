@@ -436,19 +436,29 @@ def patch_usbmsc(path):
             new_tur = (
                 '// UNIT ATTENTION counter — persists for multiple TUR polling cycles so the OS\n'
                 '// has several opportunities to react to disc change (single-shot flag is unreliable).\n'
+                '// First TUR returns ASC=29h (POWER ON/RESET) which forces every SCSI host to perform\n'
+                '// a complete re-initialisation including INQUIRY and PVD re-read.  This is required\n'
+                '// for DOS audio players (NC, CDPlayer) that keep a cached PVD across disc swaps and\n'
+                '// do not re-read the filesystem on ASC=28h (MEDIUM CHANGED) alone.\n'
+                '// Subsequent TURs return ASC=28h (MEDIUM CHANGED) so MSCDEX/SHSUCDX also sees the\n'
+                '// standard disc-change notification and re-reads the TOC.\n'
                 'static volatile uint8_t _ua_counter = 0;\n'
-                'extern "C" void msc_set_unit_attention(void) { _ua_counter = 3; }\n'
+                '// _audioPlayedOnce: per spec 0x13 returned once after play ends, then 0x15.\n'
+                '// Defined here (before msc_set_unit_attention) so it can be reset on disc swap.\n'
+                'static volatile bool _audioPlayedOnce = false;\n'
+                'extern "C" void msc_set_unit_attention(void) { _ua_counter = 4; _audioPlayedOnce = false; }\n'
                 'bool tud_msc_test_unit_ready_cb(uint8_t lun) {\n'
                 '  if (_ua_counter > 0) {\n'
+                '    uint8_t asc = (_ua_counter == 4) ? 0x29 : 0x28;\n'
                 '    _ua_counter--;\n'
-                '    tud_msc_set_sense(lun, 0x06, 0x28, 0x00);\n'
+                '    tud_msc_set_sense(lun, 0x06, asc, 0x00);\n'
                 '    return false;\n'
                 '  }\n'
                 '  return msc_luns[lun].media_present;\n'
                 '}\n'
             )
             src = src[:tur_start] + new_tur + src[tur_end:]
-            print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION (8-cycle counter)')
+            print('  Patched tud_msc_test_unit_ready_cb for UNIT ATTENTION (ASC=29 first + ASC=28 x3)')
 
     if 'CD-ROM SCSI patched v14' in src:
         print("  Already patched v14")
@@ -492,8 +502,7 @@ def patch_usbmsc(path):
         "// setSense: set SCSI sense and return -1 (error)\n"
         "static inline int32_t setSense(uint8_t sk,uint8_t asc,uint8_t ascq){\n"
         "  tud_msc_set_sense(0,sk,asc,ascq); return -1;}\n"
-        "// audioPlayedOnce: per spec, 0x13/0x14 returned only once, then 0x15\n"
-        "static volatile bool _audioPlayedOnce=false;\n"
+        "// _audioPlayedOnce declared near _ua_counter (before msc_set_unit_attention)\n"
         "extern int      scsi_audio_state();\n"
         "extern void     scsi_audio_subchannel(uint8_t*);\n"
         "extern int      scsi_audio_track_count();\n"

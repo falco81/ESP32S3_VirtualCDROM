@@ -69,6 +69,7 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 | Windows 10/11 DAE (READ CD) — no audio on PC speakers | Windows USB MSC stack does not forward `IOCTL_CDROM_RAW_READ` as SCSI READ CD | Audio plays on PCM5102 only; use HTML web player |
 | Win98 Stop/Pause ~1–2 s delay | Detected via READ_SUB_CHANNEL polling timeout, not SCSI command | Configurable via `set win98-stop <ms>` |
 | Win98 RESUME not supported | MCICDA treats RESUME same as PLAY from saved position | Transparent — works correctly |
+| **ESPUSBCD.SYS — disc swap after audio playback shows stale filesystem** | Driver-side PVD cache bug (see below) | Remount the disc a second time, or reboot the DOS PC |
 
 
 ## Hardware Requirements
@@ -836,6 +837,16 @@ ECHO Disc: %1
 `ESPUSBCD.SYS` is a modified `USBCD.SYS`-based DOS CD-ROM character device driver providing complete MSCDEX-compatible audio and data CD-ROM support through the standard Panasonic ASPI interface (`USBASPI1.SYS` / `USBASPI2.SYS`). Place it on the DOS machine alongside `USBASPI1.SYS` or `USBASPI2.SYS` (for example in `C:\DRIVERS\`). Ready-made `CONFIG.SYS` and `AUTOEXEC.BAT` templates with correct DOS CRLF line endings are in the project `driver/` folder.
 
 The driver communicates with the ESP32 entirely through the USBASPI layer via SCSI commands — no USB code is in the driver itself.
+
+### Known Issue: Stale Filesystem Cache After Audio Disc Swap
+
+**Symptom:** After playing audio from a CUE disc and then swapping to a different disc (ISO or another CUE), the file manager (NC, Volkov Commander, etc.) shows a corrupted or empty directory — typically the error "not enough memory to read N files" or garbled filenames. A second remount of the same disc always works correctly.
+
+**Root cause:** ESPUSBCD.SYS does not issue TEST UNIT READY or READ SUB-CHANNEL itself — these commands are sent by SHSUCDX/MSCDEX and the DOS audio player (NC, CDPlayer.exe). When a disc swap occurs while audio is playing or paused, SHSUCDX detects the UNIT ATTENTION condition from USBASPI and notifies the driver. However, the driver's internal state machine does not fully re-initialise when transitioning from an audio session: it re-reads the TOC but does not re-read the ISO 9660 Primary Volume Descriptor (PVD) at LBA 16. SHSUCDX therefore continues navigating the new disc's filesystem using the old disc's root directory pointer, which points to wrong or meaningless data on the new disc.
+
+This was confirmed by observing that LBA 16 is correctly read after a non-audio disc swap but is never requested after an audio→data swap. The ESP32 firmware returns correct data in both cases — the bug is entirely in the driver's disc-change code path.
+
+**Workaround:** Mount the target disc a second time from the web UI or via the serial CLI. The second mount always succeeds because the driver by then has a clean state from the first attempt. Alternatively, reboot the DOS PC after swapping from an audio disc to a data disc.
 
 ---
 
