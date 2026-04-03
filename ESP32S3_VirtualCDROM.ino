@@ -98,9 +98,9 @@ struct AudioTrack {
 // Global audio track table — filled by parseCue, cleared on umount
 static AudioTrack audioTracks[MAX_AUDIO_TRACKS];
 static uint8_t    audioTrackCount   = 0;
-static uint32_t   dataTrackEndLba   = 0;  // LBA where data track ends
-static uint32_t   dataTrackStartSect = 0; // Sector index in BIN file where data track begins (for mscReadCb offset)
-static uint32_t   dataTrackSectors_g = 0; // Usable data sector count (for cdromBlockCount)
+static volatile uint32_t   dataTrackEndLba   = 0;  // LBA where data track ends
+static volatile uint32_t   dataTrackStartSect = 0; // Sector index in BIN file where data track begins (for mscReadCb offset)
+static volatile uint32_t   dataTrackSectors_g = 0; // Usable data sector count (for cdromBlockCount)
 
 // ── Playback state (accessed from SCSI callbacks and audio task) ──
 // All writes from a single core; reads from SCSI callback (core 0) are
@@ -399,13 +399,16 @@ bool      sdReady        = false;
 String    mountedFile    = "";
 uint32_t  mountedBlocks  = 0;
 uint16_t  mountedBlkSize = 2048;
-File      isoFileHandle;
-bool      isoOpen        = false;
+// isoOpen and mscMediaPresent guard mscReadCb (Core 0) from accessing isoFileHandle
+// while doMount/fullReset (Core 1) is swapping files.  MUST be volatile so Core 0
+// always reads the current value written by Core 1, not a stale register copy.
+File               isoFileHandle;
+volatile bool      isoOpen        = false;
 
 USBMSC msc;  // registers MSC USB interface descriptor
 
-// MSC state - accessed from TinyUSB callbacks
-bool     mscMediaPresent = false;
+// MSC state - accessed from TinyUSB callbacks (Core 0) and doMount (Core 1)
+volatile bool     mscMediaPresent = false;
 uint32_t mscBlockCount   = 0;
 uint16_t mscBlockSize    = 2048;
 
@@ -462,9 +465,15 @@ void closeIso() {
 //    MODE2/2352 : [sync 12][addr 3][mode 1][subhdr 8][DATA 2048][ECC 280] offset=24
 //    MODE2/2336 : [subhdr 8][DATA 2048][ECC 280]                offset=8
 // =============================================================================
-static uint8_t  binHeaderOffset  = 16;
-static uint16_t binRawSectorSize = 2352;
-static uint16_t binUserDataSize  = 2048;
+// Sector geometry — written by Core 1 (doMount/fullReset), read by Core 0 (mscReadCb/cacheFill).
+// MUST be volatile: without it, Core 0 may read stale register/cache values after Core 1 updates them,
+// causing cacheFillWindow_locked to use old binRawSectorSize (e.g. 2352 from a previous CUE mount)
+// and take the raw-sector path for a cooked ISO, producing garbage data (wrong seek position + wrong
+// byte extraction).  This only manifests after audio playback because Core 0 hot-caches the geometry
+// during intensive audio-era reads; on a first/fresh mount Core 0 has no stale cached value.
+static volatile uint8_t  binHeaderOffset  = 16;
+static volatile uint16_t binRawSectorSize = 2352;
+static volatile uint16_t binUserDataSize  = 2048;
 
 // Convert MSF string "MM:SS:FF" to LBA (sectors from start of disc)
 static uint32_t msfToLba(const String &msf) {
@@ -793,51 +802,97 @@ String parseCue(const String &cuePath) {
 }
 
 // =============================================================================
+//  FULL DISC STATE RESET
+//  Brings the device to an identical state as a fresh boot — minus USB
+//  connection, Wi-Fi and NVS settings.  Called at the start of every
+//  doMount() and doUmount() so every mount/eject begins from a clean slate.
+//
+//  Order matters:
+//    1. mscMediaPresent=false / isoOpen=false  — stop Core 0 reads first
+//    2. cacheInvalidate()                      — while no reads in flight
+//    3. audioStop() + wait for file close      — audio task owns its File
+//    4. delay(15) + closeIso()                 — let in-flight mscReadCb exit
+//    5. zero ALL disc geometry and track state — deterministic fresh slate
+// =============================================================================
+static void fullReset() {
+  // ── 1. Block all reads immediately ───────────────────────────────────────
+  mscMediaPresent = false;
+  isoOpen         = false;   // belt-and-suspenders: mscReadCb checks both
+
+  // ── 2. Flush PSRAM cache ──────────────────────────────────────────────────
+  cacheInvalidate();
+
+  // ── 3. Stop audio and close its BIN file handle ───────────────────────────
+  audioStop();
+  audioCloseFile = true;
+  for (int _w = 0; _w < 60 && audioCloseFile; _w++) delay(10);
+  if (audioCloseFile) {
+    dualPrint.println(F("[WARN] fullReset: audioCloseFile wait timed out — forcing clear"));
+    audioCloseFile = false;
+  }
+
+  // ── 4. Close ISO file handle ──────────────────────────────────────────────
+  delay(15);   // let any in-flight mscReadCb sector loop see isoOpen=false
+  if (isoFileHandle) { isoFileHandle.close(); isoFileHandle = File(); }
+
+  // ── 5. Reset disc geometry ────────────────────────────────────────────────
+  mountedFile        = "";
+  mountedBlocks      = 0;
+  mountedBlkSize     = 2048;
+  mscBlockCount      = 0;
+  mscBlockSize       = 2048;
+  binRawSectorSize   = 2048;
+  binHeaderOffset    = 0;
+  binUserDataSize    = 2048;
+  cdromBlockCount    = 0;
+  discLeadOutLba     = 0;
+  dataTrackStartSect = 0;
+  dataTrackSectors_g = 0;
+  dataTrackEndLba    = 0;
+
+  // ── 6. Reset audio track table ────────────────────────────────────────────
+  audioTrackCount = 0;
+  audioCurrentLba = 0;
+  audioEndLba     = 0;
+  audioPlaySeq++;   // invalidate any in-flight audio batch
+  for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
+    audioTracks[i].valid          = false;
+    audioTracks[i].pregapSectors  = 0;
+    audioTracks[i].fileSectorBase = 0;
+    audioTracks[i].startLba       = 0;
+    audioTracks[i].lengthSectors  = 0;
+  }
+
+  // ── 7. Reset SCSI polling state ───────────────────────────────────────────
+  subPollActive        = false;
+  unitAttentionPending = false;
+}
+
+// =============================================================================
 //  MOUNT / UMOUNT
 // =============================================================================
 bool doMount(const String &filename) {
   if (!sdReady) { dualPrint.println(F("[ERR] SD not available.")); return false; }
 
+  bool hadDisc = isoOpen;  // save before fullReset zeroes it
 
+  // ── Full clean slate (audio, cache, file handles, all state) ─────────────
+  fullReset();
 
   String fl = filename; fl.toLowerCase();
   String actualFile = filename;
-
-  // Stop mscReadCb reads immediately (our internal guard) — but do NOT signal
-  // TUR no-media yet. MSCDEX should not see extended "no media" while we parse/open files
-  // because it may stop polling and miss the subsequent disc-change notification.
-  bool hadDisc = isoOpen;
-  mscMediaPresent = false;
-  cacheInvalidate();  // flush stale sectors before opening new image
 
   if (fl.endsWith(".cue")) {
     dualPrint.printf("[CUE] Parsing: %s\n", filename.c_str());
     actualFile = parseCue(filename);
     if (!actualFile.length()) { dualPrint.println(F("[ERR] CUE: no data track found.")); return false; }
-  }
-  closeIso();
-  delay(200);
-
-  // Reset disc state AFTER parseCue() so CUE geometry is preserved,
-  // but reset audio/LBA state that must be re-populated by parseCue
-  audioStop();
-  if (!fl.endsWith(".cue")) {
-    // For ISO/BIN: reset everything; for CUE parseCue() already set it
-    audioTrackCount   = 0;
-    dataTrackEndLba   = 0;
-    discLeadOutLba    = 0;
-    cdromBlockCount   = 0;
-    dataTrackStartSect = 0;
-    dataTrackSectors_g = 0;
-    binRawSectorSize  = 2352;
-    binHeaderOffset   = 16;
-    binUserDataSize   = 2048;
-    for (int i = 0; i < MAX_AUDIO_TRACKS; i++) {
-      audioTracks[i].valid = false;
-      audioTracks[i].pregapSectors = 0;
-      audioTracks[i].fileSectorBase = 0;
-      audioTracks[i].startLba = 0;
-      audioTracks[i].lengthSectors = 0;
+    // parseCue() sets binRawSectorSize / binHeaderOffset / binUserDataSize / audioTracks[]
+  } else {
+    // ISO / plain BIN defaults (parseCue not called)
+    if (fl.endsWith(".iso")) {
+      binRawSectorSize = 2048; binHeaderOffset = 0; binUserDataSize = 2048;
+    } else {
+      binRawSectorSize = 2352; binHeaderOffset = 16; binUserDataSize = 2048;
     }
   }
 
@@ -931,17 +986,8 @@ bool doMount(const String &filename) {
 }
 
 void doUmount() {
-  audioStop();
-  audioCloseFile = true;   // signal audio task to close its open BIN file handle
-  vTaskDelay(pdMS_TO_TICKS(30)); // wait one audio task tick (20ms) for the close to happen
-  mscMediaPresent = false;
-  cacheInvalidate();  // discard cached sectors for the ejected disc
-  closeIso();
-  mountedFile = ""; mountedBlocks = 0;
-  mscBlockCount = 0; cdromBlockCount = 0; discLeadOutLba = 0;
-  dataTrackStartSect = 0; dataTrackSectors_g = 0;
-  unitAttentionPending = false;
-  audioTrackCount = 0; dataTrackEndLba = 0;
+  fullReset();   // clean slate — identical to boot state
+
   if (cfg.dosCompat) {
     // DOS compat: drive stays connected — just eject the disc
     msc.mediaPresent(false);   // signal: no media, drive stays enumerated
@@ -1048,15 +1094,23 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
 }
 
 // =============================================================================
-//  PSRAM SECTOR CACHE — read-ahead cache for USB MSC data-track sectors
+//  PSRAM SECTOR CACHE — 2-window LRU read-ahead cache for USB MSC data-track sectors
 //
 //  Problem: mscReadCb was called once per 2048-byte sector with a seek()+read()
 //  each time.  For a 700 MB disc that means ~350 000 individual SD transactions,
 //  each paying seek overhead (FatFS cluster-chain traversal + SD command latency).
 //
-//  Solution: on the first miss at LBA X, read CACHE_SECTOR_COUNT sectors in one
-//  sequential burst into PSRAM.  The next 255 host requests are served by memcpy
-//  from PSRAM (≈1 µs) instead of SD (≈1-5 ms).
+//  Single-window solution: on a miss at LBA X, read CACHE_SECTOR_COUNT sectors
+//  sequentially into PSRAM.  Subsequent requests served by memcpy (≈1 µs).
+//
+//  Problem with single window: if the host alternates between two non-overlapping
+//  LBA regions (e.g. directory at LBA 106 and data at LBA 833), the single window
+//  is continuously evicted → 100% miss rate → every read costs ~200 ms → PC hangs.
+//
+//  2-window LRU solution: two independent cache windows share the same PSRAM pool.
+//  Each holds 128 sectors (256 KB).  LRU eviction replaces the least-recently-used
+//  window on a miss.  Two hot regions are both retained simultaneously, eliminating
+//  the ping-pong thrash while keeping total PSRAM at 512 KB.
 //
 //  Format support:
 //    ISO / MODE1-2048  → raw sector == user data → single large read()
@@ -1064,36 +1118,48 @@ extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, uint8_t *r, uint32_t bufsiz
 //    MODE2/2352        → read raw, extract bytes [24..2071]
 //    MODE2/2336        → read raw, extract bytes [8..2055]
 //    CDG/2448          → read raw, extract bytes [0..2351] (binUserDataSize=2352)
-//  binHeaderOffset and binUserDataSize are set by parseCue()/doMount() and fully
-//  describe the extraction for every supported format.
 //
 //  Safety:
-//    • Cache is invalidated on every doMount() / doUmount() — no stale data.
-//    • g_cacheMtx prevents cache fill racing with invalidation (cross-core).
-//    • isoFileHandle is only touched from mscReadCb (core 0 TinyUSB task) and
-//      from doMount/doUmount (core 1, but mscMediaPresent=false guards those).
+//    • Cache invalidated on every doMount() / doUmount() — no stale data.
+//    • g_cacheMtx serialises fill / invalidate (cross-core safe).
+//    • isoFileHandle touched only from mscReadCb (core 0) or doMount/doUmount
+//      (core 1 with mscMediaPresent=false guard).
 //    • Audio task uses its own File handle + sdMutex — fully independent.
 // =============================================================================
-#define CACHE_SECTOR_COUNT  256u            // 256 × 2048 = 512 KB in PSRAM
-#define CACHE_BYTES         (CACHE_SECTOR_COUNT * 2048u)
+#define CACHE_WINDOWS       2u               // number of LRU windows
+#define CACHE_SECTOR_COUNT  128u             // sectors per window (128 × 2048 = 256 KB)
+#define CACHE_WINDOW_BYTES  (CACHE_SECTOR_COUNT * 2048u)
+#define CACHE_BYTES         (CACHE_WINDOWS * CACHE_WINDOW_BYTES)  // 512 KB total
 
-static uint8_t*          g_cacheBuf  = nullptr;     // PSRAM: user-data sectors (2048 B each)
-static uint8_t*          g_rawBuf    = nullptr;     // PSRAM: temp raw-sector buffer (≤2448 B)
-static uint32_t          g_cacheBase = 0xFFFFFFFFu; // first disc-relative LBA in cache
-static uint32_t          g_cacheCnt  = 0;           // number of valid sectors in cache
-static SemaphoreHandle_t g_cacheMtx  = nullptr;
+static uint8_t*          g_cacheBuf          = nullptr;   // PSRAM: all windows contiguous
+static uint8_t*          g_rawBuf            = nullptr;   // PSRAM: temp raw-sector (≤2448 B)
+static uint32_t          g_cacheBase[CACHE_WINDOWS];      // LBA base (0xFFFFFFFF = invalid)
+static uint32_t          g_cacheCnt [CACHE_WINDOWS];      // valid sector count per window
+static uint32_t          g_cacheTick[CACHE_WINDOWS];      // LRU timestamps
+static uint32_t          g_cacheNow          = 0;         // global LRU clock
+static SemaphoreHandle_t g_cacheMtx          = nullptr;
+
+// Return pointer to data area of window w.
+static inline uint8_t* cacheWinBuf(int w) {
+  return g_cacheBuf + (uint32_t)w * CACHE_WINDOW_BYTES;
+}
 
 // Allocate cache buffers in PSRAM.  Call once from setup().
 static void cacheAlloc() {
   g_cacheMtx = xSemaphoreCreateMutex();
+  for (int i = 0; i < (int)CACHE_WINDOWS; i++) {
+    g_cacheBase[i] = 0xFFFFFFFFu;
+    g_cacheCnt [i] = 0;
+    g_cacheTick[i] = 0;
+  }
+  g_cacheNow = 0;
   g_cacheBuf = (uint8_t*)heap_caps_malloc(CACHE_BYTES,
                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  // Raw-sector temp buffer: max raw sector is 2448 B (CDG format)
   g_rawBuf   = (uint8_t*)heap_caps_malloc(2448u,
                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (g_cacheBuf && g_rawBuf) {
-    dualPrint.printf("[CACHE] %u KB read-ahead sector cache in PSRAM (%u sectors)\n",
-                     CACHE_BYTES / 1024u, CACHE_SECTOR_COUNT);
+    dualPrint.printf("[CACHE] %u KB read-ahead cache in PSRAM (%u windows × %u sectors)\n",
+                     CACHE_BYTES / 1024u, CACHE_WINDOWS, CACHE_SECTOR_COUNT);
   } else {
     dualPrint.println(F("[CACHE] PSRAM unavailable — sector cache disabled"));
     heap_caps_free(g_cacheBuf); g_cacheBuf = nullptr;
@@ -1101,62 +1167,59 @@ static void cacheAlloc() {
   }
 }
 
-// Invalidate cache.  Must be called whenever the mounted image changes.
+// Invalidate all windows.  Call whenever the mounted image changes.
 static void cacheInvalidate() {
   if (!g_cacheMtx) return;
   if (xSemaphoreTake(g_cacheMtx, pdMS_TO_TICKS(500)) == pdTRUE) {
-    g_cacheBase = 0xFFFFFFFFu;
-    g_cacheCnt  = 0;
+    for (int i = 0; i < (int)CACHE_WINDOWS; i++) {
+      g_cacheBase[i] = 0xFFFFFFFFu;
+      g_cacheCnt [i] = 0;
+      g_cacheTick[i] = 0;
+    }
+    g_cacheNow = 0;
     xSemaphoreGive(g_cacheMtx);
   }
 }
 
-// Fill cache starting at disc-relative LBA `lba`.
-// Must be called with g_cacheMtx already held by the caller.
-// Reads up to CACHE_SECTOR_COUNT user-data sectors sequentially from isoFileHandle.
-static void cacheFill_locked(uint32_t lba) {
+// Fill window `win` starting at disc-relative LBA `lba`.
+// Must be called with g_cacheMtx already held.
+static void cacheFillWindow_locked(int win, uint32_t lba) {
   if (!g_cacheBuf || !g_rawBuf || !isoOpen || !mscMediaPresent) return;
 
-  // Determine how many sectors we can cache without going past the data track end.
   uint32_t maxLba = (dataTrackSectors_g > 0) ? dataTrackSectors_g : cdromBlockCount;
   if (lba >= maxLba) return;
   uint32_t avail = maxLba - lba;
   if (avail > CACHE_SECTOR_COUNT) avail = CACHE_SECTOR_COUNT;
 
-  g_cacheBase = lba;
-  g_cacheCnt  = 0;
+  g_cacheBase[win] = lba;
+  g_cacheCnt [win] = 0;
+  uint8_t* winBuf  = cacheWinBuf(win);
 
   if (binRawSectorSize <= 2048) {
-    // ── Cooked / ISO / MODE1-2048 ─────────────────────────────────────────
-    // User data equals raw data; sectors are tightly packed.
-    // One large sequential read fills the entire cache block.
+    // Cooked / ISO / MODE1-2048: single large sequential read.
     uint64_t pos = (uint64_t)(lba + dataTrackStartSect) * 2048u;
-    if (!isoFileHandle.seek(pos)) { g_cacheBase = 0xFFFFFFFFu; return; }
-    int32_t got = (int32_t)isoFileHandle.read(g_cacheBuf, avail * 2048u);
-    if (got > 0) g_cacheCnt = (uint32_t)got / 2048u;
+    if (!isoFileHandle.seek(pos)) { g_cacheBase[win] = 0xFFFFFFFFu; return; }
+    int32_t got = (int32_t)isoFileHandle.read(winBuf, avail * 2048u);
+    if (got > 0) g_cacheCnt[win] = (uint32_t)got / 2048u;
   } else {
-    // ── Raw format (MODE1/2352, MODE2/2352, MODE2/2336, CDG/2448) ─────────
-    // Seek once to the first raw sector, then read sequentially — no per-sector
-    // seek overhead.  Extract binUserDataSize bytes from each raw sector.
+    // Raw format: seek once, read sector-by-sector, extract user data.
     uint64_t pos = (uint64_t)(lba + dataTrackStartSect) * binRawSectorSize;
-    if (!isoFileHandle.seek(pos)) { g_cacheBase = 0xFFFFFFFFu; return; }
+    if (!isoFileHandle.seek(pos)) { g_cacheBase[win] = 0xFFFFFFFFu; return; }
     for (uint32_t i = 0; i < avail; i++) {
       if (!isoOpen || !mscMediaPresent) break;
       int32_t got = (int32_t)isoFileHandle.read(g_rawBuf, binRawSectorSize);
       if (got < (int32_t)binRawSectorSize) break;
-      memcpy(g_cacheBuf + i * 2048u,
-             g_rawBuf + binHeaderOffset,
-             binUserDataSize);
-      g_cacheCnt++;
+      memcpy(winBuf + i * 2048u, g_rawBuf + binHeaderOffset, binUserDataSize);
+      g_cacheCnt[win]++;
     }
   }
 
-  if (g_cacheCnt == 0) g_cacheBase = 0xFFFFFFFFu;
+  if (g_cacheCnt[win] == 0) g_cacheBase[win] = 0xFFFFFFFFu;
 
   if (cfg.debugMode)
-    dualPrint.printf("[CACHE] fill LBA %lu+%lu ok (%s)\n",
-                     (unsigned long)lba, (unsigned long)g_cacheCnt,
-                     binRawSectorSize <= 2048 ? "cooked" : "raw");
+    dualPrint.printf("[CACHE] fill LBA %lu+%lu ok (%s) win%d\n",
+                     (unsigned long)lba, (unsigned long)g_cacheCnt[win],
+                     binRawSectorSize <= 2048 ? "cooked" : "raw", win);
 }
 
 // =============================================================================
@@ -1166,39 +1229,66 @@ static int32_t mscReadCb(uint32_t lba, uint32_t offset, void *buffer, uint32_t b
   if (!isoOpen || !mscMediaPresent) return -1;
 
   // ── CACHE PATH ────────────────────────────────────────────────────────────
-  // Serve whole-sector reads (offset==0, bufsize a multiple of 2048) from the
-  // PSRAM read-ahead cache.  This is the hot path for every sequential copy
-  // or directory scan: sectors 1..255 after a miss are sub-microsecond memcpy.
-  //
-  // Skip cache for:
-  //   • Sub-sector reads (offset != 0) — rare, small, not worth caching.
-  //   • Requests larger than the cache (unlikely with TinyUSB MSC).
+  // Serve whole-sector reads from the 2-window LRU PSRAM cache.
+  // On a hit in any window: memcpy (≈1 µs).
+  // On a miss: evict the least-recently-used window, fill from SD (~100 ms
+  // for 128-sector / 256 KB window), then serve.
+  // Both hot regions (e.g. directory LBA and data LBA) stay cached simultaneously,
+  // eliminating ping-pong thrash that would occur with a single window.
   if (g_cacheBuf && g_cacheMtx && offset == 0) {
     uint32_t sectorCount = bufsize / 2048u;
     if (sectorCount > 0 && (bufsize % 2048u) == 0 &&
         sectorCount <= CACHE_SECTOR_COUNT) {
 
       if (xSemaphoreTake(g_cacheMtx, pdMS_TO_TICKS(200)) == pdTRUE) {
-        // Hit check: all requested sectors present?
-        bool hit = (lba >= g_cacheBase) &&
-                   ((lba - g_cacheBase) + sectorCount <= g_cacheCnt);
 
-        if (!hit) {
-          // Cache miss → fill from SD starting at this LBA.
-          cacheFill_locked(lba);
-          hit = (lba >= g_cacheBase) &&
-                ((lba - g_cacheBase) + sectorCount <= g_cacheCnt);
+        // Search all windows for a hit.
+        int hitWin = -1;
+        for (int w = 0; w < (int)CACHE_WINDOWS; w++) {
+          if (g_cacheBase[w] != 0xFFFFFFFFu &&
+              lba >= g_cacheBase[w] &&
+              (lba - g_cacheBase[w]) + sectorCount <= g_cacheCnt[w]) {
+            hitWin = w;
+            break;
+          }
         }
 
-        if (hit) {
-          memcpy(buffer,
-                 g_cacheBuf + (lba - g_cacheBase) * 2048u,
-                 bufsize);
+        if (hitWin < 0) {
+          // Miss: evict the LRU window and fill it.
+          int evict = 0;
+          for (int w = 1; w < (int)CACHE_WINDOWS; w++)
+            if (g_cacheTick[w] < g_cacheTick[evict]) evict = w;
+          g_cacheTick[evict] = ++g_cacheNow;
+          cacheFillWindow_locked(evict, lba);
+
+          // Re-check after fill.
+          for (int w = 0; w < (int)CACHE_WINDOWS; w++) {
+            if (g_cacheBase[w] != 0xFFFFFFFFu &&
+                lba >= g_cacheBase[w] &&
+                (lba - g_cacheBase[w]) + sectorCount <= g_cacheCnt[w]) {
+              hitWin = w;
+              break;
+            }
+          }
+        }
+
+        if (hitWin >= 0) {
+          g_cacheTick[hitWin] = ++g_cacheNow;  // refresh LRU on hit
+          uint8_t* src = cacheWinBuf(hitWin) + (lba - g_cacheBase[hitWin]) * 2048u;
+          memcpy(buffer, src, bufsize);
+          // Diagnostic: log first 6 bytes for LBA 16 (ISO PVD) — must be 01 43 44 30 30 31
+          if (cfg.debugMode && lba == 16 && bufsize >= 6) {
+            char _dg[80];
+            snprintf(_dg, sizeof(_dg),
+              "[DBG]  LBA16 PVD bytes: %02X %02X %02X %02X %02X %02X (expect 01 43 44 30 30 31)\n",
+              src[0], src[1], src[2], src[3], src[4], src[5]);
+            dualPrint.print(_dg);
+          }
           xSemaphoreGive(g_cacheMtx);
           return (int32_t)bufsize;
         }
         xSemaphoreGive(g_cacheMtx);
-        // Cache fill didn't cover all sectors (near end of track) → fall through.
+        // Fill didn't cover all sectors (near EOT) → fall through to direct read.
       }
     }
   }
@@ -1208,7 +1298,17 @@ static int32_t mscReadCb(uint32_t lba, uint32_t offset, void *buffer, uint32_t b
     // Cooked format (ISO / MODE1/2048): sectors contiguous in file.
     uint64_t pos = (uint64_t)(lba + dataTrackStartSect) * 2048 + offset;
     if (!isoFileHandle.seek(pos)) return -1;
-    return (int32_t)isoFileHandle.read((uint8_t*)buffer, bufsize);
+    int32_t got = (int32_t)isoFileHandle.read((uint8_t*)buffer, bufsize);
+    // Diagnostic: log first 6 bytes for LBA 16 (ISO PVD)
+    if (cfg.debugMode && lba == 16 && got >= 6) {
+      uint8_t* b = (uint8_t*)buffer;
+      char _dg[80];
+      snprintf(_dg, sizeof(_dg),
+        "[DBG]  LBA16 PVD direct bytes: %02X %02X %02X %02X %02X %02X (expect 01 43 44 30 30 31)\n",
+        b[0], b[1], b[2], b[3], b[4], b[5]);
+      dualPrint.print(_dg);
+    }
+    return got;
   }
 
   // Raw sector format (MODE1/2352, MODE2/2352, MODE2/2336, CDG/2448):
@@ -1419,7 +1519,12 @@ static void audioTask(void* arg) {
   while (true) {
     if (!audioBuf) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
     if (audioState != AUDIO_PLAY) {
-      if (audioCloseFile && audioFile) { audioFile.close(); openedFile = ""; audioCloseFile = false; }
+      // Always close the file handle when not playing — idempotent (File::close on already-closed File is a no-op).
+      // Clearing audioCloseFile unconditionally ensures doMount()'s wait loop always exits within one 20ms tick
+      // instead of timing out when audioFile happens to be invalid (which left the old && condition false).
+      // On resume the PLAY branch reopens and seeks to the correct offset anyway.
+      if (audioFile) { audioFile.close(); openedFile = ""; }
+      audioCloseFile = false;
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -4120,7 +4225,7 @@ void setup() {
   initI2S();
   sdMutex = xSemaphoreCreateMutex();  // shared between audio task and SCSI DAE reader
   startAudioTask();
-  cacheAlloc();    // allocate PSRAM read-ahead cache (512 KB, 256 sectors)
+  cacheAlloc();    // allocate PSRAM read-ahead cache (512 KB, 2×128 sectors LRU)
   initUSBMSC();
   sdReady = initSD();
   startWiFi();
