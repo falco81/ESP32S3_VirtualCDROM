@@ -465,7 +465,7 @@ bool initSD() {
 #endif
   SD_MMC.setPins(SD_SCK_PIN, SD_MOSI_PIN, SD_MISO_PIN);
   pinMode(SD_CS_PIN, INPUT_PULLUP);
-  if (SD_MMC.begin("/sdcard", true, false, 40000000)) {  // 40 MHz — maximum for reliable CD-ROM data reads
+  if (SD_MMC.begin("/sdcard", true, false, 40000000, 20)) {  // 40 MHz, maxOpenFiles=20
     uint8_t t = SD_MMC.cardType();
     const char* tn = t==CARD_MMC?"MMC":t==CARD_SD?"SD":t==CARD_SDHC?"SDHC/SDXC":"UNKNOWN";
     uint64_t mb = SD_MMC.cardSize() / (1024*1024);
@@ -1391,10 +1391,20 @@ void initUSBMSC() {
 
 #define GK_SECTOR_SIZE   512u
 #define GK_MAX_FILES     100          // max slots
-#define GK_MAX_SECTORS   (1000u * 2880u)  // fixed USB disk size GoTek sees (1000 × 1.44MB)
+#define GK_MAX_SECTORS   (1000u * GK_SLOT_STRIDE)  // fixed USB disk size GoTek sees
+// GoTek (FlashFloppy) slot stride — number of 512-byte sectors per image slot.
+// This MUST match GoTek's configured drive type:
+//   2880 = PC 1.44 MB  (80 tracks × 2 sides × 18 sectors)
+//   3072 = PC ~1.5 MB  (observed on some FlashFloppy builds — use if slot 1+ fail)
+//   3360 = PC 1.68 MB  (XDF / DMF format)
+//   1760 = Amiga DD    (80 tracks × 2 sides × 11 sectors)
+//   3520 = Amiga HD
+// Check the Log tab after boot — if slot 1 boots correctly change is not needed.
+#define GK_SLOT_STRIDE   3072u
 
 // Forward declarations for MSC callbacks
 static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize);
+
 static int32_t gotekWriteCb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize);
 static bool    gotekStartStopCb(uint8_t, bool, bool);
 
@@ -1404,25 +1414,110 @@ struct GotekFile {
   uint32_t sz;          // file size in bytes
   uint32_t sectors;     // number of 512-byte sectors (sz rounded up)
   uint32_t startLba;    // this slot's first LBA on virtual USB disk
+  uint32_t slotNum;     // logical slot number (parsed from filename, e.g. DSKA0002→2)
 };
 
 static GotekFile        gkF[GK_MAX_FILES];
-static int              gkFC       = 0;      // number of slots
+static int              gkFC       = 0;
 static bool             gkRdy      = false;
-static volatile int     gkCurSlot  = -1;     // slot currently being accessed by GoTek
-static volatile int     gkSelectedSlot = -1; // -1=raw multi-slot layout, >=0=single-slot mode
+static volatile int     gkCurSlot  = -1;
+static volatile int     gkSelectedSlot = -1;
+static volatile uint32_t gkLastLba = 0;
+static uint32_t          gkReadCnt[GK_MAX_FILES]  = {};
+static uint32_t          gkWriteCnt[GK_MAX_FILES] = {};
 
-// Cached file handles for sequential read/write performance
-static File             gkRFH;
-static int              gkRFHIdx   = -1;
-static File             gkWFH;
-static int              gkWFHIdx   = -1;
+// ── LBA access ring buffer (debug) ───────────────────────────────────────────
+#define GK_LOG_SIZE 64
+struct GkLogEntry {
+  uint32_t lba;
+  int      slot;    // -1 = unmapped
+  uint8_t  op;      // 'R' read, 'W' write
+  uint8_t  b0, b1, b2, b3;  // first 4 bytes of sector
+};
+static GkLogEntry  gkLog[GK_LOG_SIZE];
+static uint32_t    gkLogHead = 0;   // next write index (ring)
+static uint32_t    gkLogSeq  = 0;   // monotonic counter for polling
 
+static void gkLogPush(uint32_t lba, int slot, uint8_t op, const uint8_t* data) {
+  GkLogEntry& e = gkLog[gkLogHead % GK_LOG_SIZE];
+  e.lba  = lba; e.slot = slot; e.op = op;
+  if (data) { e.b0=data[0];e.b1=data[1];e.b2=data[2];e.b3=data[3]; }
+  else       { e.b0=e.b1=e.b2=e.b3=0; }
+  gkLogHead++; gkLogSeq++;
+}
+
+// ── LRU read handle cache — avoids opening/closing file on every sector read ──
+// Keeps up to GK_CACHE_HANDLES files open. GoTek typically reads one slot
+// at a time sequentially, so 2 entries handles all practical cases.
+// With 999 possible slots we cannot keep one handle per slot open.
+#define GK_CACHE_HANDLES 4
+static struct {
+  int      fi;    // array index into gkF[], -1 = empty
+  File     fh;   // open file handle
+} gkRHCache[GK_CACHE_HANDLES];
+static int gkRHLRU[GK_CACHE_HANDLES]; // LRU order: gkRHLRU[0] = most recently used idx
+
+static void gkCacheInit() {
+  for (int i = 0; i < GK_CACHE_HANDLES; i++) {
+    if (gkRHCache[i].fh) gkRHCache[i].fh.close();
+    gkRHCache[i].fi = -1;
+    gkRHLRU[i] = i;
+  }
+}
+
+// Returns open File& for gkF[fi], opening if not cached (evicting LRU entry)
+static File* gkCacheGet(int fi) {
+  // Check cache
+  for (int i = 0; i < GK_CACHE_HANDLES; i++) {
+    if (gkRHCache[i].fi == fi) {
+      // Move to front of LRU
+      for (int j = 0; j < GK_CACHE_HANDLES; j++) if (gkRHLRU[j] == i) {
+        memmove(&gkRHLRU[1], &gkRHLRU[0], j * sizeof(int));
+        gkRHLRU[0] = i; break;
+      }
+      return &gkRHCache[i].fh;
+    }
+  }
+  // Cache miss — evict LRU (last entry)
+  int evict = gkRHLRU[GK_CACHE_HANDLES - 1];
+  if (gkRHCache[evict].fh) gkRHCache[evict].fh.close();
+  gkRHCache[evict].fi = -1;
+  gkRHCache[evict].fh = SD_MMC.open(gkF[fi].path, FILE_READ);
+  if (!gkRHCache[evict].fh) {
+    dualPrint.printf("[GK] ERROR: cannot open slot %d: %s\n", fi, gkF[fi].path);
+    return nullptr;
+  }
+  gkRHCache[evict].fi = fi;
+  // Promote to front of LRU
+  memmove(&gkRHLRU[1], &gkRHLRU[0], (GK_CACHE_HANDLES - 1) * sizeof(int));
+  gkRHLRU[0] = evict;
+  return &gkRHCache[evict].fh;
+}
+
+static void gkOpenHandles() {
+  gkCacheInit();
+  dualPrint.println(F("[GOTEK] Opening read handle cache:"));
+  // Pre-warm first GK_CACHE_HANDLES slots for fast initial access
+  for (int i = 0; i < gkFC && i < GK_CACHE_HANDLES; i++) {
+    File* fh = gkCacheGet(i);
+    if (!fh) continue;
+    uint8_t bs[64]; fh->seek(0); int got = fh->read(bs, sizeof(bs));
+    bool ok = got >= 22 && (bs[0]==0xEB||bs[0]==0xE9) && bs[21]==0xF0;
+    dualPrint.printf("[GOTEK] Slot %03u: %s  sz=%lu B  boot=%02X FAT12=%s totSec=%u\n",
+      gkF[i].slotNum, strrchr(gkF[i].path,'/')+1, (unsigned long)gkF[i].sz,
+      bs[0], ok?"OK":"WARN", (uint16_t)bs[19]|((uint16_t)bs[20]<<8));
+  }
+  dualPrint.printf("[GOTEK] Cache ready (%d/%d slots pre-warmed, %d FDs used)\n",
+    min(gkFC, GK_CACHE_HANDLES), gkFC, GK_CACHE_HANDLES);
+}
+
+static void gkCloseHandles() {
+  gkCacheInit();  // closes all cached handles and resets LRU
+}
 // ── Build slot table from SD card directory ───────────────────────────────────
 static void gkBuildFS() {
   gkFC = 0; gkRdy = false; gkCurSlot = -1;
-  if (gkRFH) { gkRFH.close(); gkRFHIdx = -1; }
-  if (gkWFH) { gkWFH.close(); gkWFHIdx = -1; }
+  gkCloseHandles();
 
   if (!sdReady) {
     dualPrint.println(F("[GOTEK] SD not ready"));
@@ -1450,33 +1545,76 @@ static void gkBuildFS() {
   }
   dir.close();
 
-  // Sort alphabetically — slot assignment follows filename order
-  for (int i=0;i<nc-1;i++)
-    for (int j=0;j<nc-1-i;j++)
-      if(names[j]>names[j+1]){String t=names[j];names[j]=names[j+1];names[j+1]=t;}
+  // Sort: try to load order.json first; fall back to alphabetical
+  // order.json format: ["file1.img","file2.img",...] — defines slot assignment
+  String orderPath = gotekImgDir + "/order.json";
+  String orderJson = "";
+  {
+    File of = SD_MMC.open(orderPath.c_str(), FILE_READ);
+    if (of) { orderJson = of.readString(); of.close(); }
+  }
 
-  // Assign start LBAs
-  uint32_t nextLba = 0;
+  if (orderJson.length() > 2) {
+    // Parse JSON array of filenames and reorder names[] accordingly
+    String ordered[GK_MAX_FILES]; int oc = 0;
+    bool used[GK_MAX_FILES] = {};
+    // Extract each quoted string from the JSON array
+    int pos = 0;
+    while (pos < (int)orderJson.length() && oc < GK_MAX_FILES) {
+      int q1 = orderJson.indexOf('"', pos); if (q1 < 0) break;
+      int q2 = orderJson.indexOf('"', q1+1); if (q2 < 0) break;
+      String fn = orderJson.substring(q1+1, q2);
+      pos = q2+1;
+      // Find this filename in names[]
+      for (int i = 0; i < nc; i++) {
+        if (!used[i] && names[i].equalsIgnoreCase(fn)) {
+          ordered[oc++] = names[i]; used[i] = true; break;
+        }
+      }
+    }
+    // Append any files not in order.json (new files added after last save)
+    for (int i = 0; i < nc; i++)
+      if (!used[i] && oc < GK_MAX_FILES) ordered[oc++] = names[i];
+    for (int i = 0; i < oc; i++) names[i] = ordered[i];
+    nc = oc;
+    dualPrint.println(F("[GOTEK] Using custom slot order from order.json"));
+  } else {
+    // Alphabetical fallback
+    for (int i=0;i<nc-1;i++)
+      for (int j=0;j<nc-1-i;j++)
+        if(names[j]>names[j+1]){String t=names[j];names[j]=names[j+1];names[j+1]=t;}
+    dualPrint.println(F("[GOTEK] No order.json — using alphabetical order"));
+  }
+
+  // Assign slot numbers positionally — slot 0 = first file in order, slot 1 = second, etc.
+  // Order comes from order.json (if exists) or alphabetical fallback.
+  // Custom filenames (Test.img, Work.img) are fully supported.
   for (int i = 0; i < nc; i++) {
     String fp = gotekImgDir + "/" + names[i];
     File fi = SD_MMC.open(fp.c_str(), FILE_READ);
-    if (!fi) continue;
+    if (!fi) { Serial.printf("[GOTEK] WARN: cannot open %s — skipping\n", names[i].c_str()); continue; }
     uint32_t sz = (uint32_t)fi.size(); fi.close();
-    if (!sz) continue;
+    if (!sz) { Serial.printf("[GOTEK] WARN: %s is empty — skipping\n", names[i].c_str()); continue; }
 
     GotekFile& gf = gkF[gkFC];
     strlcpy(gf.path, fp.c_str(), sizeof(gf.path));
     gf.sz       = sz;
     gf.sectors  = (sz + GK_SECTOR_SIZE - 1) / GK_SECTOR_SIZE;
-    gf.startLba = nextLba;
-    nextLba    += gf.sectors;
-    dualPrint.printf("[GOTEK] Slot %02d: %s  %lu B  LBA %lu-%lu\n",
-      gkFC, names[i].c_str(), (unsigned long)sz,
-      (unsigned long)gf.startLba, (unsigned long)(gf.startLba+gf.sectors-1));
+    gf.slotNum  = (uint32_t)gkFC;               // slot = position in list
+    gf.startLba = (uint32_t)gkFC * GK_SLOT_STRIDE;
+
+    dualPrint.printf("[GOTEK] Slot %03u: %-24s  %lu B  LBA %lu\n",
+      gkFC, names[i].c_str(), (unsigned long)sz, (unsigned long)gf.startLba);
+
+    if (gf.sectors > GK_SLOT_STRIDE)
+      dualPrint.printf("[GOTEK] WARN: Slot %03u image (%lu sectors) > GK_SLOT_STRIDE (%u)!\n",
+        gkFC, (unsigned long)gf.sectors, (unsigned)GK_SLOT_STRIDE);
     gkFC++;
   }
   gkRdy = true;
-  dualPrint.printf("[GOTEK] %d slot(s) ready.\n", gkFC);
+  dualPrint.printf("[GOTEK] %d slot(s) ready. Max LBA: %u\n", gkFC, gkFC * GK_SLOT_STRIDE);
+  // Open persistent per-slot file handles AFTER slot table is built
+  gkOpenHandles();
 }
 
 // ── USB MSC init — called AFTER gkBuildFS so block count is known ────────────
@@ -1515,49 +1653,94 @@ static bool gotekStartStopCb(uint8_t, bool, bool) { return true; }
 // In single-slot mode (gkSelectedSlot >= 0): LBA maps directly to that image.
 // In raw multi-slot mode (gkSelectedSlot < 0): LBA maps across concatenated images.
 static inline int gkResolveLba(uint32_t lba, uint64_t& fOff) {
-  int sel = gkSelectedSlot;
-  if (sel >= 0 && sel < gkFC) {
-    // Single-slot: LBA 0 → byte 0 of selected image
-    fOff = (uint64_t)lba * GK_SECTOR_SIZE;
-    if (fOff >= (uint64_t)gkF[sel].sz) return -1;
-    return sel;
+  int sel = gkSelectedSlot;  // slotNum value, not array index
+  if (sel >= 0) {
+    // Single-slot mode (Windows direct access): find array entry by slotNum
+    for (int fi = 0; fi < gkFC; fi++) {
+      if ((int)gkF[fi].slotNum == sel) {
+        fOff = (uint64_t)lba * GK_SECTOR_SIZE;
+        if (fOff >= (uint64_t)gkF[fi].sz) return -1;
+        return fi;
+      }
+    }
+    return -1;  // slot not found
   }
-  // Multi-slot raw layout
+  // Multi-slot raw layout: slot N starts at LBA N×GK_SLOT_STRIDE
   for (int fi = 0; fi < gkFC; fi++) {
-    if (lba < gkF[fi].startLba || lba >= gkF[fi].startLba + gkF[fi].sectors) continue;
-    fOff = (uint64_t)(lba - gkF[fi].startLba) * GK_SECTOR_SIZE;
+    uint32_t slotEnd = gkF[fi].startLba + GK_SLOT_STRIDE;
+    if (lba < gkF[fi].startLba || lba >= slotEnd) continue;
+    uint32_t relSec = lba - gkF[fi].startLba;
+    if (relSec >= gkF[fi].sectors) return -1;
+    fOff = (uint64_t)relSec * GK_SECTOR_SIZE;
     return fi;
   }
   return -1;
 }
 
+
+// ── MSC read callback ────────────────────────────────────────────────────────
 static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize) {
   (void)offset;
   uint8_t* dst = (uint8_t*)buffer;
   uint32_t sec = bufsize / GK_SECTOR_SIZE;
-  bool haveMtx = sdMutex && (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(30)) == pdTRUE);
+  bool haveMtx = sdMutex && (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) == pdTRUE);
 
   for (uint32_t s = 0; s < sec; s++) {
     uint8_t* sb = dst + s * GK_SECTOR_SIZE;
     if (!gkRdy) { memset(sb, 0, GK_SECTOR_SIZE); continue; }
     uint64_t fOff = 0;
     int fi = gkResolveLba(lba + s, fOff);
-    if (fi < 0) { memset(sb, 0, GK_SECTOR_SIZE); continue; }
-    gkCurSlot = fi;
-    if (gkRFHIdx != fi) {
-      if (gkRFH) gkRFH.close();
-      gkRFH = SD_MMC.open(gkF[fi].path, FILE_READ);
-      gkRFHIdx = fi;
-    }
-    if (gkRFH) {
-      if ((uint64_t)gkRFH.position() != fOff) gkRFH.seek(fOff);
-      uint32_t toRead = min((uint32_t)GK_SECTOR_SIZE,
-                            (uint32_t)(gkF[fi].sz > fOff ? gkF[fi].sz - fOff : 0));
-      int32_t got = toRead ? gkRFH.read(sb, toRead) : 0;
-      if (got < (int32_t)GK_SECTOR_SIZE) memset(sb + got, 0, GK_SECTOR_SIZE - got);
-    } else {
+
+    if (fi < 0) {
       memset(sb, 0, GK_SECTOR_SIZE);
+      gkLogPush(lba + s, -1, 'R', nullptr);
+      if (cfg.debugMode)
+        dualPrint.printf("[GK R] LBA %u UNMAPPED — GoTek reads outside all slots!\n", lba + s);
+      continue;
     }
+
+    gkCurSlot = fi; gkLastLba = lba + s;
+    if (fi < GK_MAX_FILES) gkReadCnt[fi]++;
+
+    // Per-slot handle via LRU cache (supports 999 slots with only 4 open FDs)
+    File* fhp = gkCacheGet(fi);
+    if (!fhp) {
+      memset(sb, 0, GK_SECTOR_SIZE);
+      gkLogPush(lba + s, fi, 'R', sb);
+      continue;
+    }
+    if ((uint64_t)fhp->position() != fOff) fhp->seek(fOff);
+    uint32_t toRead = min((uint32_t)GK_SECTOR_SIZE,
+                          (uint32_t)(gkF[fi].sz > fOff ? gkF[fi].sz - fOff : 0));
+    int32_t got = toRead ? fhp->read(sb, toRead) : 0;
+    if (got < (int32_t)GK_SECTOR_SIZE) memset(sb + got, 0, GK_SECTOR_SIZE - got);
+    gkLogPush(lba + s, fi, 'R', sb);
+
+    // Always log critical sectors once per session (boot, FAT, root dir)
+    static uint8_t _loggedSec[GK_MAX_FILES][3] = {};
+    uint32_t relSec = (lba + s) - gkF[fi].startLba;
+    int sidx = (relSec==0)?0:(relSec==1)?1:(relSec==19)?2:-1;
+    if (sidx >= 0 && fi < GK_MAX_FILES && !_loggedSec[fi][sidx]) {
+      _loggedSec[fi][sidx] = 1;
+      if (relSec == 0)
+        dualPrint.printf("[GK] Slot %d boot sector OK: OEM=%.8s TotSec=%u Media=%02X\n",
+          fi, (char*)&sb[3], (uint16_t)sb[19]|((uint16_t)sb[20]<<8), sb[21]);
+      else if (relSec == 1)
+        dualPrint.printf("[GK] Slot %d FAT1[0-2]: %02X %02X %02X  %s\n",
+          fi, sb[0],sb[1],sb[2], (sb[0]==0xF0&&sb[1]==0xFF&&sb[2]==0xFF)?"OK":"WARN: invalid FAT!");
+      else {
+        bool hasEntry = (sb[0]!=0x00 && sb[0]!=0xE5);
+        dualPrint.printf("[GK] Slot %d root dir: %s\n",
+          fi, hasEntry ? "has files" : "EMPTY — host may ask to format");
+        if (hasEntry) {
+          char name[12]={}; memcpy(name, sb, 11);
+          dualPrint.printf("[GK] Slot %d first entry: '%.11s' size=%lu\n",
+            fi, name, (uint32_t)sb[28]|((uint32_t)sb[29]<<8)|((uint32_t)sb[30]<<16)|((uint32_t)sb[31]<<24));
+        }
+      }
+    }
+    if (cfg.debugMode && relSec == 0)
+      dualPrint.printf("[GK R] Slot %d boot (LBA %u): %02X%02X%02X got=%d\n", fi, lba+s, sb[0],sb[1],sb[2], got);
   }
   if (haveMtx) xSemaphoreGive(sdMutex);
   return (int32_t)bufsize;
@@ -1575,29 +1758,37 @@ static int32_t gotekWriteCb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint
   for (uint32_t s = 0; s < sec; s++) {
     uint64_t fOff = 0;
     int fi = gkResolveLba(lba + s, fOff);
-    if (fi < 0) continue;
+    if (fi < 0) {
+      gkLogPush(lba + s, -1, 'W', nullptr);
+      if (cfg.debugMode) dualPrint.printf("[GK W] LBA %u UNMAPPED write!\n", lba + s);
+      continue;
+    }
+    if (fi >= 0 && fi < GK_MAX_FILES) gkWriteCnt[fi]++;
+    gkLogPush(lba + s, fi, 'W', buffer + s * GK_SECTOR_SIZE);
+    if (cfg.debugMode)
+      dualPrint.printf("[GK W] LBA %u  slot %d  fOff %llu  b0-3: %02X%02X%02X%02X\n",
+        lba+s, fi, (unsigned long long)fOff,
+        buffer[s*GK_SECTOR_SIZE], buffer[s*GK_SECTOR_SIZE+1],
+        buffer[s*GK_SECTOR_SIZE+2], buffer[s*GK_SECTOR_SIZE+3]);
     if (fOff >= (uint64_t)gkF[fi].sz) continue;
-    if (gkWFHIdx != fi) {
-      if (gkWFH) { gkWFH.flush(); gkWFH.close(); }
-      gkWFH = SD_MMC.open(gkF[fi].path, "r+");
-      gkWFHIdx = (gkWFH) ? fi : -1;
+    // Open write handle on demand, write, close immediately — avoids FD exhaustion
+    File wfh = SD_MMC.open(gkF[fi].path, "r+");
+    if (!wfh) {
+      dualPrint.printf("[GK W] ERROR: cannot open write handle slot %d\n", fi);
+      continue;
     }
-    if (gkWFH) {
-      if ((uint64_t)gkWFH.position() != fOff) gkWFH.seek(fOff);
-      uint32_t toWrite = min((uint32_t)GK_SECTOR_SIZE,
-                             (uint32_t)((uint64_t)gkF[fi].sz > fOff
-                                        ? (uint64_t)gkF[fi].sz - fOff : 0));
-      if (toWrite) { gkWFH.write(buffer + s * GK_SECTOR_SIZE, toWrite); didWrite = true; }
-    }
+    wfh.seek(fOff);
+    uint32_t toWrite = min((uint32_t)GK_SECTOR_SIZE,
+                           (uint32_t)((uint64_t)gkF[fi].sz > fOff ? (uint64_t)gkF[fi].sz - fOff : 0));
+    if (toWrite) { wfh.write(buffer + s * GK_SECTOR_SIZE, toWrite); didWrite = true; }
+    wfh.flush(); wfh.close();
   }
-  if (didWrite && gkWFH) gkWFH.flush();
+  if (didWrite) { /* individual handles flushed and closed above */ }
   xSemaphoreGive(sdMutex);
   return (int32_t)bufsize;
 }
 
 static void gkRefresh() {
-  if (gkRFH) { gkRFH.close(); gkRFHIdx = -1; }
-  if (gkWFH) { gkWFH.close(); gkWFHIdx = -1; }
   bool haveMtx = sdMutex && (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) == pdTRUE);
   gkBuildFS();
   if (haveMtx) xSemaphoreGive(sdMutex);
@@ -2115,8 +2306,6 @@ static inline bool gkMtxTake() {
   if (!sdMutex) return true;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
   // Flush + close GoTek write handle so web handler can safely open same file
-  if (gkWFH) { gkWFH.flush(); gkWFH.close(); gkWFHIdx = -1; }
-  if (gkRFH) { gkRFH.close(); gkRFHIdx = -1; }
   return true;
 }
 static inline void gkMtxGive() { if (sdMutex) xSemaphoreGive(sdMutex); }
@@ -4463,29 +4652,105 @@ void setupWebServer() {
   httpServer.on("/api/gotek/usbdebug", HTTP_GET, [](){
     if (!checkAuth()) return;
     String j = "{";
-    j += "\"gotek_mode_fn\":" + String(scsi_get_gotek_mode() ? "true" : "false");
-    j += ",\"cfg_deviceMode\":" + String(cfg.deviceMode);
-    j += ",\"gk_selected_slot\":" + String(gkSelectedSlot);
-    j += ",\"gk_sectors\":" + String(gkSelectedSlot>=0&&gkSelectedSlot<gkFC ? gkF[gkSelectedSlot].sectors : (uint32_t)GK_MAX_SECTORS);
+    j += "\"gotek_mode_fn\":"    + String(scsi_get_gotek_mode() ? "true" : "false");
+    j += ",\"cfg_deviceMode\":"  + String(cfg.deviceMode);
+    j += ",\"gk_selected_slot\":"+ String(gkSelectedSlot);
+    j += ",\"gk_cur_slot\":"     + String(gkCurSlot);
+    j += ",\"gk_last_lba\":"     + String(gkLastLba);
+    j += ",\"gk_fc\":"           + String(gkFC);
+    j += ",\"gk_ready\":"        + String(gkRdy ? "true" : "false");
     j += ",\"pid_hex\":\"0x8020\"";
-    j += ",\"note\":\"If gotek_mode_fn=false in GoTek mode, cfg.deviceMode NVS read failed\"";
+    j += ",\"slots\":[";
+    for (int i = 0; i < gkFC; i++) {
+      if (i) j += ",";
+      uint32_t stride = (gkF[i].sectors <= 2880) ? 2880 : ((gkF[i].sectors + 2879) / 2880) * 2880;
+      j += "{\"slot\":"      + String(i);
+      j += ",\"path\":\""    + String(gkF[i].path) + "\"";
+      j += ",\"sz\":"        + String(gkF[i].sz);
+      j += ",\"sectors\":"   + String(gkF[i].sectors);
+      j += ",\"startLba\":"  + String(gkF[i].startLba);
+      j += ",\"endLba\":"    + String(gkF[i].startLba + stride - 1);
+      j += ",\"reads\":"     + String(gkReadCnt[i]);
+      j += ",\"writes\":"    + String(gkWriteCnt[i]);
+      j += ",\"sz_ok\":"     + String(gkF[i].sectors == 2880 ? "true" : "false");
+      j += "}";
+    }
+    j += "]";
     j += "}";
     httpServer.send(200, "application/json", j);
   });
   httpServer.on("/api/gotek/create", HTTP_GET, handleGotekCreate);
+
+  // GET /api/gotek/lbalog — last 64 LBA accesses (ring buffer)
+  httpServer.on("/api/gotek/lbalog", HTTP_GET, [](){
+    if (!checkAuth()) return;
+    String j = "{\"seq\":"+String(gkLogSeq)+",\"fc\":"+String(gkFC)+",\"entries\":[";
+    uint32_t total = min(gkLogHead, (uint32_t)GK_LOG_SIZE);
+    uint32_t start = (gkLogHead > GK_LOG_SIZE) ? gkLogHead - GK_LOG_SIZE : 0;
+    bool first = true;
+    for (uint32_t i = start; i < gkLogHead; i++) {
+      GkLogEntry& e = gkLog[i % GK_LOG_SIZE];
+      if (!first) j += ","; first = false;
+      char hex[12]; snprintf(hex, sizeof(hex), "%02X%02X%02X%02X", e.b0, e.b1, e.b2, e.b3);
+      j += "{\"lba\":"+String(e.lba)
+          +",\"slot\":"+String(e.slot)
+          +",\"op\":\""+String((char)e.op)+"\""
+          +",\"hex\":\""+String(hex)+"\"";
+      // Flag LBAs that would be slot boundaries
+      uint32_t slotN = (gkFC > 0) ? (e.lba / 2880) : 0;
+      j += ",\"slotN\":"+String(slotN);
+      j += "}";
+    }
+    j += "]}";
+    httpServer.send(200, "application/json", j);
+  });
+
+  // GET /api/gotek/sector?lba=N — dump raw bytes of one sector (for troubleshooting)
+  httpServer.on("/api/gotek/sector", HTTP_GET, [](){
+    if (!checkAuth()) return;
+    uint32_t lba = httpServer.hasArg("lba") ? (uint32_t)httpServer.arg("lba").toInt() : 0;
+    uint8_t buf[512]; memset(buf, 0, 512);
+    uint64_t fOff = 0;
+    int fi = gkResolveLba(lba, fOff);
+    String j = "{\"lba\":"+String(lba)+",\"slot\":"+String(fi);
+    if (fi >= 0) {
+      j += ",\"path\":\""+String(gkF[fi].path)+"\"";
+      j += ",\"fOff\":"+String((uint32_t)fOff);
+      if (gkMtxTake()) {
+        File f = SD_MMC.open(gkF[fi].path, FILE_READ);
+        if (f) { f.seek(fOff); f.read(buf, 512); f.close(); }
+        gkMtxGive();
+      }
+      // Return hex of first 64 bytes
+      String hex = "";
+      for (int i = 0; i < 64; i++) {
+        char h[3]; snprintf(h, sizeof(h), "%02X", buf[i]);
+        hex += h;
+        if (i % 16 == 15) hex += " ";
+      }
+      j += ",\"hex64\":\""+hex+"\"";
+      // Check if it looks like a FAT12 boot sector
+      bool fat12 = (buf[0]==0xEB || buf[0]==0xE9) && buf[21]==0xF0;
+      j += ",\"looks_fat12\":"+String(fat12?"true":"false");
+      j += ",\"b0\":"+String(buf[0]);
+      j += ",\"b510\":"+String(buf[510]);
+      j += ",\"b511\":"+String(buf[511]);
+    }
+    j += "}";
+    httpServer.send(200, "application/json", j);
+  });
   // SELECT: switch single-slot mode (Windows-friendly — exposes one image as 1.44MB USB disk)
-  // GET /api/gotek/select?slot=N  — expose only slot N (1.44MB, sector 0-2879)
-  // GET /api/gotek/select?slot=-1 — raw multi-slot mode (GoTek hardware)
   httpServer.on("/api/gotek/select", HTTP_GET, []() {
     if (!checkAuth()) return;
     int slot = httpServer.hasArg("slot") ? httpServer.arg("slot").toInt() : -1;
-    if (slot >= gkFC) { httpServer.send(400,"application/json","{\"error\":\"slot out of range\"}"); return; }
-    gkSelectedSlot = slot;
-    uint32_t newCount = (slot >= 0 && slot < gkFC) ? gkF[slot].sectors : GK_MAX_SECTORS;
-    // ── USB re-enumeration — same pattern as CD-ROM doMount() ────────────────
-    // Re-enum happens BEFORE sending HTTP response so the client knows it's done.
-    // WiFi (HTTP) and USB storage are separate interfaces — disconnect/connect
-    // on USB does not affect the WiFi TCP connection.
+    gkSelectedSlot = slot;  // stores slotNum (-1 = raw multi-slot)
+    // Find array entry by slotNum to get sector count
+    uint32_t newCount = GK_MAX_SECTORS;
+    if (slot >= 0) {
+      for (int i = 0; i < gkFC; i++) {
+        if ((int)gkF[i].slotNum == slot) { newCount = gkF[i].sectors; break; }
+      }
+    }
     tud_disconnect();
     delay(600);
     msc.onRead(gotekReadCb);
@@ -4495,11 +4760,34 @@ void setupWebServer() {
     msc.begin(newCount, GK_SECTOR_SIZE);
     msc.mediaPresent(true);
     tud_connect();
-    dualPrint.printf("[GOTEK] Selected slot: %d  sectors: %u  (re-enumerated)\n",
-      slot, newCount);
+    dualPrint.printf("[GOTEK] Selected slot: %d  sectors: %u  (re-enumerated)\n", slot, newCount);
     httpServer.send(200,"application/json",
       "{\"ok\":true,\"slot\":"+String(slot)+",\"sectors\":"+String(newCount)+"}");
   });
+  // POST /api/gotek/order — rename files to DSKA0000..N to match new drag-drop order
+  // Body: JSON array of filenames in new order, e.g. ["DSKA0002.IMG","DSKA0000.IMG"]
+  // POST /api/gotek/order — saves desired slot order to order.json (no renaming!)
+  // Body: JSON array of filenames in desired slot order
+  httpServer.on("/api/gotek/order", HTTP_POST, []() {
+    if (!checkAuth()) return;
+    String body = httpServer.arg("plain");
+    if (!body.length() || body[0] != '[') {
+      httpServer.send(400,"application/json","{\"error\":\"invalid\"}"); return;
+    }
+    String orderPath = gotekImgDir + "/order.json";
+    if (!gkMtxTake()) { httpServer.send(503,"application/json","{\"error\":\"busy\"}"); return; }
+    File f = SD_MMC.open(orderPath.c_str(), FILE_WRITE);
+    if (!f) { gkMtxGive(); httpServer.send(500,"application/json","{\"error\":\"write failed\"}"); return; }
+    f.print(body); f.close();
+    dualPrint.printf("[GOTEK] order.json saved (%d bytes)\n", body.length());
+    gkBuildFS(); gkMtxGive();
+    tud_disconnect(); delay(600);
+    msc.onRead(gotekReadCb); msc.onWrite(gotekWriteCb); msc.onStartStop(gotekStartStopCb);
+    msc.isWritable(true); msc.begin(GK_MAX_SECTORS, GK_SECTOR_SIZE); msc.mediaPresent(true);
+    tud_connect();
+    httpServer.send(200,"application/json","{\"ok\":true}");
+  });
+
   httpServer.on("/api/gotek/refresh", HTTP_GET, []() {
     if (!checkAuth()) return;
     if (cfg.deviceMode != 1) { httpServer.send(400, "text/plain", "Not in GoTek mode."); return; }
@@ -4513,15 +4801,38 @@ void setupWebServer() {
     String j = "{\"dir\":\"" + gotekImgDir + "\",\"files\":[";
     for (int i = 0; i < gkFC; i++) {
       if (i) j += ",";
-      // Extract just the filename from path
       String p = String(gkF[i].path);
       int sl = p.lastIndexOf('/');
       String fn = (sl >= 0) ? p.substring(sl+1) : p;
       j += "{\"name\":\"" + fn + "\",\"size\":" + String(gkF[i].sz) +
-           ",\"slot\":" + String(i) + "}";
+           ",\"slot\":" + String(gkF[i].slotNum) + "}";
     }
     j += "]}";
     httpServer.send(200, "application/json", j);
+  });
+  httpServer.on("/api/gotek/labels", HTTP_GET, []() {
+    if (!checkAuth()) return;
+    String labelsPath = gotekImgDir + "/labels.json";
+    if (!gkMtxTake()) { httpServer.send(503,"application/json","{\"error\":\"busy\"}"); return; }
+    File f = SD_MMC.open(labelsPath.c_str(), FILE_READ);
+    if (!f) { gkMtxGive(); httpServer.send(200,"application/json","{}"); return; }
+    String content = f.readString(); f.close();
+    gkMtxGive();
+    httpServer.send(200, "application/json", content.length() ? content : "{}");
+  });
+
+  // POST /api/gotek/labels — saves JSON body to SD
+  httpServer.on("/api/gotek/labels", HTTP_POST, []() {
+    if (!checkAuth()) return;
+    String body = httpServer.arg("plain");
+    if (!body.length()) { httpServer.send(400,"application/json","{\"error\":\"empty\"}"); return; }
+    String labelsPath = gotekImgDir + "/labels.json";
+    if (!gkMtxTake()) { httpServer.send(503,"application/json","{\"error\":\"busy\"}"); return; }
+    File f = SD_MMC.open(labelsPath.c_str(), FILE_WRITE);
+    if (!f) { gkMtxGive(); httpServer.send(500,"application/json","{\"error\":\"write failed\"}"); return; }
+    f.print(body); f.close();
+    gkMtxGive();
+    httpServer.send(200,"application/json","{\"ok\":true}");
   });
   httpServer.on("/api/download",      HTTP_GET,  handleApiDownload);
   httpServer.on("/api/mkdir",        HTTP_GET,  handleApiMkdir);

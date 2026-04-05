@@ -658,6 +658,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <span id="gkModeBadge" class="badge off">CD-ROM mode</span>
         <span id="gkReadyBadge" class="badge on" style="display:none">FS ready</span>
         <span id="gkUsbBadge" class="badge def" style="display:none;cursor:pointer" onclick="gkShowUsbDebug()" title="Click for USB diagnostic">USB info</span>
+
       </div>
       <div class="ct">&#128190; Current image</div>
       <div class="sbar">
@@ -668,16 +669,18 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <div id="gkUsbDebugBox" style="display:none;margin-top:8px;font-size:.72rem;background:rgba(0,0,0,.3);border:1px solid var(--border2);border-radius:4px;padding:8px 10px;color:var(--tx2)">
         Loading USB debug info&hellip;
       </div>
-    </div>
+    </div><!-- end Current image card -->
 
     <!-- Image browser — mirrors CD "Browse SD" card -->
     <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
       <div class="ct" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
         <span>&#128190; Image files &mdash; <b id="gkDir">/gotek</b> <span class="sp" id="gkSp"></span></span>
-        <div style="display:flex;gap:6px;align-items:center">
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <button class="btn b" onclick="gkRefresh()" id="gkRefBtn">&#8635; Refresh</button>
           <button class="btn g" onclick="gkShowCreate()">&#43; New</button>
           <button class="btn b" onclick="gkShowUpload()">&#8679; Upload</button>
+          <button class="btn gr" onclick="gkSaveOrder()" id="gkSaveOrderBtn" style="display:none" title="Save current drag-and-drop order as GoTek slot assignment">&#128204; Save order</button>
+          <span id="gkOrderMsg" style="font-size:.75rem;color:var(--tx2)"></span>
         </div>
       </div>
       <!-- Create row -->
@@ -706,8 +709,15 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
       <div class="tbl-wrap" style="flex:1">
         <table id="gkTbl" style="width:100%">
-          <thead><tr><th class="ic"></th><th>Filename</th><th class="sz">Size</th><th class="ac"></th></tr></thead>
-          <tbody id="gkTbody"><tr><td colspan="4" style="color:var(--tx2);padding:12px">Loading&hellip;</td></tr></tbody>
+          <thead><tr>
+            <th class="ic"></th>
+            <th class="sz" style="text-align:center;padding:6px 8px;cursor:pointer;user-select:none" onclick="gkSort('slot')" title="Sort by ID">ID <span id="gkSortInd">▲</span></th>
+            <th style="cursor:pointer;user-select:none" onclick="gkSort('name')" title="Sort by name">Filename</th>
+            <th style="text-align:left;padding:6px">Description</th>
+            <th class="sz">Size</th>
+            <th class="ac"></th>
+          </tr></thead>
+          <tbody id="gkTbody"><tr><td colspan="6" style="color:var(--tx2);padding:12px">Loading&hellip;</td></tr></tbody>
         </table>
       </div>
     </div>
@@ -1100,7 +1110,9 @@ function gkInit(){
       rbadge.className='badge '+(s.gotek_ready?'on':'off');
     }
     var dirEl=$('gkDir'); if(dirEl) dirEl.textContent=s.gotek_dir||'/gotek';
-    if(gkIsGotek){ gkLoadList(); gkShowUsbBadge(true); }
+    if(gkIsGotek){
+      gkLoadList(); gkShowUsbBadge(true);
+    }
     else gkShowUsbBadge(false);
   }).catch(function(){
     // Even on error, show panels based on last known state
@@ -1111,25 +1123,179 @@ function gkInit(){
 }
 var gkSelIdx=-1;
 var gkFilesList=[];
+var gkLabels={};  // {filename: "description text"}
+
+function gkLabelsLoad(cb){
+  fetch('/api/gotek/labels').then(function(r){return r.json();}).then(function(d){
+    gkLabels=d||{}; if(cb) cb();
+  }).catch(function(){ gkLabels={}; if(cb) cb(); });
+}
+function gkLabelSave(filename, text){
+  gkLabels[filename]=text;
+  fetch('/api/gotek/labels',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(gkLabels)})
+    .catch(function(){});
+}
+function gkLabelEdit(filename, tdEl){
+  var cur=gkLabels[filename]||'';
+  var inp=document.createElement('input');
+  inp.type='text'; inp.value=cur; inp.maxLength=80;
+  inp.style.cssText='width:100%;font-size:.78rem;background:var(--bg);color:var(--tx);border:1px solid var(--accent);border-radius:3px;padding:2px 5px;box-sizing:border-box';
+  tdEl.innerHTML=''; tdEl.appendChild(inp);
+  inp.focus(); inp.select();
+  function done(){
+    var v=inp.value.trim();
+    gkLabelSave(filename, v);
+    tdEl.textContent=v||'';
+    addEditHint(tdEl, filename);
+  }
+  inp.addEventListener('blur', done);
+  inp.addEventListener('keydown',function(e){
+    if(e.key==='Enter'){inp.blur();}
+    if(e.key==='Escape'){tdEl.textContent=cur||''; addEditHint(tdEl,filename); }
+  });
+}
+function addEditHint(td, filename){
+  td.style.cursor='text';
+  td.onclick=function(){ gkLabelEdit(filename, td); };
+}
 
 function gkShowUsbDebug(){
   var box=$('gkUsbDebugBox');
   if(!box) return;
   if(box.style.display!=='none'){box.style.display='none';return;}
   box.style.display='block';
-  box.textContent='Loading…';
+  box.innerHTML='<span style="color:var(--tx2)">Loading…</span>';
   fetch('/api/gotek/usbdebug').then(function(r){return r.json();}).then(function(d){
     var ok=d.gotek_mode_fn&&d.cfg_deviceMode===1;
-    box.innerHTML='<b>GoTek mode function:</b> '+(d.gotek_mode_fn?'<span style="color:var(--green)">✓ true</span>':'<span style="color:var(--red)">✗ false — NVS read problem!</span>')
-      +'<br><b>cfg.deviceMode:</b> '+d.cfg_deviceMode
-      +'<br><b>USB PID:</b> '+d.pid_hex+' (GoTek) vs 0x1001 (CD-ROM)'
-      +'<br><b>Sectors:</b> '+d.gk_sectors+' × 512 B'
-      +(ok?'':'<br><br><b style="color:var(--red)">Problem detected!</b> GoTek mode not active in firmware. Save config and restart ESP32.');
-  }).catch(function(){box.textContent='Error fetching debug info';});
+    var h='';
+    // ── Header ──
+    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 16px;margin-bottom:8px">';
+    h+='<span><b>GoTek mode:</b> '+(d.gotek_mode_fn
+      ?'<span style="color:var(--green)">✓ active</span>'
+      :'<span style="color:var(--red)">✗ INACTIVE</span>')+'</span>';
+    h+='<span><b>USB PID:</b> '+d.pid_hex+' (GoTek)</span>';
+    h+='<span><b>cfg.deviceMode:</b> '+d.cfg_deviceMode+'</span>';
+    h+='<span><b>Slots loaded:</b> '+(d.gk_fc||0)+'  '+(d.gk_ready?'<span style="color:var(--green)">ready</span>':'<span style="color:var(--red)">not ready</span>')+'</span>';
+    h+='<span><b>Selected slot:</b> '+(d.gk_selected_slot>=0?'#'+d.gk_selected_slot:'RAW multi-slot')+'</span>';
+    h+='<span><b>Current slot:</b> '+(d.gk_cur_slot>=0?'#'+d.gk_cur_slot:'—')+'</span>';
+    h+='<span><b>Last LBA:</b> '+d.gk_last_lba+'</span>';
+    h+='</div>';
+    // ── Slot table ──
+    if(d.slots&&d.slots.length){
+      h+='<table style="width:100%;border-collapse:collapse;font-size:.7rem;margin-top:4px">';
+      h+='<thead><tr style="color:var(--tx2);border-bottom:1px solid var(--border2)">';
+      h+='<th style="text-align:left;padding:2px 6px">Slot</th>';
+      h+='<th style="text-align:left;padding:2px 6px">File</th>';
+      h+='<th style="text-align:right;padding:2px 6px">Size</th>';
+      h+='<th style="text-align:right;padding:2px 6px">Sectors</th>';
+      h+='<th style="text-align:right;padding:2px 6px">Start LBA</th>';
+      h+='<th style="text-align:right;padding:2px 6px">End LBA</th>';
+      h+='<th style="text-align:right;padding:2px 6px">Reads</th>';
+      h+='<th style="text-align:right;padding:2px 6px">Writes</th>';
+      h+='<th style="text-align:center;padding:2px 6px">OK?</th>';
+      h+='</tr></thead><tbody>';
+      d.slots.forEach(function(s){
+        var warn=!s.sz_ok;
+        var name=s.path.split('/').pop();
+        var rowBg=warn?'rgba(255,100,0,.06)':'';
+        h+='<tr style="border-bottom:1px solid rgba(255,255,255,.03);background:'+rowBg+'">';
+        h+='<td style="padding:3px 6px;font-weight:bold">#'+s.slot+'</td>';
+        h+='<td style="padding:3px 6px;color:var(--tx)">'+escHtml(name)+'</td>';
+        h+='<td style="padding:3px 6px;text-align:right">'+Math.round(s.sz/1024)+' KB</td>';
+        h+='<td style="padding:3px 6px;text-align:right;color:'+(warn?'#e3b341':'var(--tx2)')+'">'+s.sectors+'</td>';
+        h+='<td style="padding:3px 6px;text-align:right">'+s.startLba+'</td>';
+        h+='<td style="padding:3px 6px;text-align:right">'+s.endLba+'</td>';
+        h+='<td style="padding:3px 6px;text-align:right;color:var(--green)">'+s.reads+'</td>';
+        h+='<td style="padding:3px 6px;text-align:right;color:'+(s.writes>0?'#e3b341':'var(--tx2)')+'">'+s.writes+'</td>';
+        h+='<td style="padding:3px 6px;text-align:center">'+(s.sz_ok
+          ?'<span style="color:var(--green)">✓</span>'
+          :'<span style="color:#e3b341" title="Not exactly 1474560 B — GoTek may see wrong data">⚠</span>')+'</td>';
+        h+='</tr>';
+        if(warn) h+='<tr style="background:rgba(255,160,0,.06)"><td colspan="9" style="padding:2px 6px 5px;color:#e3b341;font-size:.68rem">'
+          +'⚠ Slot #'+s.slot+': '+s.sectors+' sectors ≠ 2880. GoTek hardware expects exactly 1474560 B (1.44 MB). '
+          +'LBA alignment is corrected automatically but the image may be non-standard.</td></tr>';
+      });
+      h+='</tbody></table>';
+    }
+    if(!ok) h+='<div style="margin-top:8px;color:var(--red);font-weight:bold">⛔ GoTek mode not active in firmware. Save Config and restart ESP32.</div>';
+    box.innerHTML=h;
+  }).catch(function(){box.innerHTML='<span style="color:var(--red)">Error fetching debug info</span>';});
 }
 function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=show?'inline':'none'; }
+
 function gkShowCreate(){var r=$('gkCreateRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
 function gkShowUpload(){var r=$('gkUploadRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
+
+var gkSortKey='slot', gkSortAsc=true;
+var gkOrderChanged=false;
+
+// ── Drag-and-drop row reordering ─────────────────────────────────────────────
+var gkDragSrc=null;
+function gkDragStart(e){ gkDragSrc=this; this.style.opacity='0.4'; e.dataTransfer.effectAllowed='move'; }
+function gkDragOver(e){ e.preventDefault(); e.dataTransfer.dropEffect='move'; return false; }
+function gkDragEnter(){ this.style.background='rgba(56,139,253,.15)'; }
+function gkDragLeave(){ this.style.background=''; }
+function gkDragDrop(e){
+  e.stopPropagation();
+  if(gkDragSrc===this) return false;
+  var srcName=gkDragSrc.dataset.fname, dstName=this.dataset.fname;
+  var si=-1, di=-1;
+  for(var i=0;i<gkFilesList.length;i++){
+    if(gkFilesList[i].name===srcName) si=i;
+    if(gkFilesList[i].name===dstName) di=i;
+  }
+  if(si>=0&&di>=0){ var tmp=gkFilesList[si]; gkFilesList[si]=gkFilesList[di]; gkFilesList[di]=tmp; }
+  gkOrderChanged=true;
+  var btn=$('gkSaveOrderBtn'); if(btn) btn.style.display='inline';
+  gkRenderList({files:gkFilesList.slice(), dir:($('gkDir')?$('gkDir').textContent:'/gotek')});
+  return false;
+}
+function gkDragEnd(){ this.style.opacity=''; }
+function gkMakeDraggable(tr, fname){
+  tr.dataset.fname=fname;
+  tr.draggable=true;
+  tr.addEventListener('dragstart', gkDragStart);
+  tr.addEventListener('dragover',  gkDragOver);
+  tr.addEventListener('dragenter', gkDragEnter);
+  tr.addEventListener('dragleave', gkDragLeave);
+  tr.addEventListener('drop',      gkDragDrop);
+  tr.addEventListener('dragend',   gkDragEnd);
+}
+function gkSaveOrder(){
+  var order=gkFilesList.map(function(f){return f.name;});
+  var btn=$('gkSaveOrderBtn'), msg=$('gkOrderMsg');
+  if(btn) btn.disabled=true;
+  if(msg) msg.textContent='Saving & re-enumerating USB…';
+  fetch('/api/gotek/order',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(order)})
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        if(msg) msg.textContent='✓ Order saved — GoTek updated';
+        if(btn){btn.disabled=false;btn.style.display='none';}
+        gkOrderChanged=false;
+        setTimeout(function(){if(msg)msg.textContent='';},3000);
+        gkRefresh();
+      } else {
+        if(msg) msg.textContent='Error: '+(d.error||'failed');
+        if(btn) btn.disabled=false;
+      }
+    }).catch(function(){if(msg)msg.textContent='Network error';if(btn)btn.disabled=false;});
+}
+function gkSort(key){
+  if(gkSortKey===key) gkSortAsc=!gkSortAsc;
+  else { gkSortKey=key; gkSortAsc=true; }
+  var ind=$('gkSortInd'); if(ind) ind.textContent=gkSortAsc?'▲':'▼';
+  if(gkFilesList.length) gkRenderList({files:gkFilesList.slice(), dir:($('gkDir')?$('gkDir').textContent:'/gotek')});
+}
+function gkSortedFiles(files){
+  if(gkOrderChanged) return files.slice();  // preserve drag order
+  return files.slice().sort(function(a,b){
+    var va=gkSortKey==='slot'?a.slot:a.name.toLowerCase();
+    var vb=gkSortKey==='slot'?b.slot:b.name.toLowerCase();
+    return gkSortAsc?(va>vb?1:va<vb?-1:0):(va<vb?1:va>vb?-1:0);
+  });
+}
 
 function gkUpdateCurrent(selectedSlot){
   var badge=$('gkCurBadge'), nm=$('gkCurName');
@@ -1162,6 +1328,10 @@ function gkSelectSlot(slot){
 
 function gkLoadList(){
   fetch('/api/gotek/ls').then(function(r){return r.json();}).then(function(d){
+    gkLabelsLoad(function(){ gkRenderList(d); });
+  }).catch(function(){var tb=$('gkTbody');if(tb)tb.innerHTML='<tr><td colspan="5" style="color:var(--red)">Load error</td></tr>';});
+}
+function gkRenderList(d){
     var tb=$('gkTbody'); if(!tb) return;
     if(!d.files||!d.files.length){
       gkFilesList=[];
@@ -1176,7 +1346,7 @@ function gkLoadList(){
       var sel=s.gotek_selected_slot!=null?s.gotek_selected_slot:-1;
       gkSelIdx=sel; gkUpdateCurrent(sel);
       tb.innerHTML='';
-      d.files.forEach(function(f){
+      gkSortedFiles(d.files).forEach(function(f){
         var imgPath=($('gkDir')?$('gkDir').textContent:'/gotek')+'/'+f.name;
         var sz=f.size>1048576?(f.size/1048576).toFixed(2)+' MB':
                f.size>1024?(f.size/1024).toFixed(0)+' KB':f.size+' B';
@@ -1184,8 +1354,16 @@ function gkLoadList(){
         var tr=mkTr();
         if(isSel) tr.style.background='rgba(63,185,80,.08)';
         else if(isCur) tr.style.background='rgba(56,139,253,.06)';
-        // Icon cell
-        tr.appendChild(mkTd('ic','💾'));
+        // Icon cell — drag handle
+        var tdIc=mkTd('ic','⠿');
+        tdIc.style.cssText='cursor:grab;color:var(--tx3);font-size:1rem;padding:4px 6px';
+        tdIc.title='Drag to reorder';
+        tr.appendChild(tdIc);
+        // Slot ID cell
+        var tdId=document.createElement('td');
+        tdId.style.cssText='padding:4px 8px;text-align:center;font-family:monospace;font-size:.8rem;color:var(--tx2);white-space:nowrap;font-weight:bold';
+        tdId.textContent=String(f.slot).padStart(3,'0');
+        tr.appendChild(tdId);
         // Name + free space cell with mini bar
         var tdN=document.createElement('td'); tdN.className='nm';
         var nameDiv=document.createElement('div'); nameDiv.textContent=f.name;
@@ -1205,6 +1383,12 @@ function gkLoadList(){
         spaceWrap.appendChild(spaceDiv); spaceWrap.appendChild(barWrap);
         tdN.appendChild(nameDiv); tdN.appendChild(spaceWrap);
         tr.appendChild(tdN);
+        // Description cell — editable inline
+        var tdD=document.createElement('td');
+        tdD.style.cssText='padding:4px 8px;color:var(--tx);font-size:.78rem;max-width:240px';
+        tdD.textContent=gkLabels[f.name]||'';
+        addEditHint(tdD, f.name);
+        tr.appendChild(tdD);
         // Size column (image file size on disk)
         tr.appendChild(Object.assign(document.createElement('td'),{className:'sz',textContent:sz}));
         // Action cell
@@ -1228,6 +1412,7 @@ function gkLoadList(){
         db.onclick=(function(n){return function(){gkDelete(n);};})(f.name);
         tdA.appendChild(db);
         tr.appendChild(tdA);
+        gkMakeDraggable(tr, f.name);
         tb.appendChild(tr);
       });
       // Async: fetch free/used space for each slot — fills text + mini bar
@@ -1265,7 +1450,17 @@ function gkLoadList(){
         var bFill=document.createElement('div'); bFill.id='gkBar_'+f.slot;
         bFill.style.cssText='height:100%;width:0%;background:var(--green);border-radius:2px;transition:width .4s';
         bWrap.appendChild(bFill); tdN.appendChild(spDiv); tdN.appendChild(bWrap);
-        tr.appendChild(mkTd('ic','💾')); tr.appendChild(tdN);
+        tr.appendChild(mkTd('ic','💾'));
+        var tdId2=document.createElement('td');
+        tdId2.style.cssText='padding:4px 8px;text-align:center;font-family:monospace;font-size:.8rem;color:var(--tx2);white-space:nowrap;font-weight:bold';
+        tdId2.textContent=String(f.slot).padStart(3,'0');
+        tr.appendChild(tdId2);
+        tr.appendChild(tdN);
+        var tdD2=document.createElement('td');
+        tdD2.style.cssText='padding:4px 8px;color:var(--tx);font-size:.78rem;max-width:240px';
+        tdD2.textContent=gkLabels[f.name]||'';
+        addEditHint(tdD2, f.name);
+        tr.appendChild(tdD2);
         tr.appendChild(Object.assign(document.createElement('td'),{className:'sz',textContent:sz}));
         var tdA=mkTd('ac','');
         var mb=document.createElement('button'); mb.className='btn g'; mb.style.whiteSpace='nowrap';
@@ -1293,7 +1488,6 @@ function gkLoadList(){
           }).catch(function(){if(spEl){spEl.textContent='—';spEl.style.color='var(--tx3)';}});
       });
     });
-  }).catch(function(){var tb=$('gkTbody');if(tb)tb.innerHTML='<tr><td colspan="4" style="color:var(--red)">Load error</td></tr>';});
 }
 
 // ── IMG Browser ───────────────────────────────────────────────────────────────
