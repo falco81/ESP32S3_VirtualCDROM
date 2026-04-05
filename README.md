@@ -1,11 +1,53 @@
-# ESP32-S3 Virtual CD-ROM Drive + File Manager
+# ESP32-S3 Virtual CD-ROM + GoTek Floppy Emulator
 
-Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored on an SD card are presented to the host PC as a standard optical drive. Works natively on Windows and Linux without any drivers. For DOS and retro systems a modified `USBCD.SYS`-based driver (`ESPUSBCD.SYS`) is included, providing full data and audio CD support through the standard ASPI interface. The device also acts as a Wi-Fi file manager and supports audio track playback from CUE images via an I2S DAC module.
+Firmware for the ESP32-S3 that emulates a **USB CD-ROM drive** and optionally a **USB floppy drive source for GoTek hardware**. Disc and floppy images are stored on an SD card and presented to the host PC or GoTek device via USB. Works natively on Windows and Linux without any drivers. For DOS and retro systems a modified `USBCD.SYS`-based driver (`ESPUSBCD.SYS`) is included, providing full data and audio CD support. The device also acts as a Wi-Fi file manager and supports audio track playback from CUE images via an I2S DAC module.
+
+---
+
+## Two Firmware Variants
+
+This project provides two firmware builds. Both use the same hardware, wiring and Arduino IDE settings.
+
+### GoTek/ESP32S3_VirtualCDROM.ino
+
+The primary build. Contains the complete CD-ROM firmware plus GoTek floppy emulation. The active mode — CD-ROM or GoTek — is switchable from the web interface or serial CLI without reflashing.
+
+```
+GoTek/
+├── ESP32S3_VirtualCDROM.ino  ← primary firmware
+├── html_page.h
+├── partitions.csv
+├── build_exfat_libs.py
+└── build/
+    ├── firmware_merged.bin
+    ├── flash_windows.bat
+    └── flash_linux.sh
+```
+
+In CD-ROM mode the device enumerates with USB PID `0x1001` and SCSI type `0x05` — Windows installs the CdRom driver. In GoTek mode it enumerates with PID `0x8020` and SCSI type `0x00` — Windows installs the Disk driver and GoTek hardware can read floppy images from the ESP32 via raw LBA access.
+
+### ESP32S3_VirtualCDROM.ino
+
+CD-ROM emulation only. Kept for reference and minimal deployments where GoTek support is not needed. All features documented in this file apply to this build as well, with the exception of everything in the GoTek section.
+
+```
+ESP32S3_VirtualCDROM.ino
+html_page.h
+partitions.csv
+build_exfat_libs.py
+build/
+├── firmware_merged.bin
+├── flash_windows.bat
+└── flash_linux.sh
+```
+
+The `build_exfat_libs.py` patch script must be run before compiling either build.
 
 ---
 
 ## Table of Contents
 
+- [Two Firmware Variants](#two-firmware-variants)
 - [Features](#features)
 - [Hardware Requirements](#hardware-requirements)
 - [Wiring](#wiring)
@@ -39,6 +81,8 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [Building and Flashing Without Arduino IDE](#building-and-flashing-without-arduino-ide)
 - [Project Files](#project-files)
 - [GoTek Floppy Emulator Extension](#gotek-floppy-emulator-extension)
+  - [Overview](#overview)
+  - [GoTek Hardware and Firmware Compatibility](#gotek-hardware-and-firmware-compatibility)
   - [Project Structure](#project-structure-1)
   - [GoTek Features](#gotek-features)
   - [Files in this Folder](#files-in-this-folder)
@@ -57,6 +101,8 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 ---
 
 ## Features
+
+> Features below apply to **both firmware variants**. GoTek-specific features are listed in the [GoTek Floppy Emulator Extension](#gotek-floppy-emulator-extension) section.
 
 - **USB CD-ROM emulation** — USB MSC with CD-ROM SCSI profile; seen as optical drive on any OS without drivers
 - **Disc image formats** — ISO 9660 (`.iso`), raw binary (`.bin`), CUE sheets (`.cue`) with full multi-track support and all raw sector formats
@@ -1820,11 +1866,35 @@ ESP32S3_VirtualCDROM-main/
 
 ## Overview
 
-The GoTek extension turns the ESP32-S3 into a USB floppy drive source for **GoTek hardware** (running stock or HxC firmware). The GoTek reads floppy disk images from the ESP32 as if it were a USB flash drive containing raw concatenated disk images.
+The GoTek extension turns the ESP32-S3 into a USB floppy drive source for GoTek hardware. The GoTek reads floppy disk images from the ESP32 as if it were a USB flash drive containing raw concatenated disk images at fixed LBA offsets.
 
-In addition to serving GoTek hardware, the single-slot mode allows **Windows direct access** to any individual floppy image as a standard USB disk (for reading, writing and browsing files).
+In addition to serving GoTek hardware, the single-slot mode allows Windows direct access to any individual floppy image as a standard USB disk for reading, writing and browsing files.
 
-The **mode is persistent** — stored in NVS flash. After setting GoTek mode via the web interface Config tab, the device starts in GoTek mode on every subsequent boot (including `gkBuildFS`, USB MSC init, and web server setup) until CD-ROM mode is restored.
+The mode is persistent — stored in NVS flash. After setting GoTek mode via the web interface Config tab, the device starts in GoTek mode on every subsequent boot until CD-ROM mode is restored.
+
+---
+
+## GoTek Hardware and Firmware Compatibility
+
+GoTek is the brand name of a widely sold floppy drive emulator. The same physical hardware is used with several different firmware variants, and they differ in how they read images from a USB source device.
+
+### FlashFloppy
+
+[FlashFloppy](https://github.com/keirf/flashfloppy) is open-source third-party firmware for GoTek hardware and is the most commonly used alternative firmware. In USB Host mode (FF.CFG `host = usb`) FlashFloppy reads images from a USB storage device using raw LBA access with a configurable stride.
+
+**This firmware was developed and tested against FlashFloppy.** The default stride of 3072 sectors was measured empirically on a GoTek running FlashFloppy with a standard PC floppy drive configuration (HD 1.44 MB). If your FlashFloppy configuration uses a different image size (e.g. Amiga DD, HD, or DMF extended), change `GK_SLOT_STRIDE` accordingly — see the stride table in the [Technical Notes](#technical-notes--how-gotek-raw-mode-works) section.
+
+### Stock GoTek firmware
+
+The stock firmware shipped on GoTek hardware reads images by filename from a FAT filesystem on the USB device. It does not use raw LBA access and is therefore **not compatible** with this firmware. If your GoTek is running stock firmware, replace it with FlashFloppy.
+
+### HxC firmware
+
+[HxC](https://hxc2001.com/floppy_drive_emulator/) is a commercial firmware for GoTek. In USB mode it reads images using a protocol similar to FlashFloppy raw LBA access. Compatibility with this firmware has not been verified; the stride value may differ.
+
+### Goex / other variants
+
+Other GoTek firmware variants have not been tested. If the GoTek reads slot 0 correctly but slot 1 appears blank or asks to format, the stride value does not match — see [Troubleshooting GoTek Mode](#troubleshooting-gotek-mode).
 
 ---
 
@@ -2485,12 +2555,26 @@ This was caused by declaring large arrays on the stack inside HTTP lambda functi
 
 ## Project Files
 
+### Root directory — CD-ROM only build
+
 | File | Description |
 |---|---|
-| `ESP32S3_VirtualCDROM.ino` | Main firmware (Arduino C++) |
-| `html_page.h` | Web interface as an inline C string |
+| `ESP32S3_VirtualCDROM.ino` | CD-ROM only firmware (Arduino C++) |
+| `html_page.h` | Web interface (CD-ROM tabs only) |
 | `partitions.csv` | Custom partition table (6 MB app) |
 | `build_exfat_libs.py` | exFAT + USBMSC patch script — run in WSL (current patch: v14) |
+
+### GoTek/ directory — Primary build (CD-ROM + GoTek)
+
+| File | Description |
+|---|---|
+| `GoTek/ESP32S3_VirtualCDROM.ino` | **Primary firmware** — CD-ROM + GoTek floppy emulation |
+| `GoTek/html_page.h` | Extended web interface (GoTek tab + all CD-ROM tabs) |
+| `GoTek/partitions.csv` | Same custom partition table (6 MB app) |
+| `GoTek/build_exfat_libs.py` | Same exFAT + USBMSC patch script |
+| `GoTek/build/firmware_merged.bin` | **Pre-built primary firmware** — single 16 MB file for direct flashing |
+| `GoTek/build/flash_windows.bat` | Windows flash script for GoTek firmware |
+| `GoTek/build/flash_linux.sh` | Linux/macOS flash script for GoTek firmware |
 | `driver/ESPUSBCD.SYS` | DOS CD-ROM driver (modified USBCD.SYS) — copy to DOS machine |
 | `driver/CONFIG.SYS` | Sample DOS CONFIG.SYS with correct CRLF line endings |
 | `driver/AUTOEXEC.BAT` | Sample DOS AUTOEXEC.BAT with correct CRLF line endings |
