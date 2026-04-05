@@ -38,6 +38,21 @@ Firmware for the ESP32-S3 that emulates a USB CD-ROM drive. Disc images stored o
 - [Troubleshooting](#troubleshooting)
 - [Building and Flashing Without Arduino IDE](#building-and-flashing-without-arduino-ide)
 - [Project Files](#project-files)
+- [GoTek Floppy Emulator Extension](#gotek-floppy-emulator-extension)
+  - [Project Structure](#project-structure-1)
+  - [GoTek Features](#gotek-features)
+  - [Files in this Folder](#files-in-this-folder)
+  - [Setup and Compilation](#setup-and-compilation)
+  - [Switching Between CD-ROM and GoTek Mode](#switching-between-cd-rom-and-gotek-mode)
+  - [Preparing the SD Card for GoTek Mode](#preparing-the-sd-card-for-gotek-mode)
+  - [GoTek Web Interface](#gotek-web-interface)
+  - [Slot Ordering and Image Names](#slot-ordering-and-image-names)
+  - [Image Editor](#image-editor)
+  - [Debug and Diagnostics](#debug-and-diagnostics)
+  - [GoTek API Reference](#gotek-api-reference)
+  - [USB Classification Fix](#usb-classification-fix)
+  - [Technical Notes — How GoTek Raw Mode Works](#technical-notes--how-gotek-raw-mode-works)
+  - [Troubleshooting GoTek Mode](#troubleshooting-gotek-mode)
 
 ---
 
@@ -1768,6 +1783,705 @@ Upload the `build/` folder contents as a `.zip` file attached to the GitHub Rele
 
 ---
 
+
+
+---
+
+## GoTek Floppy Emulator Extension
+
+The GoTek folder (`GoTek/`) contains a **separate extended firmware build** that adds USB floppy drive emulation while retaining all CD-ROM features. The root directory keeps the original CD-ROM-only firmware unchanged.
+
+### Project Structure
+
+```
+ESP32S3_VirtualCDROM-main/
+├── ESP32S3_VirtualCDROM.ino   ← Original CD-ROM only firmware
+├── html_page.h
+├── partitions.csv
+├── build_exfat_libs.py
+├── build/
+│   ├── firmware_merged.bin
+│   ├── flash_windows.bat
+│   └── flash_linux.sh
+├── README.md                  ← This file
+│
+└── GoTek/                     ← Extended firmware (CD-ROM + GoTek)
+    ├── ESP32S3_VirtualCDROM.ino
+    ├── html_page.h
+    ├── partitions.csv
+    ├── build_exfat_libs.py
+    └── build/
+        ├── firmware_merged.bin
+        ├── flash_windows.bat
+        └── flash_linux.sh
+```
+
+**Hardware wiring and Arduino IDE settings are identical for both versions.** The GoTek build uses the same `build_exfat_libs.py` patch script. Only the `.ino` and `html_page.h` files differ.
+
+## Overview
+
+The GoTek extension turns the ESP32-S3 into a USB floppy drive source for **GoTek hardware** (running stock or HxC firmware). The GoTek reads floppy disk images from the ESP32 as if it were a USB flash drive containing raw concatenated disk images.
+
+In addition to serving GoTek hardware, the single-slot mode allows **Windows direct access** to any individual floppy image as a standard USB disk (for reading, writing and browsing files).
+
+The **mode is persistent** — stored in NVS flash. After setting GoTek mode via the web interface Config tab, the device starts in GoTek mode on every subsequent boot (including `gkBuildFS`, USB MSC init, and web server setup) until CD-ROM mode is restored.
+
+---
+
+## Project Structure
+
+```
+ESP32S3_VirtualCDROM-main/
+├── ESP32S3_VirtualCDROM.ino   ← Original CD-ROM only firmware
+├── html_page.h
+├── partitions.csv
+├── build_exfat_libs.py
+├── build/
+│   ├── firmware_merged.bin
+│   ├── flash_windows.bat
+│   └── flash_linux.sh
+├── README.md
+│
+└── GoTek/                     ← THIS FOLDER: GoTek extended firmware
+    ├── ESP32S3_VirtualCDROM.ino  ← Extended firmware (CD-ROM + GoTek)
+    ├── html_page.h               ← Extended web UI with GoTek tab
+    ├── partitions.csv            ← Same partition table
+    ├── build_exfat_libs.py       ← Same patch script
+    └── build/
+        ├── firmware_merged.bin
+        ├── flash_windows.bat
+        └── flash_linux.sh
+```
+
+**Both versions share the same hardware, wiring and Arduino IDE settings.** Only the firmware file and `html_page.h` differ.
+
+---
+
+## GoTek Features
+
+- **USB floppy drive emulation** — ESP32 presents itself as a USB mass storage device with `peripheral_device_type = 0x00` (Direct-access block device). Windows installs Disk driver; GoTek hardware reads raw floppy images.
+- **Multiple image slots** — up to 100 `.img` / `.ima` / `.adf` / `.dsk` / `.st` / `.d81` / `.d64` / `.hfe` image files, served at fixed LBA offsets matching GoTek's slot stride
+- **Custom image names** — files can have any name (not limited to `DSKA0000.img` convention); slot order is stored in `order.json`
+- **Persistent slot order** — drag-and-drop reordering in the web UI saved to `/GoTek/order.json` on the SD card; no file renaming
+- **Image labels** — per-image description text stored in `/GoTek/labels.json`; inline editing in the web UI
+- **Image editor** — browse, upload, download and delete files inside individual FAT12 floppy images directly from the browser
+- **Free space monitoring** — per-slot used/free space with colour-coded progress bar (green/yellow/red)
+- **Single-slot mode** — mount one specific image as a standard 1.44 MB USB disk for Windows direct access (read/write); re-enumerates USB automatically
+- **GoTek RAW mode** — all slots concatenated at fixed LBA offsets for GoTek hardware; re-enumerates USB automatically
+- **Create blank images** — generate pre-formatted FAT12 1.44 MB / 720 KB / 360 KB images directly from the web UI
+- **LRU read cache** — 4-handle LRU cache for SD card file descriptors; supports up to 999 image slots with only 4 open file descriptors
+- **Debug logging** — critical sector reads (boot sector, FAT, root directory) logged to Serial and Log tab on first access per slot
+
+---
+
+## Files in this Folder
+
+| File | Description |
+|---|---|
+| `ESP32S3_VirtualCDROM.ino` | Extended firmware: all CD-ROM features + GoTek floppy emulation |
+| `html_page.h` | Extended web UI: adds GoTek tab with image browser, editor, labels, ordering |
+| `partitions.csv` | Same custom partition table as the root version (6 MB app) |
+| `build_exfat_libs.py` | Same patch script as root version — must be run before compiling |
+| `build/firmware_merged.bin` | Pre-built GoTek firmware (single 16 MB merged image) |
+| `build/flash_windows.bat` | Windows flash script |
+| `build/flash_linux.sh` | Linux/macOS flash script |
+
+---
+
+## Setup and Compilation
+
+**All hardware wiring and Arduino IDE settings are identical to the root version.** See the main [README.md](../README.md) for complete setup instructions.
+
+### Quick summary:
+
+1. Run `build_exfat_libs.py` from WSL/AlmaLinux (same as root version)
+2. Open `GoTek/ESP32S3_VirtualCDROM.ino` in Arduino IDE (not the root `.ino`)
+3. Ensure `GoTek/html_page.h` and `GoTek/partitions.csv` are in the same folder
+4. Use identical Arduino IDE settings as the root version
+5. Upload
+
+### Or flash the pre-built binary:
+
+**Windows:** double-click `build\flash_windows.bat`
+
+**Linux/macOS:**
+```bash
+chmod +x build/flash_linux.sh
+./build/flash_linux.sh
+```
+
+---
+
+## Switching Between CD-ROM and GoTek Mode
+
+The device starts in **CD-ROM mode** by default. Switch to GoTek mode via the web interface:
+
+**Web UI → Config tab → Device Mode → GoTek Floppy Emulator → Save → Reboot**
+
+Or via Serial CLI:
+```
+set device-mode gotek
+reboot
+```
+
+Switch back to CD-ROM mode:
+```
+set device-mode cdrom
+reboot
+```
+
+After switching modes the USB device re-enumerates:
+- **CD-ROM mode**: USB PID `0x1001`, SCSI device type `0x05` (CD-ROM) → Windows installs CdRom driver
+- **GoTek mode**: USB PID `0x8020`, SCSI device type `0x00` (Direct-access) → Windows installs Disk driver
+
+The mode is stored in NVS and survives reboots and power cycles.
+
+---
+
+## Preparing the SD Card for GoTek Mode
+
+### Directory structure
+
+GoTek images are stored in a dedicated directory on the SD card (default: `/GoTek`). Configure the directory in the web UI Config tab or via CLI:
+
+```
+set gotek-dir /GoTek
+```
+
+The directory is created automatically if it does not exist.
+
+### Place floppy images
+
+Copy `.img`, `.ima`, `.adf`, `.dsk`, `.st`, `.d81`, `.d64` or `.hfe` files to the GoTek directory on the SD card (via File Manager tab or direct SD card copy).
+
+Image files can have any filename:
+```
+/GoTek/DSKA0000.img
+/GoTek/DSKA0001.img
+/GoTek/Games-Doom.img
+/GoTek/Work_spreadsheet.img
+/GoTek/Amiga_Workbench.adf
+```
+
+### Slot assignment
+
+Without an `order.json` file, slots are assigned **alphabetically** by filename:
+```
+Slot 0 = Amiga_Workbench.adf    (LBA 0)
+Slot 1 = DSKA0000.img            (LBA 3072)
+Slot 2 = DSKA0001.img            (LBA 6144)
+Slot 3 = Games-Doom.img          (LBA 9216)
+Slot 4 = Work_spreadsheet.img    (LBA 12288)
+```
+
+Use the web UI **GoTek tab → drag and drop → Save order** to reorder without renaming files. The order is written to `/GoTek/order.json`.
+
+### Supported image formats
+
+| Extension | Description |
+|---|---|
+| `.img` / `.ima` | Raw floppy sector image (FAT12, Amiga DOS, etc.) |
+| `.adf` | Amiga Disk File |
+| `.dsk` | Various disk image formats |
+| `.st` | Atari ST disk image |
+| `.d81` | Commodore 1581 disk image |
+| `.d64` | Commodore 1541 disk image |
+| `.hfe` | HxC Floppy Emulator format |
+
+The firmware does not interpret the image format — it serves raw bytes at the correct LBA offset and lets the GoTek hardware handle the format.
+
+---
+
+## GoTek Web Interface
+
+The extended web UI adds a **GoTek** tab between CD-ROM and File Manager. The tab is automatically shown when the device is in GoTek mode and hidden in CD-ROM mode.
+
+### GoTek tab sections
+
+#### Status badges (top of card)
+- **GoTek mode active** — green when `cfg.deviceMode == 1`
+- **FS ready** — green when `gkBuildFS()` has completed
+- **USB info** — click to open the slot diagnostics panel
+
+#### Current image card
+
+Shows the currently active GoTek configuration:
+- **GoTek RAW** badge — all slots served at fixed LBA offsets for GoTek hardware
+- **SLOT NNN** badge — single-slot mode; one image exposed as 1.44 MB USB disk
+- Filename of the active image (single-slot mode only)
+- **GoTek mode** button — switches back to GoTek RAW mode (all slots); triggers USB re-enumeration
+
+#### Image files card
+
+The main image list table with columns:
+
+| Column | Description |
+|---|---|
+| (drag handle ⠿) | Drag row to reorder; appears as grab cursor |
+| **ID** | Slot number (000, 001, 002 …); click header to sort ascending/descending |
+| **Filename** | Image filename; click header to sort alphabetically |
+| **Description** | Editable per-image label (click cell to edit inline; Enter/Tab to save) |
+| (free space) | Sub-line: `241 KB used • 1183 KB free` + 3 px colour bar (green/yellow/red) |
+| **Size** | Image file size on SD card |
+| Actions | **▶ Mount** (single-slot mode), **💾** (image editor), **🗑** (delete) |
+
+#### Toolbar buttons
+
+| Button | Action |
+|---|---|
+| **⟳ Refresh** | Reload the image list from the SD card |
+| **+ New** | Create a blank pre-formatted FAT12 image (1.44 MB / 720 KB / 360 KB) |
+| **⬆ Upload** | Upload an `.img` file from the browser to the SD card |
+| **📌 Save order** | Save the current drag-and-drop order to `/GoTek/order.json` (appears only after reordering) |
+
+---
+
+## Slot Ordering and Image Names
+
+### Why custom filenames work
+
+The slot number is determined **by position in the sorted/ordered list**, not by the filename. Any filename is valid.
+
+```
+order.json: ["Work.img", "Games.img", "DSKA0000.img"]
+
+→ Slot 0 = Work.img    starts at LBA 0
+→ Slot 1 = Games.img   starts at LBA 3072
+→ Slot 2 = DSKA0000.img starts at LBA 6144
+```
+
+GoTek hardware reads:
+- Slot 0 → LBA 0 → `Work.img` byte 0 (boot sector) ✓
+- Slot 1 → LBA 3072 → `Games.img` byte 0 (boot sector) ✓
+- Slot 2 → LBA 6144 → `DSKA0000.img` byte 0 (boot sector) ✓
+
+### Drag-and-drop reordering
+
+1. Drag a row to the desired position in the GoTek tab
+2. **📌 Save order** button appears in the toolbar
+3. Click Save order → writes `order.json` to SD card → GoTek slot table rebuilds → USB re-enumerates
+4. No files are renamed
+
+### order.json format
+
+```json
+["Work.img", "Games.img", "DSKA0000.img", "Amiga_WB.adf"]
+```
+
+Files not in `order.json` (added after last save) are appended alphabetically.
+
+### Image labels (labels.json)
+
+Click any cell in the **Description** column to edit inline:
+- Type a description → press **Enter** or click elsewhere to save
+- The label is saved immediately to `/GoTek/labels.json` (created automatically on first edit)
+- Press **Escape** to cancel
+
+`labels.json` format:
+```json
+{"Work.img": "Word 6.0 install disk 1", "Games.img": "Doom II level pack"}
+```
+
+Labels survive slot reordering and file deletion (keyed by filename).
+
+---
+
+## Image Editor
+
+The image editor allows browsing, reading and writing files **inside** individual FAT12 floppy images directly from the browser, without removing the SD card.
+
+### Opening the editor
+
+Click the **💾** button in the Actions column of any image row → modal opens.
+
+### Features
+
+- **File list** — directories first (alphabetically), then files (alphabetically)
+- **Breadcrumb navigation** — click any path component to navigate
+- **Download** — click the download button (⬇) next to any file to download it to your computer
+- **Delete** — click 🗑 to delete a file or folder
+- **New folder** — enter a name in the folder field and click **📁 New folder**
+- **Upload** — select a file; upload is blocked with a warning (⚠ Not enough space) if the file would not fit
+- **Upload progress** — shows `Uploading… 42%` during transfer
+- **Free space bar** — coloured progress bar at the bottom: `Used: 357 KB • Free: 1083 KB • Total: 1440 KB`
+  - Green: < 75% full
+  - Yellow: 75–90% full
+  - Red: > 90% full
+
+### Limitations
+
+- Images must be FAT12 formatted (standard floppy format)
+- Maximum filename length: 8.3 format (FAT12 limitation)
+- Image must be less than 2880 sectors (standard 1.44 MB) for standard GoTek compatibility
+
+---
+
+## Debug and Diagnostics
+
+### USB info panel
+
+Click the **USB info** badge on the GoTek tab to open the slot diagnostics panel:
+
+| Field | Description |
+|---|---|
+| GoTek mode | Whether `scsi_get_gotek_mode()` returns true |
+| cfg.deviceMode | Raw NVS value (1 = GoTek) |
+| Slots loaded | Number of images found and loaded |
+| Selected slot | Current single-slot selection (−1 = RAW mode) |
+| Current slot | Last slot accessed by GoTek hardware |
+| Last LBA | Last LBA read by GoTek hardware |
+| Slot table | Full table: filename, size, sector count, Start LBA, End LBA, reads, writes, FAT12 validity |
+
+### Log tab (Serial mirror)
+
+All GoTek events appear in the **Log tab** (and Serial at 115 200 baud). Events are logged on first access per slot:
+
+```
+[GOTEK] Slot 000: Work.img              1474560 B  LBA 0
+[GOTEK] Slot 001: Games.img             1474560 B  LBA 3072
+[GOTEK] 2 slot(s) ready. Max LBA: 6144
+[GOTEK] Read handle cache ready (2/2 slots pre-warmed, 2 FDs used)
+
+[GK] Slot 0 boot OK: OEM=MSDOS5.0  TotSec=2880  Media=F0  got=512
+[GK] Slot 0 FAT1: F0 FF FF  OK
+[GK] Slot 0 root dir: has files
+[GK] Slot 0 first entry: 'AUTOEXEC BAT' size=128
+```
+
+### Debug mode
+
+Enable debug mode in Config tab or via serial (`set debug on`) for verbose per-sector logging:
+
+```
+[GK R] Slot 1 boot (LBA 3072): EB3C90 got=512
+[GK R] LBA 6144 UNMAPPED — GoTek reads outside all slots!
+```
+
+UNMAPPED reads indicate GoTek is trying to access a slot that does not exist — expected when GoTek navigates to a slot number beyond the number of loaded images.
+
+---
+
+## GoTek API Reference
+
+All endpoints require authentication if web-auth is enabled. Base URL: `http://espcd.local` or device IP.
+
+### GoTek slot management
+
+#### `GET /api/gotek/ls`
+
+List all loaded image slots.
+
+```json
+{
+  "dir": "/GoTek",
+  "files": [
+    {"name": "Work.img",  "size": 1474560, "slot": 0},
+    {"name": "Games.img", "size": 1474560, "slot": 1}
+  ]
+}
+```
+
+#### `GET /api/gotek/select?slot=N`
+
+Switch to single-slot mode — expose only slot N as a 1.44 MB USB disk. Triggers USB re-enumeration.
+
+```
+GET /api/gotek/select?slot=0
+→ {"ok": true, "slot": 0, "sectors": 2880}
+```
+
+#### `GET /api/gotek/select?slot=-1`
+
+Switch back to GoTek RAW mode (all slots at fixed LBA offsets). Triggers USB re-enumeration.
+
+#### `GET /api/gotek/usbdebug`
+
+Full diagnostics: GoTek mode state, slot table with LBA ranges, read/write counters, FAT12 validity.
+
+```json
+{
+  "gotek_mode_fn": true,
+  "cfg_deviceMode": 1,
+  "gk_selected_slot": -1,
+  "gk_cur_slot": 0,
+  "gk_last_lba": 147,
+  "gk_fc": 2,
+  "gk_ready": true,
+  "pid_hex": "0x8020",
+  "slots": [
+    {
+      "slot": 0, "path": "/GoTek/Work.img",
+      "sz": 1474560, "sectors": 2880,
+      "startLba": 0, "endLba": 3071,
+      "reads": 2880, "writes": 0, "sz_ok": true
+    }
+  ]
+}
+```
+
+#### `GET /api/gotek/refresh`
+
+Rescan the SD card GoTek directory and rebuild the slot table without rebooting.
+
+### Image labels
+
+#### `GET /api/gotek/labels`
+
+Read the labels JSON file. Returns `{}` if no labels file exists.
+
+```json
+{"Work.img": "Word 6.0 install", "Games.img": "Doom II level pack"}
+```
+
+#### `POST /api/gotek/labels`
+
+Save labels. Body: full JSON object (all labels). Overwrites the labels file.
+
+```
+POST /api/gotek/labels
+Content-Type: application/json
+{"Work.img": "Word 6.0 install", "Games.img": "Doom II level pack"}
+→ {"ok": true}
+```
+
+### Slot order
+
+#### `POST /api/gotek/order`
+
+Save a new slot order. Body: JSON array of filenames. Writes `order.json`, rebuilds slot table, re-enumerates USB.
+
+```
+POST /api/gotek/order
+Content-Type: application/json
+["Games.img", "Work.img", "DSKA0000.img"]
+→ {"ok": true}
+```
+
+### Image creation
+
+#### `GET /api/gotek/create?name=FILENAME&type=TYPE`
+
+Create a new blank pre-formatted FAT12 image on the SD card.
+
+| Parameter | Values |
+|---|---|
+| `name` | Target filename, e.g. `DSKA0002.img` |
+| `type` | `144` = 1.44 MB, `720` = 720 KB, `360` = 360 KB |
+
+```
+GET /api/gotek/create?name=DSKA0002.img&type=144
+→ {"ok": true, "size": 1474560}
+```
+
+### Image filesystem (FAT12 editor)
+
+#### `GET /api/img/ls?img=PATH&dir=DIRPATH`
+
+List directory contents inside a FAT12 image.
+
+```
+GET /api/img/ls?img=/GoTek/Work.img&dir=/
+→ {
+    "ok": true, "dir": "/",
+    "bps": 512, "spc": 1, "total": 2880,
+    "free_clusters": 1183,
+    "files": [
+      {"n": "AUTOEXEC.BAT", "d": false, "s": 128},
+      {"n": "SYSTEM",       "d": true,  "s": 0}
+    ]
+  }
+```
+
+#### `GET /api/img/stat?img=PATH`
+
+Free/used/total bytes for a FAT12 image. Used for space monitoring in the web UI.
+
+```json
+{
+  "ok": true,
+  "free_bytes": 1108992,
+  "used_bytes": 365568,
+  "total_bytes": 1474560,
+  "free_clusters": 538,
+  "cluster_bytes": 2048
+}
+```
+
+#### `GET /api/img/get?img=PATH&file=FILEPATH`
+
+Download a file from inside a FAT12 image.
+
+#### `GET /api/img/rm?img=PATH&file=FILEPATH`
+
+Delete a file or folder from inside a FAT12 image.
+
+#### `GET /api/img/mkdir?img=PATH&dir=DIRPATH&name=NAME`
+
+Create a folder inside a FAT12 image.
+
+#### `POST /api/img/put?img=PATH&file=FILEPATH`
+
+Upload a file into a FAT12 image. If the file is larger than the available free space, the upload is rejected before writing. Send as `multipart/form-data`.
+
+---
+
+## USB Classification Fix
+
+GoTek hardware and Windows classify the USB device differently based on the **SCSI INQUIRY response byte 0** (`peripheral_device_type`):
+
+| Value | Device type | Windows driver | GoTek sees |
+|---|---|---|---|
+| `0x00` | Direct-access block device | Disk | ✓ USB floppy source |
+| `0x05` | CD-ROM | CdRom | ✗ Wrong driver |
+
+The firmware defines `tud_msc_inquiry2_cb` (newer TinyUSB API) to control the full 36-byte INQUIRY response:
+
+```cpp
+extern "C" uint32_t tud_msc_inquiry2_cb(uint8_t lun, void* resp, uint32_t bufsize) {
+    uint8_t* r = (uint8_t*)resp;
+    memset(r, 0, 36);
+    r[0] = scsi_get_gotek_mode() ? 0x00 : 0x05;  // Disk or CD-ROM
+    r[1] = 0x80;  // removable
+    // ... vendor/product strings ...
+    return 36;
+}
+```
+
+Additionally the USB PID differs between modes:
+- CD-ROM mode: PID `0x1001` — Windows cached drivers should not clash
+- GoTek mode: PID `0x8020` — unique PID ensures Windows installs Disk driver on first connect
+
+The serial number is MAC-address-based (`GK-XXXXXX`) to prevent Windows from reusing a cached CD-ROM driver association.
+
+---
+
+## Technical Notes — How GoTek Raw Mode Works
+
+### Slot layout
+
+GoTek hardware (stock or HxC firmware) reads disk images from a USB storage device using raw LBA access — **not** through a FAT filesystem. Each slot is accessed at a fixed LBA offset:
+
+```
+Slot N starts at LBA:  N × GK_SLOT_STRIDE
+```
+
+The `GK_SLOT_STRIDE` value must match the GoTek firmware's expected image size in sectors. **This value was measured empirically** on the test device:
+
+```
+Slot 0 → reads LBA 0     (0 × 3072)
+Slot 2 → reads LBA 6144  (2 × 3072)
+∴ GK_SLOT_STRIDE = 3072
+```
+
+The stride 3072 sectors × 512 bytes = **1,572,864 bytes ≈ 1.5 MB** per slot. This is slightly larger than the standard 1.44 MB floppy (2880 sectors × 512 = 1,474,560 bytes), leaving a 192-sector gap between images that GoTek does not use.
+
+**If your GoTek hardware uses a different stride** (e.g. 2880 for true 1.44 MB, or 3360 for 1.68 MB DMF format), change the constant at the top of the `.ino` file:
+
+```cpp
+#define GK_SLOT_STRIDE  3072u   // Change to match your GoTek firmware
+```
+
+Common stride values:
+
+| Stride | Image size | Format |
+|---|---|---|
+| 2880 | 1.44 MB | Standard PC HD |
+| 3072 | ~1.5 MB | Observed on some stock GoTek builds |
+| 3360 | 1.68 MB | XDF / DMF extended format |
+| 1760 | 880 KB | Amiga DD |
+| 3520 | 1.76 MB | Amiga HD |
+
+### LRU file handle cache
+
+Keeping one SD file descriptor open per slot would require up to 999 file descriptors — far beyond the ESP32's VFS FAT limit. Instead a **4-handle LRU cache** is used:
+
+```
+GoTek reads slot 0 → cache miss → open DSKA0000.img → cache: [0, -, -, -]
+GoTek reads slot 1 → cache miss → open DSKA0001.img → cache: [1, 0, -, -]
+GoTek reads slot 0 → cache hit → seek + read → cache: [0, 1, -, -]  ✓ no open()
+GoTek reads slot 5 → cache miss → evict LRU (slot 1) → open DSKA0005.img → cache: [5, 0, 1, -]
+```
+
+In practice GoTek reads one slot sequentially (streaming the full 1.44 MB image) — the cache achieves near-100% hit rate with only 4 open file descriptors regardless of the total number of slots.
+
+### Single-slot mode
+
+Single-slot mode (`GET /api/gotek/select?slot=N`) exposes one image as the entire USB disk with block count = 2880 (1.44 MB). LBA 0 on the USB device maps to byte 0 of the selected image. This allows Windows to mount the image as a standard floppy disk drive — file manager access, read and write — without knowing about GoTek or the concatenated raw format.
+
+After switching slots, the USB device re-enumerates (disconnect → 600 ms → reconnect) so the OS sees the new disk immediately.
+
+### SD card file descriptor limit
+
+`SD_MMC.begin()` is called with `maxOpenFiles = 20` to allow:
+- 4 LRU read handles (GoTek streaming)
+- Simultaneous web API operations (file listing, image editor, labels read/write)
+- Write operations (image uploads, FAT12 modifications)
+
+Default `maxOpenFiles` is 5 — insufficient for more than 3 simultaneous open files.
+
+---
+
+## Troubleshooting GoTek Mode
+
+### GoTek hardware sees slot 0 but not slot 1
+
+**Symptom:** Slot 0 loads correctly; slot 1 shows "wants to format" or appears blank.
+
+**Cause:** `GK_SLOT_STRIDE` does not match your GoTek firmware. The LBA log (USB info panel) shows what LBA GoTek reads for each slot:
+
+```
+Slot 0 → reads LBA 0      ✓
+Slot 1 → no reads at all  ← GoTek reads LBA 3072 but our slot 1 starts at 2880
+Slot 2 → reads LBA 6144   ✓ → stride = 3072
+```
+
+If slot 2 reads at LBA 6144, the stride is 3072. Change `GK_SLOT_STRIDE` to match.
+
+**Debug:** Enable debug mode and check the Log tab after connecting GoTek hardware. Look for:
+- `[GK] Slot N boot OK` — boot sector of slot N was successfully read
+- `[GK R] LBA NNNN UNMAPPED` — GoTek reads outside known slots → stride mismatch
+
+### "no free file descriptors" on SD card
+
+**Cause:** Too many SD files open simultaneously. This was fixed by:
+1. Increasing `maxOpenFiles` to 20 in `SD_MMC.begin()`
+2. Using a 4-handle LRU cache instead of one handle per slot
+3. Opening write handles on demand (not kept open permanently)
+
+If the error returns after adding many images, check for other SD operations running simultaneously.
+
+### USB device shows as CD-ROM instead of Disk in GoTek mode
+
+The `tud_msc_inquiry2_cb` function must be defined in the `.ino` file (not just in `USBMSC.cpp`). Verify:
+
+```
+Serial output: [DIAG] cfg.deviceMode=1  scsi_get_gotek_mode()=1
+USB info panel: GoTek mode: ✓ active
+```
+
+If Windows still shows CD-ROM, unplug and replug the USB cable. Windows caches the driver by VID+PID+SerialNumber — the unique MAC-based serial prevents driver reuse between modes.
+
+### Drag-and-drop reordering does not work
+
+- The row turns semi-transparent while dragging — if you do not see this, the browser may not support HTML5 drag-and-drop
+- After dropping, the **📌 Save order** button must appear — if not, the drop did not register
+- Sorting (clicking ID or Filename header) clears the drag order; clicking a sort header after reordering will re-sort and lose the drag order
+
+### image editor shows "Error reading image — must be FAT12"
+
+The image file must be a standard FAT12 formatted floppy image. Images in Amiga (`.adf`), Atari ST (`.st`), or other non-FAT12 formats cannot be browsed in the image editor (though they work fine with GoTek hardware).
+
+### Web UI does not load after adding more images
+
+**Cause:** Too many SD file descriptors exhausted. See "no free file descriptors" above.
+
+### Stack overflow crash (Guru Meditation — Stack canary watchpoint triggered)
+
+This was caused by declaring large arrays on the stack inside HTTP lambda functions. Fixed by using heap allocation (`new[]` / `delete[]`). If you see this crash after modifying the firmware, check for large arrays inside lambda callbacks.
+
+---
+
+*GoTek extension documentation — part of the ESP32-S3 Virtual CD-ROM + File Manager project.*
 
 ## Project Files
 
