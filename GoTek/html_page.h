@@ -470,8 +470,9 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           <input class="cfg-inp" id="cfgGotekDir" type="text" placeholder="/gotek" style="width:100%">
         </div>
         <div style="font-size:.75rem;color:var(--tx2);margin-top:6px">
-          Place <code>.img</code> / <code>.adf</code> / <code>.hfe</code> files in this SD folder.
-          FlashFloppy sees them as a FAT32 USB drive and navigates by filename order.
+          Place <code>.img</code> / <code>.adf</code> / <code>.hfe</code> and other floppy images in this SD folder.
+          GoTek hardware reads images via <b>raw LBA access</b> — slot&nbsp;N starts at LBA&nbsp;N&nbsp;×&nbsp;GK_SLOT_STRIDE (default&nbsp;3072).
+          Slot order is alphabetical or set via drag-and-drop in the GoTek tab.
         </div>
       </div>
       <div id="cfgDeviceModeNote0" style="margin-top:8px;font-size:.75rem;background:rgba(56,139,253,.1);border:1px solid rgba(56,139,253,.3);border-radius:4px;padding:8px 12px">
@@ -1053,6 +1054,8 @@ function deviceModeChanged(){
 }
 // ── GoTek tab functions ──────────────────────────────────────────────────────
 var gkIsGotek=false;
+var gkActivePollTimer=null;
+var gkLastCurSlotNum=-1;
 function gkApplyTabVisibility(isGotek){
   var t0=$('t0'),t1=$('t1'),t6=$('t6');
   if(isGotek){
@@ -1112,8 +1115,10 @@ function gkInit(){
     var dirEl=$('gkDir'); if(dirEl) dirEl.textContent=s.gotek_dir||'/gotek';
     if(gkIsGotek){
       gkLoadList(); gkShowUsbBadge(true);
+      // Start polling for active GoTek slot (physical button presses on GoTek hardware)
+      gkStartActivePoll();
     }
-    else gkShowUsbBadge(false);
+    else { gkShowUsbBadge(false); gkStopActivePoll(); }
   }).catch(function(){
     // Even on error, show panels based on last known state
     var notice=$('gkCdromNotice'),panel=$('gkActivePanel');
@@ -1123,6 +1128,55 @@ function gkInit(){
 }
 var gkSelIdx=-1;
 var gkFilesList=[];
+
+// ── Active GoTek slot polling ─────────────────────────────────────────────────
+// Polls /api/sysinfo every 2s when GoTek tab is open.
+// Highlights the row of the slot currently being accessed by GoTek hardware
+// (based on last LBA read — updates as user presses buttons on the GoTek).
+function gkStartActivePoll(){
+  gkStopActivePoll();
+  gkPollActiveSlot();
+  gkActivePollTimer = setInterval(gkPollActiveSlot, 2000);
+}
+function gkStopActivePoll(){
+  if(gkActivePollTimer){ clearInterval(gkActivePollTimer); gkActivePollTimer=null; }
+}
+function gkPollActiveSlot(){
+  fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){
+    var cur = (s.gotek_cur_slotnum != null) ? s.gotek_cur_slotnum : -1;
+    if(cur === gkLastCurSlotNum) return; // no change
+    gkLastCurSlotNum = cur;
+    gkHighlightActiveSlot(cur);
+  }).catch(function(){});
+}
+function gkHighlightActiveSlot(slotNum){
+  var rows = document.querySelectorAll('#gkTbody tr[data-slot]');
+  rows.forEach(function(tr){
+    var sn = parseInt(tr.dataset.slot, 10);
+    var isActive = (sn === slotNum && slotNum >= 0);
+    var isSel = (sn === gkSelIdx && gkSelIdx >= 0);
+    var tip = isActive ? 'GoTek hardware is currently reading this slot' : '';
+    tr.querySelectorAll('td').forEach(function(td){ td.title = tip; });
+    if(isSel){
+      tr.style.background='rgba(63,185,80,.08)';
+      tr.style.boxShadow='';
+    } else if(isActive){
+      tr.style.background='rgba(63,185,80,.05)';
+      tr.style.boxShadow='inset 3px 0 0 var(--green)';
+    } else {
+      tr.style.background='';
+      tr.style.boxShadow='';
+    }
+  });
+  // Update current image name in header card
+  var nm=$('gkCurName');
+  if(nm && gkSelIdx<0){
+    if(slotNum>=0){
+      var f=gkFilesList.find(function(x){return x.slot===slotNum;});
+      if(f) nm.textContent=f.name;
+    }
+  }
+}
 var gkLabels={};  // {filename: "description text"}
 
 function gkLabelsLoad(cb){
@@ -1352,12 +1406,15 @@ function gkRenderList(d){
                f.size>1024?(f.size/1024).toFixed(0)+' KB':f.size+' B';
         var isSel=(f.slot===sel), isCur=(f.slot===cur&&sel<0);
         var tr=mkTr();
+        tr.dataset.slot = f.slot;
+        var isGotelActive = (f.slot===gkLastCurSlotNum && gkLastCurSlotNum>=0);
         if(isSel) tr.style.background='rgba(63,185,80,.08)';
         else if(isCur) tr.style.background='rgba(56,139,253,.06)';
-        // Icon cell — drag handle
+        if(isGotelActive) tr.style.boxShadow='inset 3px 0 0 var(--green)';
+        // Simple drag handle cell
         var tdIc=mkTd('ic','⠿');
         tdIc.style.cssText='cursor:grab;color:var(--tx3);font-size:1rem;padding:4px 6px';
-        tdIc.title='Drag to reorder';
+        tdIc.title = isGotelActive ? 'GoTek hardware is currently reading this slot' : 'Drag to reorder';
         tr.appendChild(tdIc);
         // Slot ID cell
         var tdId=document.createElement('td');
@@ -1413,6 +1470,9 @@ function gkRenderList(d){
         tdA.appendChild(db);
         tr.appendChild(tdA);
         gkMakeDraggable(tr, f.name);
+        if(isGotelActive) tr.querySelectorAll('td').forEach(function(td){
+          td.title='GoTek hardware is currently reading this slot';
+        });
         tb.appendChild(tr);
       });
       // Async: fetch free/used space for each slot — fills text + mini bar

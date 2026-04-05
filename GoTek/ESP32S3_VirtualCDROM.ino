@@ -3532,6 +3532,12 @@ void handleApiSysinfo() {
   j += ",\"gotek_files\":" + String(gkFC);
   j += ",\"gotek_ready\":" + String(gkRdy ? "true" : "false");
   j += ",\"gotek_cur_slot\":" + String(gkCurSlot);
+  // Also expose the slotNum (display ID) of the currently active slot
+  {
+    int sn = -1;
+    if (gkCurSlot >= 0 && gkCurSlot < gkFC) sn = (int)gkF[gkCurSlot].slotNum;
+    j += ",\"gotek_cur_slotnum\":" + String(sn);
+  }
   j += ",\"gotek_selected_slot\":" + String(gkSelectedSlot);
   j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
   j += ",\"httpsCert\":\"" + jsonEsc(cfg.httpsCertPath) + "\"";
