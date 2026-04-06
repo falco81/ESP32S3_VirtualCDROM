@@ -471,8 +471,22 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         </div>
         <div style="font-size:.75rem;color:var(--tx2);margin-top:6px">
           Place <code>.img</code> / <code>.adf</code> / <code>.hfe</code> and other floppy images in this SD folder.
-          GoTek hardware reads images via <b>raw LBA access</b> — slot&nbsp;N starts at LBA&nbsp;N&nbsp;×&nbsp;GK_SLOT_STRIDE (default&nbsp;3072).
           Slot order is alphabetical or set via drag-and-drop in the GoTek tab.
+        </div>
+        <div class="cfg-row" style="margin-top:10px">
+          <label class="cfg-lbl">GoTek USB mode</label>
+          <select class="cfg-inp" id="cfgGotekUsbMode">
+            <option value="0">Raw LBA — slot N at LBA N×stride (stock GoTek firmware)</option>
+            <option value="1">FAT32 virtual — DSKA0000.IMG… navigable by FlashFloppy (nav-mode=indexed)</option>
+          </select>
+        </div>
+        <div id="cfgGotekUsbModeNote" style="font-size:.75rem;color:var(--tx2);margin-top:6px"></div>
+        <div id="cfgGotekFatWPRow" class="cfg-row" style="margin-top:10px;display:none">
+          <label class="cfg-lbl">FAT32 write-protect</label>
+          <select class="cfg-inp" id="cfgGotekFatWP">
+            <option value="1">Enabled — Windows cannot format or delete (recommended)</option>
+            <option value="0">Disabled — fully writable (use only if GoTek firmware requires it)</option>
+          </select>
         </div>
       </div>
       <div id="cfgDeviceModeNote0" style="margin-top:8px;font-size:.75rem;background:rgba(56,139,253,.1);border:1px solid rgba(56,139,253,.3);border-radius:4px;padding:8px 12px">
@@ -658,6 +672,8 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <div class="sbar" style="margin-bottom:6px">
         <span id="gkModeBadge" class="badge off">CD-ROM mode</span>
         <span id="gkReadyBadge" class="badge on" style="display:none">FS ready</span>
+        <span id="gkUsbModeBadge" class="badge" style="display:none;background:rgba(139,92,246,.18);color:#a78bfa;border:1px solid rgba(139,92,246,.4)">Raw LBA</span>
+        <span id="gkFatWPBadge" class="badge" style="display:none;background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.3)" title="FAT32 volume is write-protected — Windows cannot format or delete">WP</span>
         <span id="gkUsbBadge" class="badge def" style="display:none;cursor:pointer" onclick="gkShowUsbDebug()" title="Click for USB diagnostic">USB info</span>
 
       </div>
@@ -1112,6 +1128,13 @@ function gkInit(){
       rbadge.textContent=s.gotek_ready?'FS ready':'FS building';
       rbadge.className='badge '+(s.gotek_ready?'on':'off');
     }
+    var umbadge=$('gkUsbModeBadge');
+    if(umbadge){
+      umbadge.style.display=gkIsGotek?'inline':'none';
+      umbadge.textContent=s.gotek_usb_mode===1?'FAT32 virtual':'Raw LBA';
+    }
+    var wpbadge=$('gkFatWPBadge');
+    if(wpbadge) wpbadge.style.display=(gkIsGotek&&s.gotek_usb_mode===1&&s.gotek_fat_wp===1)?'inline':'none';
     var dirEl=$('gkDir'); if(dirEl) dirEl.textContent=s.gotek_dir||'/gotek';
     if(gkIsGotek){
       gkLoadList(); gkShowUsbBadge(true);
@@ -1280,6 +1303,23 @@ function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=show
 
 function gkShowCreate(){var r=$('gkCreateRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
 function gkShowUpload(){var r=$('gkUploadRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
+
+function gkUsbModeNote(v){
+  var el=$('cfgGotekUsbModeNote'); if(!el) return;
+  var wpRow=$('cfgGotekFatWPRow');
+  if(v===1){
+    el.innerHTML='<b>FAT32 virtual mode:</b> ESP32 presents a FAT32 volume with virtual filenames <code>DSKA0000.IMG</code>, <code>DSKA0001.IMG</code>... mapped to your actual image files. Use with FlashFloppy (<code>nav-mode&nbsp;=&nbsp;indexed</code> in FF.CFG) or native navigation. Files on SD are never renamed.';
+    if(wpRow) wpRow.style.display='flex';
+  } else {
+    el.innerHTML='<b>Raw LBA mode:</b> Slot N is served at LBA N&nbsp;×&nbsp;GK_SLOT_STRIDE (default&nbsp;3072). For stock GoTek firmware that uses fixed USB partitions. Not compatible with FlashFloppy.';
+    if(wpRow) wpRow.style.display='none';
+  }
+}
+(function(){
+  document.addEventListener('change', function(e){
+    if(e.target && e.target.id==='cfgGotekUsbMode') gkUsbModeNote(parseInt(e.target.value));
+  });
+})();
 
 var gkSortKey='slot', gkSortAsc=true;
 var gkOrderChanged=false;
@@ -2089,6 +2129,9 @@ function cfgLoad(){
     // Device mode
     var dmEl=$('cfgDeviceMode'); if(dmEl){dmEl.value=c.deviceMode||0; deviceModeChanged();}
     var gdEl=$('cfgGotekDir'); if(gdEl) gdEl.value=c.gotekDir||'/gotek';
+  var umEl=$('cfgGotekUsbMode'); if(umEl){ umEl.value=String(c.gotekUsbMode||0); gkUsbModeNote(parseInt(umEl.value)); }
+  var wpEl=$('cfgGotekFatWP'); if(wpEl) wpEl.value=String(c.gotekFatWP!=null?c.gotekFatWP:1);
+  var wpRow=$('cfgGotekFatWPRow'); if(wpRow) wpRow.style.display=(c.gotekUsbMode===1)?'flex':'none';
     eapRestoreSaved();
     if(c.dhcp){$('rDhcp').checked=true;}else{$('rStatic').checked=true;}
     cfgDhcpToggle();
@@ -2130,6 +2173,8 @@ function cfgSave(){
   if($('cfgWebPass').value.trim()) params.set('webPass',$('cfgWebPass').value.trim());
   var dm=$('cfgDeviceMode'); if(dm) params.set('deviceMode',dm.value);
   var gd=$('cfgGotekDir'); if(gd&&gd.value.trim()) params.set('gotekDir',gd.value.trim());
+  var um=$('cfgGotekUsbMode'); if(um) params.set('gotekUsbMode',um.value);
+  var wp=$('cfgGotekFatWP'); if(wp) params.set('gotekFatWP',wp.value);
   if(!dhcp){
     params.set('ip',$('cfgIp').value.trim());
     params.set('mask',$('cfgMask').value.trim());
@@ -2289,6 +2334,8 @@ function loadSysinfo(){
           gkt.innerHTML='';
           siRow(gkt,'Status',s.gotek_ready?'<span style="color:var(--ok)">&#10003; Ready</span>':'<span style="color:var(--warn)">Building&hellip;</span>');
           siRow(gkt,'Image folder',s.gotek_dir||'/gotek');
+          siRow(gkt,'USB mode', s.gotek_usb_mode===1 ? 'FAT32 virtual (FlashFloppy)' : 'Raw LBA (stock GoTek)');
+          if(s.gotek_usb_mode===1) siRow(gkt,'FAT32 write-protect', s.gotek_fat_wp===1 ? 'ON — Windows cannot format' : 'OFF — writable');
           siRow(gkt,'Slots loaded',String(s.gotek_files||0));
           if(s.gotek_cur_slot>=0) siRow(gkt,'Active slot','<span style="color:var(--ok)">'+String(s.gotek_cur_slot).padStart(3,'0')+'</span>');
           siRow(gkt,'Virtual disk','1000 slots × 1.44 MB, 512 B sectors, raw (no FAT)');

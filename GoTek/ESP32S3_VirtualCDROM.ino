@@ -218,6 +218,15 @@ struct Config {
   // 1 = GoTek floppy emulator (presents as USB MSC flash drive, GoTek reads .img files)
   // Changing this requires reboot to take effect (USB descriptor set at init time).
   uint8_t  deviceMode;
+  // GoTek USB presentation mode:
+  // 0 = Raw LBA — slot N at LBA N × GK_SLOT_STRIDE (for stock GoTek firmware)
+  // 1 = FAT virtual — virtual FAT16 volume with DSKA0000.IMG... mapped to real files
+  //                   (for FlashFloppy: use nav-mode=indexed in FF.CFG)
+  uint8_t  gotekUsbMode;
+  // Write-protect the FAT32 virtual volume (prevents Windows format/delete).
+  // Default ON — GoTek hardware ignores write-protect for image writes.
+  // Disable only if your GoTek firmware requires write access to the container.
+  uint8_t  gotekFatWP;    // 1 = write-protected (default), 0 = writable
 };
 Config cfg;
 
@@ -262,7 +271,9 @@ void loadConfig() {
   cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
   strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
   strlcpy(cfg.httpsKeyPath,  prefs.getString("httpsKey",  "").c_str(), sizeof(cfg.httpsKeyPath));
-  cfg.deviceMode  = (uint8_t)constrain((int)prefs.getUChar("deviceMode", 0), 0, 1);
+  cfg.deviceMode    = (uint8_t)constrain((int)prefs.getUChar("deviceMode", 0), 0, 1);
+  cfg.gotekUsbMode  = (uint8_t)constrain((int)prefs.getUChar("gotekUsbMode", 0), 0, 1);
+  cfg.gotekFatWP    = (uint8_t)constrain((int)prefs.getUChar("gotekFatWP",   1), 0, 1);
   gotekImgDir     = prefs.getString("gotekDir", "/gotek");
   prefs.end();
 }
@@ -305,7 +316,9 @@ void saveConfig() {
   prefs.putUChar("wifiTxPow", cfg.wifiTxPower);
   prefs.putBool("debugMode",   cfg.debugMode);
   prefs.putUShort("win98StopMs", cfg.win98StopMs);
-  prefs.putUChar("deviceMode", cfg.deviceMode);
+  prefs.putUChar("deviceMode",   cfg.deviceMode);
+  prefs.putUChar("gotekUsbMode", cfg.gotekUsbMode);
+  prefs.putUChar("gotekFatWP",   cfg.gotekFatWP);
   prefs.putString("gotekDir", gotekImgDir);
   prefs.putBool("httpsEnabled", cfg.httpsEnabled);
   prefs.putString("httpsCert", cfg.httpsCertPath);
@@ -1422,6 +1435,9 @@ static int              gkFC       = 0;
 static bool             gkRdy      = false;
 static volatile int     gkCurSlot  = -1;
 static volatile int     gkSelectedSlot = -1;
+// Runtime USB mode — follows cfg.gotekUsbMode but forced to 0 (raw) in single-slot mode.
+// Kept separate so single-slot mode doesn't permanently corrupt cfg.gotekUsbMode.
+static uint8_t          gkRuntimeUsbMode = 0;
 static volatile uint32_t gkLastLba = 0;
 static uint32_t          gkReadCnt[GK_MAX_FILES]  = {};
 static uint32_t          gkWriteCnt[GK_MAX_FILES] = {};
@@ -1514,10 +1530,343 @@ static void gkOpenHandles() {
 static void gkCloseHandles() {
   gkCacheInit();  // closes all cached handles and resets LRU
 }
+// == GoTek PSRAM sector cache ================================================
+// One sliding window per slot — GoTek reads sequentially, so a single
+// read-ahead window per slot achieves near-100% hit rate.
+// Window size: GK_CACHE_WIN_SEC sectors × 512 B.
+// Total PSRAM used: GK_CACHE_WIN_SEC × 512 bytes (default 256 = 128 KB).
+// Falls back gracefully when PSRAM is not available.
+
+#define GK_CACHE_WIN_SEC  256u          // sectors per window (256 × 512 = 128 KB)
+#define GK_CACHE_WIN_BYTES (GK_CACHE_WIN_SEC * GK_SECTOR_SIZE)
+
+static uint8_t*  gkCacheBuf  = nullptr; // PSRAM window buffer
+static int       gkCacheSlot = -1;      // which slot is cached (-1 = invalid)
+static uint32_t  gkCacheBase = 0xFFFFFFFFu; // first sector in window
+static uint32_t  gkCacheCnt  = 0;           // valid sectors in window
+
+static void gkCacheAlloc() {
+  gkCacheBuf = (uint8_t*)heap_caps_malloc(GK_CACHE_WIN_BYTES,
+                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (gkCacheBuf) {
+    dualPrint.printf("[GK CACHE] %u KB read-ahead in PSRAM (%u sectors/window)\n",
+      GK_CACHE_WIN_BYTES / 1024u, GK_CACHE_WIN_SEC);
+  } else {
+    dualPrint.println(F("[GK CACHE] PSRAM not available — no sector cache"));
+  }
+}
+
+static void gkCacheInvalidate() {
+  gkCacheSlot = -1;
+  gkCacheBase = 0xFFFFFFFFu;
+  gkCacheCnt  = 0;
+}
+
+// Fill cache window for file fi starting at sector sectorInFile.
+// Must be called with sdMutex held.
+static void gkCacheFill(int fi, uint32_t sectorInFile) {
+  if (!gkCacheBuf || fi < 0 || fi >= gkFC) return;
+  uint32_t avail = gkF[fi].sectors > sectorInFile
+                   ? gkF[fi].sectors - sectorInFile : 0;
+  if (!avail) return;
+  if (avail > GK_CACHE_WIN_SEC) avail = GK_CACHE_WIN_SEC;
+  File* fh = gkCacheGet(fi);
+  if (!fh) return;
+  uint64_t pos = (uint64_t)sectorInFile * GK_SECTOR_SIZE;
+  if ((uint64_t)fh->position() != pos) fh->seek(pos);
+  int32_t got = (int32_t)fh->read(gkCacheBuf, avail * GK_SECTOR_SIZE);
+  gkCacheSlot = fi;
+  gkCacheBase = sectorInFile;
+  gkCacheCnt  = (got > 0) ? (uint32_t)got / GK_SECTOR_SIZE : 0;
+  if (cfg.debugMode)
+    dualPrint.printf("[GK CACHE] fill fi=%d sec=%u+%u\n", fi, sectorInFile, gkCacheCnt);
+}
+
+// Try to serve one sector from cache. Returns true on hit.
+static bool gkCacheRead(int fi, uint32_t sectorInFile, uint8_t* buf) {
+  if (!gkCacheBuf || gkCacheSlot != fi || gkCacheBase == 0xFFFFFFFFu) return false;
+  if (sectorInFile < gkCacheBase || sectorInFile >= gkCacheBase + gkCacheCnt) return false;
+  memcpy(buf, gkCacheBuf + (sectorInFile - gkCacheBase) * GK_SECTOR_SIZE, GK_SECTOR_SIZE);
+  return true;
+}
+
+// == Virtual FAT32 filesystem (GoTek FAT USB mode) ===========================
+// FlashFloppy requires FAT32 on the USB source device (ExFAT/FAT16 not supported).
+// Root directory contains DSKA0000.IMG, DSKA0001.IMG... mapped to actual image
+// files in slot order. No files renamed on SD card.
+// Use this mode with FlashFloppy in indexed navigation (nav-mode = indexed in FF.CFG)
+// or native navigation mode. Raw LBA mode is for stock GoTek firmware.
+
+#define GK_FAT_SPC     8u          // sectors per cluster (4 KB)
+#define GK_FAT_NFATS   2u
+#define GK_FAT_RESV    32u         // reserved sectors (FAT32 standard)
+#define GK_FAT_ROOTCLU 2u          // root directory cluster (FAT32: in data area)
+
+// Free space added to FAT32 volume when WP=OFF so Windows can delete files
+// (needs space for $RECYCLE.BIN etc.). Writes to these clusters are silently ignored.
+#define GK_FAT_FREE_CLUS  1280u   // 1280 × 8 × 512 = 5 MB free space
+
+static struct {
+  bool     valid;
+  uint32_t fatSz;
+  uint32_t fat1Start;
+  uint32_t fat2Start;
+  uint32_t dataStart;
+  uint32_t totalSectors;
+  uint32_t totalClusters;   // file clusters (3..3+totalClusters-1)
+  uint32_t freeClusters;    // free clusters appended after file clusters (WP=OFF only)
+  uint32_t firstFreeCluster;// cluster number of first free cluster
+  uint32_t startCluster[GK_MAX_FILES];
+  uint32_t clusterCount[GK_MAX_FILES];
+} gkFat;
+
+// Shadow root directory for FAT32 writable mode (WP=OFF).
+// Mirrors the virtual root dir in RAM so Windows can delete/modify entries
+// without touching real SD files. Allocated lazily, reset on gkBuildFS().
+// Root dir = 1 cluster = GK_FAT_SPC sectors = 4096 bytes = 128 dir entries.
+static uint8_t* gkShadowRoot    = nullptr;
+static bool     gkShadowRootOk  = false;
+
+// Populate shadow root dir from current gkF[] slot table
+static void gkShadowRootInit() {
+  if (!gkShadowRoot)
+    gkShadowRoot = (uint8_t*)malloc(GK_FAT_SPC * GK_SECTOR_SIZE);
+  if (!gkShadowRoot) { gkShadowRootOk = false; return; }
+  memset(gkShadowRoot, 0, GK_FAT_SPC * GK_SECTOR_SIZE);
+  for (int fi = 0; fi < gkFC && fi < 128; fi++) {
+    uint8_t* de = gkShadowRoot + fi * 32;
+    char stem[9]; snprintf(stem, sizeof(stem), "DSKA%04u", (unsigned)gkF[fi].slotNum);
+    memcpy(de, stem, 8); memcpy(de+8, "IMG", 3);
+    de[11] = 0x20;
+    *(uint16_t*)&de[20] = (uint16_t)((gkFat.startCluster[fi] >> 16) & 0xFFFF);
+    *(uint16_t*)&de[22] = 0;
+    *(uint16_t*)&de[24] = (uint16_t)(((2024-1980)<<9)|(1<<5)|1);
+    *(uint16_t*)&de[26] = (uint16_t)(gkFat.startCluster[fi] & 0xFFFF);
+    *(uint32_t*)&de[28] = gkF[fi].sz;
+  }
+  gkShadowRootOk = true;
+  dualPrint.printf("[GOTEK FAT] Shadow root init: %d entries\n", gkFC);
+}
+
+static void gkFatBuild() {
+  memset(&gkFat, 0, sizeof(gkFat));
+  if (!gkFC) return;
+
+  // Cluster 2 = root directory (1 cluster = 8 sectors = 4 KB = 128 dir entries)
+  // File clusters start at 3
+  uint32_t nextCluster = 3;
+  for (int i = 0; i < gkFC; i++) {
+    uint32_t cc = (gkF[i].sectors + GK_FAT_SPC - 1) / GK_FAT_SPC;
+    if (!cc) cc = 1;
+    gkFat.startCluster[i] = nextCluster;
+    gkFat.clusterCount[i] = cc;
+    nextCluster += cc;
+  }
+  // +1 for root dir cluster (cluster 2), rest are file clusters
+  gkFat.totalClusters = nextCluster - 2;
+
+  // FAT32: 4 bytes per entry
+  // Add free clusters when WP=OFF so Windows can use the volume (Recycle Bin, etc.)
+  // Writes to free clusters are silently ignored — no real files are created.
+  gkFat.freeClusters    = (cfg.gotekUsbMode == 1 && cfg.gotekFatWP == 0) ? GK_FAT_FREE_CLUS : 0;
+  gkFat.firstFreeCluster = nextCluster;  // free clusters start right after file clusters
+
+  gkFat.fatSz      = ((nextCluster + gkFat.freeClusters) * 4u + 511u) / 512u;
+  gkFat.fat1Start  = GK_FAT_RESV;
+  gkFat.fat2Start  = GK_FAT_RESV + gkFat.fatSz;
+  gkFat.dataStart  = GK_FAT_RESV + 2 * gkFat.fatSz;
+  gkFat.totalSectors = gkFat.dataStart +
+    (gkFat.totalClusters + 1 + gkFat.freeClusters) * GK_FAT_SPC; // +1 for root cluster
+  gkFat.valid = true;
+
+  dualPrint.printf("[GOTEK FAT32] fatSz=%u data=%u total=%u clusters=%u\n",
+    gkFat.fatSz, gkFat.dataStart, gkFat.totalSectors, gkFat.totalClusters);
+  for (int i = 0; i < gkFC; i++)
+    dualPrint.printf("[GOTEK FAT32] DSKA%04u.IMG -> %s  clu=%u cc=%u\n",
+      gkF[i].slotNum, strrchr(gkF[i].path,'/')+1,
+      gkFat.startCluster[i], gkFat.clusterCount[i]);
+  // Initialize shadow root dir (used when WP=OFF to allow Windows delete operations)
+  gkShadowRootOk = false;
+  if (cfg.gotekUsbMode == 1 && cfg.gotekFatWP == 0)
+    gkShadowRootInit();
+}
+
+static void gkFatReadSector(uint32_t lba, uint8_t* buf) {
+  memset(buf, 0, 512);
+  if (!gkFat.valid) return;
+
+  // LBA 0: FAT32 Boot Sector
+  if (lba == 0) {
+    buf[0]=0xEB; buf[1]=0x58; buf[2]=0x90;
+    memcpy(&buf[3], "ESP32GK ", 8);
+    *(uint16_t*)&buf[11] = 512;              // BytesPerSector
+    buf[13]              = (uint8_t)GK_FAT_SPC; // SectorsPerCluster
+    *(uint16_t*)&buf[14] = (uint16_t)GK_FAT_RESV; // ReservedSectors
+    buf[16]              = (uint8_t)GK_FAT_NFATS;  // NumFATs
+    *(uint16_t*)&buf[17] = 0;               // RootEntCnt = 0 (FAT32)
+    *(uint16_t*)&buf[19] = 0;               // TotSec16 = 0 (FAT32)
+    buf[21]              = 0xF8;             // MediaType
+    *(uint16_t*)&buf[22] = 0;               // FATSz16 = 0 (FAT32)
+    *(uint16_t*)&buf[24] = 63;              // SectorsPerTrack
+    *(uint16_t*)&buf[26] = 255;             // NumHeads
+    *(uint32_t*)&buf[28] = 0;               // HiddenSectors
+    *(uint32_t*)&buf[32] = gkFat.totalSectors; // TotSec32
+    // FAT32 extended BPB (offset 36+)
+    *(uint32_t*)&buf[36] = gkFat.fatSz;    // FATSz32
+    *(uint16_t*)&buf[40] = 0;               // ExtFlags
+    *(uint16_t*)&buf[42] = 0;               // FSVer = 0
+    *(uint32_t*)&buf[44] = GK_FAT_ROOTCLU; // RootClus = 2
+    *(uint16_t*)&buf[48] = 1;               // FSInfo at sector 1
+    *(uint16_t*)&buf[50] = 6;               // BkBootSec at sector 6
+    // bytes 52-63: reserved (zeros)
+    buf[64] = 0x80;                          // DrvNum
+    buf[66] = 0x29;                          // BootSig
+    *(uint32_t*)&buf[67] = 0xE5321ABC;      // VolID
+    memcpy(&buf[71], "GOTEK IMGS ", 11);    // VolLab (11 bytes)
+    memcpy(&buf[82], "FAT32   ", 8);        // FilSysType
+    buf[510]=0x55; buf[511]=0xAA;
+    return;
+  }
+
+  // LBA 1: FSInfo sector
+  if (lba == 1) {
+    *(uint32_t*)&buf[0]   = 0x41615252;
+    *(uint32_t*)&buf[484] = 0x61417272;
+    *(uint32_t*)&buf[488] = gkFat.freeClusters;            // FreeCount
+    *(uint32_t*)&buf[492] = gkFat.freeClusters > 0         // NextFree
+                            ? gkFat.firstFreeCluster : 0xFFFFFFFF;
+    buf[508]=0x00; buf[509]=0x00; buf[510]=0x55; buf[511]=0xAA;
+    return;
+  }
+
+  // FAT1 / FAT2 (4 bytes per entry, 128 entries per sector)
+  if (lba >= gkFat.fat1Start && lba < gkFat.dataStart) {
+    bool isFat2 = (lba >= gkFat.fat2Start);
+    uint32_t base = (lba - (isFat2 ? gkFat.fat2Start : gkFat.fat1Start)) * 128;
+    uint32_t* fat = (uint32_t*)buf;
+    for (int e = 0; e < 128; e++) {
+      uint32_t cl = base + (uint32_t)e;
+      uint32_t val = 0x00000000;
+      if      (cl == 0) val = 0x0FFFFFF8;
+      else if (cl == 1) val = 0x0FFFFFFF;
+      else if (cl == GK_FAT_ROOTCLU) val = 0x0FFFFFFF;
+      else if (cl >= gkFat.firstFreeCluster &&
+               cl <  gkFat.firstFreeCluster + gkFat.freeClusters) val = 0x00000000; // free
+      else {
+        for (int i = 0; i < gkFC; i++) {
+          uint32_t cs = gkFat.startCluster[i], ce = cs + gkFat.clusterCount[i];
+          if (cl >= cs && cl < ce) {
+            val = (cl+1 < ce) ? (cl+1) : 0x0FFFFFFF;
+            break;
+          }
+        }
+      }
+      fat[e] = val;
+    }
+    return;
+  }
+
+  // Data area (cluster 2 = root dir, cluster 3+ = file data)
+  if (lba >= gkFat.dataStart) {
+    uint32_t ds = lba - gkFat.dataStart;
+    uint32_t cl = (ds / GK_FAT_SPC) + 2;
+    uint32_t sc = ds % GK_FAT_SPC;
+
+    // Cluster 2 = root directory entries
+    if (cl == GK_FAT_ROOTCLU) {
+      if (cfg.gotekFatWP == 0 && gkShadowRootOk && gkShadowRoot) {
+        // Shadow mode (WP=OFF): serve from shadow root dir so Windows sees deletions
+        memcpy(buf, gkShadowRoot + sc * GK_SECTOR_SIZE, GK_SECTOR_SIZE);
+      } else {
+        // WP=ON or no shadow: virtual generation
+        uint32_t first = sc * 16;
+        for (int e = 0; e < 16; e++) {
+          uint32_t fi = first + (uint32_t)e;
+          if (fi >= (uint32_t)gkFC) break;
+          uint8_t* de = &buf[e * 32];
+          char stem[9]; snprintf(stem, sizeof(stem), "DSKA%04u", (unsigned)gkF[fi].slotNum);
+          memcpy(de, stem, 8); memcpy(de+8, "IMG", 3);
+          de[11] = 0x20;
+          *(uint16_t*)&de[20] = (uint16_t)((gkFat.startCluster[fi] >> 16) & 0xFFFF);
+          *(uint16_t*)&de[22] = 0;
+          *(uint16_t*)&de[24] = (uint16_t)(((2024-1980)<<9)|(1<<5)|1);
+          *(uint16_t*)&de[26] = (uint16_t)(gkFat.startCluster[fi] & 0xFFFF);
+          *(uint32_t*)&de[28] = gkF[fi].sz;
+        }
+      }
+      return;
+    }
+
+    // Free clusters (WP=OFF): return zeros, writes silently ignored
+    if (gkFat.freeClusters > 0 &&
+        cl >= gkFat.firstFreeCluster &&
+        cl <  gkFat.firstFreeCluster + gkFat.freeClusters) {
+      return;  // buf already zeroed
+    }
+
+    // File data clusters (cluster 3+)
+    for (int i = 0; i < gkFC; i++) {
+      uint32_t cs = gkFat.startCluster[i], ce = cs + gkFat.clusterCount[i];
+      if (cl < cs || cl >= ce) continue;
+      uint32_t sf = (cl - cs) * GK_FAT_SPC + sc;
+      if (sf >= gkF[i].sectors) return;
+      // Try PSRAM cache first
+      if (gkCacheRead(i, sf, buf)) return;
+      gkCacheFill(i, sf);
+      if (gkCacheRead(i, sf, buf)) return;
+      // Fallback: direct SD read
+      uint64_t fOff = (uint64_t)sf * GK_SECTOR_SIZE;
+      File* fh = gkCacheGet(i); if (!fh) return;
+      if ((uint64_t)fh->position() != fOff) fh->seek(fOff);
+      fh->read(buf, GK_SECTOR_SIZE);
+      return;
+    }
+  }
+}
+
+static void gkFatWriteSector(uint32_t lba, const uint8_t* data) {
+  if (!gkFat.valid || lba < gkFat.dataStart) return;
+  uint32_t ds = lba - gkFat.dataStart;
+  uint32_t cl = (ds / GK_FAT_SPC) + 2, sc = ds % GK_FAT_SPC;
+
+  // Root directory cluster: update shadow (WP=OFF only)
+  if (cl == GK_FAT_ROOTCLU) {
+    if (cfg.gotekFatWP == 0 && gkShadowRootOk && gkShadowRoot) {
+      memcpy(gkShadowRoot + sc * GK_SECTOR_SIZE, data, GK_SECTOR_SIZE);
+      // Log any deletions for debug
+      const uint8_t* s = data;
+      for (int e = 0; e < 16; e++) {
+        if (s[e*32] == 0xE5 && s[e*32+11] != 0x0F)
+          dualPrint.printf("[GOTEK FAT] Shadow: slot deleted (entry %d)\n", (int)(sc*16+e));
+      }
+    }
+    return;
+  }
+
+  // Data clusters: find which image file this maps to
+  for (int i = 0; i < gkFC; i++) {
+    uint32_t cs = gkFat.startCluster[i], ce = cs + gkFat.clusterCount[i];
+    if (cl < cs || cl >= ce) continue;
+    uint32_t sf = (cl - cs) * GK_FAT_SPC + sc;
+    if (sf >= gkF[i].sectors) return;
+    // Note: no zero-detection here — GoTek legitimately writes zero sectors
+    // (empty floppy sectors). Full Format with WP=OFF will corrupt image data
+    // (user must explicitly choose Full Format — Quick Format is safe).
+    if (gkCacheSlot == i) gkCacheInvalidate();
+    uint64_t fOff = (uint64_t)sf * GK_SECTOR_SIZE;
+    File wfh = SD_MMC.open(gkF[i].path, "r+"); if (!wfh) return;
+    wfh.seek(fOff); wfh.write(data, GK_SECTOR_SIZE); wfh.flush(); wfh.close();
+    return;
+  }
+}
+
+
 // ── Build slot table from SD card directory ───────────────────────────────────
 static void gkBuildFS() {
   gkFC = 0; gkRdy = false; gkCurSlot = -1;
   gkCloseHandles();
+  gkCacheInvalidate();
+  gkShadowRootOk = false;  // shadow will be rebuilt after gkFatBuild()
 
   if (!sdReady) {
     dualPrint.println(F("[GOTEK] SD not ready"));
@@ -1613,11 +1962,19 @@ static void gkBuildFS() {
   }
   gkRdy = true;
   dualPrint.printf("[GOTEK] %d slot(s) ready. Max LBA: %u\n", gkFC, gkFC * GK_SLOT_STRIDE);
+  // Build FAT virtual filesystem layout (used only when gotekUsbMode == 1)
+  gkFatBuild();
   // Open persistent per-slot file handles AFTER slot table is built
   gkOpenHandles();
 }
 
 // ── USB MSC init — called AFTER gkBuildFS so block count is known ────────────
+// Returns correct USB MSC block count for current GoTek USB mode
+static uint32_t gkBlockCount() {
+  if (gkRuntimeUsbMode == 1 && gkFat.valid) return gkFat.totalSectors;
+  return GK_MAX_SECTORS;
+}
+
 void initUSBGoTek() {
   // ── Unique USB serial number per device ────────────────────────────────────
   // Windows caches USB device driver by VID+PID+SerialNumber.
@@ -1635,8 +1992,11 @@ void initUSBGoTek() {
   msc.onRead(gotekReadCb);
   msc.onWrite(gotekWriteCb);
   msc.onStartStop(gotekStartStopCb);
-  msc.isWritable(true);
-  msc.begin(GK_MAX_SECTORS, GK_SECTOR_SIZE);
+  gkRuntimeUsbMode = cfg.gotekUsbMode;  // sync runtime from config
+  // Write-protect only in FAT32 virtual multi-slot mode with WP enabled.
+  // Single-slot (raw) mode is always writable regardless of gotekFatWP.
+  msc.isWritable(gkRuntimeUsbMode != 1 || cfg.gotekFatWP == 0);
+  msc.begin(gkBlockCount(), GK_SECTOR_SIZE);
   msc.mediaPresent(true);
   USB.begin();
   dualPrint.printf("[GOTEK] USB serial: %s  PID: 0x8020  block_size: %u\n", sn, GK_SECTOR_SIZE);
@@ -1683,7 +2043,17 @@ static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t
   (void)offset;
   uint8_t* dst = (uint8_t*)buffer;
   uint32_t sec = bufsize / GK_SECTOR_SIZE;
-  bool haveMtx = sdMutex && (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(50)) == pdTRUE);
+  bool haveMtx = sdMutex && (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) == pdTRUE);
+
+  // FAT virtual filesystem mode (use gkRuntimeUsbMode — may differ from cfg in single-slot)
+  if (gkRuntimeUsbMode == 1) {
+    for (uint32_t s = 0; s < sec; s++) {
+      gkFatReadSector(lba + s, dst + s * GK_SECTOR_SIZE);
+      gkLastLba = lba + s;
+    }
+    if (haveMtx) xSemaphoreGive(sdMutex);
+    return (int32_t)bufsize;
+  }
 
   for (uint32_t s = 0; s < sec; s++) {
     uint8_t* sb = dst + s * GK_SECTOR_SIZE;
@@ -1702,23 +2072,31 @@ static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t
     gkCurSlot = fi; gkLastLba = lba + s;
     if (fi < GK_MAX_FILES) gkReadCnt[fi]++;
 
-    // Per-slot handle via LRU cache (supports 999 slots with only 4 open FDs)
-    File* fhp = gkCacheGet(fi);
-    if (!fhp) {
-      memset(sb, 0, GK_SECTOR_SIZE);
-      gkLogPush(lba + s, fi, 'R', sb);
-      continue;
-    }
-    if ((uint64_t)fhp->position() != fOff) fhp->seek(fOff);
-    uint32_t toRead = min((uint32_t)GK_SECTOR_SIZE,
-                          (uint32_t)(gkF[fi].sz > fOff ? gkF[fi].sz - fOff : 0));
-    int32_t got = toRead ? fhp->read(sb, toRead) : 0;
-    if (got < (int32_t)GK_SECTOR_SIZE) memset(sb + got, 0, GK_SECTOR_SIZE - got);
-    gkLogPush(lba + s, fi, 'R', sb);
+    uint32_t secInFile = (uint32_t)(fOff / GK_SECTOR_SIZE);
 
-    // Always log critical sectors once per session (boot, FAT, root dir)
+    // Try PSRAM cache first
+    if (gkCacheRead(fi, secInFile, sb)) {
+      gkLogPush(lba + s, fi, 'R', sb);
+    } else {
+      // Cache miss — fill window then retry
+      gkCacheFill(fi, secInFile);
+      if (!gkCacheRead(fi, secInFile, sb)) {
+        // PSRAM unavailable — direct SD read fallback
+        File* fhp = gkCacheGet(fi);
+        if (!fhp) { memset(sb, 0, GK_SECTOR_SIZE); gkLogPush(lba + s, fi, 'R', sb); continue; }
+        if ((uint64_t)fhp->position() != fOff) fhp->seek(fOff);
+        uint32_t toRead = min((uint32_t)GK_SECTOR_SIZE,
+                              (uint32_t)(gkF[fi].sz > fOff ? gkF[fi].sz - fOff : 0));
+        int32_t got = toRead ? fhp->read(sb, toRead) : 0;
+        if (got < (int32_t)GK_SECTOR_SIZE) memset(sb + got, 0, GK_SECTOR_SIZE - got);
+      }
+      gkLogPush(lba + s, fi, 'R', sb);
+    }
+
+    // Log critical sectors once per session (boot sector, FAT, root dir)
+    // Runs regardless of cache hit/miss — sector data is in sb at this point
     static uint8_t _loggedSec[GK_MAX_FILES][3] = {};
-    uint32_t relSec = (lba + s) - gkF[fi].startLba;
+    uint32_t relSec = secInFile;  // sector within image file
     int sidx = (relSec==0)?0:(relSec==1)?1:(relSec==19)?2:-1;
     if (sidx >= 0 && fi < GK_MAX_FILES && !_loggedSec[fi][sidx]) {
       _loggedSec[fi][sidx] = 1;
@@ -1740,7 +2118,7 @@ static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t
       }
     }
     if (cfg.debugMode && relSec == 0)
-      dualPrint.printf("[GK R] Slot %d boot (LBA %u): %02X%02X%02X got=%d\n", fi, lba+s, sb[0],sb[1],sb[2], got);
+      dualPrint.printf("[GK R] Slot %d boot (LBA %u): %02X%02X%02X\n", fi, lba+s, sb[0],sb[1],sb[2]);
   }
   if (haveMtx) xSemaphoreGive(sdMutex);
   return (int32_t)bufsize;
@@ -1749,8 +2127,21 @@ static int32_t gotekReadCb(uint32_t lba, uint32_t offset, void* buffer, uint32_t
 static int32_t gotekWriteCb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize) {
   (void)offset;
   if (!gkRdy) return (int32_t)bufsize;
-  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE)
+  // Wait up to 2s for SD mutex — image editor operations can take ~500ms
+  // If timeout, report error (return -1) so host retries rather than silently dropping
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+    dualPrint.printf("[GK W] WARN: mutex timeout — write LBA %u dropped!\n", lba);
+    return -1;  // signal error to host so it retries
+  }
+
+  // FAT virtual filesystem mode — route writes to real files via FAT mapping
+  if (gkRuntimeUsbMode == 1) {
+    uint32_t sec = bufsize / GK_SECTOR_SIZE;
+    for (uint32_t s = 0; s < sec; s++)
+      gkFatWriteSector(lba + s, buffer + s * GK_SECTOR_SIZE);
+    xSemaphoreGive(sdMutex);
     return (int32_t)bufsize;
+  }
 
   uint32_t sec = bufsize / GK_SECTOR_SIZE;
   bool didWrite = false;
@@ -1771,6 +2162,8 @@ static int32_t gotekWriteCb(uint32_t lba, uint32_t offset, uint8_t* buffer, uint
         buffer[s*GK_SECTOR_SIZE], buffer[s*GK_SECTOR_SIZE+1],
         buffer[s*GK_SECTOR_SIZE+2], buffer[s*GK_SECTOR_SIZE+3]);
     if (fOff >= (uint64_t)gkF[fi].sz) continue;
+    // Invalidate PSRAM cache for this slot on write
+    if (gkCacheSlot == fi) gkCacheInvalidate();
     // Open write handle on demand, write, close immediately — avoids FD exhaustion
     File wfh = SD_MMC.open(gkF[fi].path, "r+");
     if (!wfh) {
@@ -1805,6 +2198,7 @@ static void gkRefresh() {
 
 // SD mutex helpers for GoTek web handlers (forward-declared here, defined after upload state)
 static inline bool gkMtxTake();
+static void gkInvalidateForPath(const String& imgPath);  // forward decl
 static inline void gkMtxGive();
 
 // ── Session globals ───────────────────────────────────────────────────────────
@@ -1814,6 +2208,7 @@ static uint8_t* g_fatBuf  = nullptr;   // heap-allocated in-RAM FAT copy
 static uint32_t g_fatBytes = 0;
 static bool     g_fatDirty = false;
 static bool     g_sOpen    = false;
+static String   g_sImgPath = "";       // path of currently open image (for cache invalidation)
 static uint8_t  g_secBuf[512];         // shared sector read/write buffer
 
 static bool imgParseBPB(File& f, ImgBPB& b) {
@@ -1856,6 +2251,7 @@ static bool imgOpenSession(const String& imgPath) {
   }
   g_sFile = SD_MMC.open(imgPath.c_str(), "r+");
   if (!g_sFile) return false;
+  g_sImgPath = imgPath;
   if (!imgParseBPB(g_sFile, g_sBPB)) { g_sFile.close(); return false; }
   g_fatBytes = (uint32_t)g_sBPB.fatsz * g_sBPB.bps;
   g_fatBuf = (uint8_t*)malloc(g_fatBytes);
@@ -1926,7 +2322,10 @@ static String imgScanDirAt(uint32_t lba, uint16_t count) {
       uint16_t idx=s*ePerSec+e; if(idx>=count) return j+"]";
       uint8_t* de=g_secBuf+e*32;
       if (de[0]==0x00) return j+"]";
-      if (de[0]==0xE5||de[11]==0x0F||(de[11]&0x08)||de[0]=='.') continue;
+      // Skip: deleted, LFN, volume-label, dot-entries, and UTF-16LE garbage
+      // (UTF-16LE stores null bytes in name positions 1-7; valid 8.3 names never have 0x00 there)
+      if (de[0]==0xE5 || de[11]==0x0F || (de[11]&0x08) || de[0]=='.') continue;
+      if (de[1]==0x00 || de[3]==0x00 || de[5]==0x00) continue;  // UTF-16LE guard
       bool isDir=(de[11]&0x10)!=0;
       char name[13]; imgEntry83Name(de,name);
       uint32_t sz=(uint32_t)de[28]|((uint32_t)de[29]<<8)|((uint32_t)de[30]<<16)|((uint32_t)de[31]<<24);
@@ -1971,6 +2370,7 @@ static uint16_t imgNavPath(const String& path) {
           uint16_t idx=s*ePerSec+e; if(idx>=scanCnt||g_secBuf[e*32]==0) goto nextClu;
           uint8_t*de=g_secBuf+e*32;
           if(de[0]==0xE5||de[11]==0x0F||(de[11]&0x08)||!(de[11]&0x10)) continue;
+          if(de[1]==0x00||de[3]==0x00||de[5]==0x00) continue; // UTF-16LE guard
           char nm[13]; imgEntry83Name(de,nm); String nmU=String(nm);nmU.toUpperCase();
           if(nmU==part){curClu=(uint16_t)de[26]|((uint16_t)de[27]<<8);found=true;break;}
         }
@@ -1999,6 +2399,7 @@ static int64_t imgFindEntry(uint16_t dirClu, const String& name83) {
         uint8_t*de=g_secBuf+e*32;
         if(de[0]==0x00) return -1;
         if(de[0]==0xE5||de[11]==0x0F||(de[11]&0x08)) continue;
+        if(de[1]==0x00||de[3]==0x00||de[5]==0x00) continue; // UTF-16LE guard
         char nm[13]; imgEntry83Name(de,nm); String nmU=String(nm);nmU.toUpperCase();
         if(nmU==target) return (int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;
       }
@@ -2110,6 +2511,7 @@ void handleImgMkdir() {
   g_sFile.seek((uint64_t)slot); g_sFile.write(dirEntry,32);
   imgCloseSession();
   gkMtxGive();
+  gkInvalidateForPath(imgPath);
   httpServer.send(200,"application/json","{\"ok\":true}");
 }
 
@@ -2156,6 +2558,7 @@ void handleImgRm() {
   if(fc>=2) imgFreeChainM(fc);
   imgCloseSession();
   gkMtxGive();
+  gkInvalidateForPath(imgPath);
   httpServer.send(200,"application/json","{\"ok\":true}");
 }
 
@@ -2211,6 +2614,7 @@ static uint32_t _iuSecOff= 0;
 static uint8_t  _iuSIC   = 0;
 static uint32_t _iuCluLBA= 0;
 static String   _iuFile  = "";
+static String   _iuImgPath = "";  // image path for cache invalidation on completion
 static bool     _iuOk    = false;
 static bool     _iuDone  = false;
 
@@ -2236,8 +2640,8 @@ void handleImgPut() {
     _iuOk=false;_iuDone=false;_iuFirst=0;_iuPrev=0;_iuWrit=0;_iuSecOff=0;_iuSIC=0;_iuCluLBA=0;
     String imgPath=httpServer.hasArg("img")?httpServer.arg("img"):"";
     _iuFile=httpServer.hasArg("file")?httpServer.arg("file"):"";
+    _iuImgPath=imgPath;
     if(!imgPath.length()||!_iuFile.length()) return;
-    if(!gkMtxTake()) return;
     if(!imgOpenSession(imgPath)){gkMtxGive();dualPrint.println(F("[IMG] Cannot open session"));return;}
     // ── Space pre-check: if Content-Length header present, reject early ────────
     if(httpServer.hasHeader("Content-Length")){
@@ -2287,6 +2691,7 @@ void handleImgPut() {
     imgCloseSession(); _iuOk=false; _iuDone=true;
     dualPrint.printf("[IMG] Upload done: %lu B\n",(unsigned long)_iuWrit);
     gkMtxGive();
+    gkInvalidateForPath(_iuImgPath);
   } else if (up.status==UPLOAD_FILE_ABORTED) {
     if(_iuOk&&_iuFirst) imgFreeChainM(_iuFirst);
     imgCloseSession(); _iuOk=false;
@@ -2305,10 +2710,39 @@ void handleImgPutDone() {
 static inline bool gkMtxTake() {
   if (!sdMutex) return true;
   if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) != pdTRUE) return false;
-  // Flush + close GoTek write handle so web handler can safely open same file
   return true;
 }
 static inline void gkMtxGive() { if (sdMutex) xSemaphoreGive(sdMutex); }
+
+// Invalidate PSRAM sector cache and LRU file handle for a specific image path.
+// Call after any image editor write (rm, mkdir, put) so GoTek/Windows sees fresh data.
+static void gkInvalidateForPath(const String& imgPath) {
+  if (!imgPath.length()) return;
+  for (int i = 0; i < gkFC; i++) {
+    if (imgPath.equalsIgnoreCase(String(gkF[i].path))) {
+      // Invalidate PSRAM sector cache
+      if (gkCacheSlot == i) gkCacheInvalidate();
+      // Evict LRU read handle so next USB read reopens a fresh handle
+      for (int c = 0; c < GK_CACHE_HANDLES; c++) {
+        if (gkRHCache[c].fi == i) {
+          if (gkRHCache[c].fh) gkRHCache[c].fh.close();
+          gkRHCache[c].fi = -1;
+          for (int r = 0; r < GK_CACHE_HANDLES; r++)
+            if (gkRHLRU[r] == c) { gkRHLRU[r] = GK_CACHE_HANDLES - 1; break; }
+        }
+      }
+      // If this image is currently single-slot mounted, signal UNIT ATTENTION
+      // so Windows re-reads FAT/directory automatically — no manual remount needed.
+      if ((int)gkF[i].slotNum == gkSelectedSlot && gkSelectedSlot >= 0) {
+        msc_set_unit_attention();
+        dualPrint.printf("[GK] UA → Windows will refresh disk view: %s\n", imgPath.c_str());
+      } else {
+        dualPrint.printf("[GK] Cache invalidated: %s\n", imgPath.c_str());
+      }
+      break;
+    }
+  }
+}
 
 // Create a blank FAT12 floppy image on SD card
 // GET /api/gotek/create?name=DSKA0000.img&type=144  (144=1.44MB, 720=720KB, 360=360KB)
@@ -3529,6 +3963,8 @@ void handleApiSysinfo() {
   j += ",\"win98_stop_ms\":" + String(cfg.win98StopMs);
   j += ",\"device_mode\":" + String(cfg.deviceMode);
   j += ",\"gotek_dir\":\"" + jsonEsc(gotekImgDir.c_str()) + "\"";
+  j += ",\"gotek_usb_mode\":" + String(cfg.gotekUsbMode);
+  j += ",\"gotek_fat_wp\":"  + String(cfg.gotekFatWP);
   j += ",\"gotek_files\":" + String(gkFC);
   j += ",\"gotek_ready\":" + String(gkRdy ? "true" : "false");
   j += ",\"gotek_cur_slot\":" + String(gkCurSlot);
@@ -3746,6 +4182,8 @@ void handleApiGetConfig() {
   j += ",\"dosDriver\":" + String(cfg.dosDriver);
   j += ",\"debugMode\":" + String(cfg.debugMode ? "true" : "false");
   j += ",\"win98StopMs\":" + String(cfg.win98StopMs);
+  j += ",\"gotekUsbMode\":" + String(cfg.gotekUsbMode);
+  j += ",\"gotekFatWP\":"  + String(cfg.gotekFatWP);
   j += ",\"deviceMode\":" + String(cfg.deviceMode);
   j += ",\"gotekDir\":\"" + jsonEsc(gotekImgDir.c_str()) + "\"";
   j += ",\"httpsEnabled\":" + String(cfg.httpsEnabled ? "true" : "false");
@@ -3819,6 +4257,27 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("deviceMode")) {
     String v=httpServer.arg("deviceMode");
     cfg.deviceMode=(uint8_t)constrain(v.toInt(),0,1); changed=true;
+  }
+  if (httpServer.hasArg("gotekUsbMode")) {
+    String v=httpServer.arg("gotekUsbMode");
+    cfg.gotekUsbMode=(uint8_t)constrain(v.toInt(),0,1); changed=true;
+  }
+  if (httpServer.hasArg("gotekFatWP")) {
+    String v=httpServer.arg("gotekFatWP");
+    uint8_t newWP=(uint8_t)constrain(v.toInt(),0,1);
+    if (newWP != cfg.gotekFatWP) {
+      cfg.gotekFatWP=newWP; changed=true;
+      // Re-enumerate USB immediately so Windows sees new write-protect state
+      if (cfg.deviceMode==1 && cfg.gotekUsbMode==1) {
+        tud_disconnect(); delay(400);
+        msc.isWritable(cfg.gotekFatWP==0);
+        msc.begin(gkBlockCount(), GK_SECTOR_SIZE);
+        msc.mediaPresent(true);
+        tud_connect();
+        dualPrint.printf("[GOTEK] FAT32 WP changed to %s — USB re-enumerated\n",
+          cfg.gotekFatWP ? "ON" : "OFF");
+      }
+    }
   }
   if (httpServer.hasArg("gotekDir")) {
     String v=httpServer.arg("gotekDir"); v.trim();
@@ -4750,8 +5209,13 @@ void setupWebServer() {
     if (!checkAuth()) return;
     int slot = httpServer.hasArg("slot") ? httpServer.arg("slot").toInt() : -1;
     gkSelectedSlot = slot;  // stores slotNum (-1 = raw multi-slot)
-    // Find array entry by slotNum to get sector count
-    uint32_t newCount = GK_MAX_SECTORS;
+    gkCacheInvalidate();    // flush PSRAM cache — new slot has different data
+
+    // Single-slot mode always uses raw LBA presentation regardless of gotekUsbMode.
+    // Use gkRuntimeUsbMode so cfg.gotekUsbMode is never corrupted.
+    gkRuntimeUsbMode = (slot >= 0) ? 0 : cfg.gotekUsbMode;
+
+    uint32_t newCount = gkBlockCount();
     if (slot >= 0) {
       for (int i = 0; i < gkFC; i++) {
         if ((int)gkF[i].slotNum == slot) { newCount = gkF[i].sectors; break; }
@@ -4762,11 +5226,14 @@ void setupWebServer() {
     msc.onRead(gotekReadCb);
     msc.onWrite(gotekWriteCb);
     msc.onStartStop(gotekStartStopCb);
-    msc.isWritable(true);
+    msc.isWritable(gkRuntimeUsbMode != 1 || cfg.gotekFatWP == 0);
     msc.begin(newCount, GK_SECTOR_SIZE);
     msc.mediaPresent(true);
     tud_connect();
-    dualPrint.printf("[GOTEK] Selected slot: %d  sectors: %u  (re-enumerated)\n", slot, newCount);
+    dualPrint.printf("[GOTEK] Selected slot: %d  sectors: %u  usbMode: %s  writable: %s  (re-enumerated)\n",
+      slot, newCount,
+      gkRuntimeUsbMode ? "FAT32" : "Raw",
+      (gkRuntimeUsbMode != 1 || cfg.gotekFatWP == 0) ? "yes" : "no (WP)");
     httpServer.send(200,"application/json",
       "{\"ok\":true,\"slot\":"+String(slot)+",\"sectors\":"+String(newCount)+"}");
   });
@@ -4787,9 +5254,10 @@ void setupWebServer() {
     f.print(body); f.close();
     dualPrint.printf("[GOTEK] order.json saved (%d bytes)\n", body.length());
     gkBuildFS(); gkMtxGive();
+    gkRuntimeUsbMode = cfg.gotekUsbMode;  // re-sync (multi-slot, no single-slot override)
     tud_disconnect(); delay(600);
     msc.onRead(gotekReadCb); msc.onWrite(gotekWriteCb); msc.onStartStop(gotekStartStopCb);
-    msc.isWritable(true); msc.begin(GK_MAX_SECTORS, GK_SECTOR_SIZE); msc.mediaPresent(true);
+    msc.isWritable(gkRuntimeUsbMode != 1 || cfg.gotekFatWP == 0); msc.begin(gkBlockCount(), GK_SECTOR_SIZE); msc.mediaPresent(true);
     tud_connect();
     httpServer.send(200,"application/json","{\"ok\":true}");
   });
@@ -4902,6 +5370,30 @@ void printConfig(bool showRuntime = true) {
   }
   dualPrint.printf("  Default image : %s\n",  defaultMount.length() ? defaultMount.c_str() : "(none)");
   dualPrint.printf("  Device mode   : %s\n",  cfg.deviceMode == 1 ? "GoTek floppy emulator" : "CD-ROM (default)");
+  if (cfg.deviceMode == 1) {
+    dualPrint.println(F("\n  ┌─ GoTek Floppy Emulator ────────────────────────┐"));
+    dualPrint.printf("  GoTek USB mode: %s\n",
+      cfg.gotekUsbMode == 1
+        ? "FAT32 virtual (FlashFloppy indexed/native)"
+        : "Raw LBA      (stock GoTek firmware)");
+    if (cfg.gotekUsbMode == 1)
+      dualPrint.printf("  FAT32 WP      : %s\n",
+        cfg.gotekFatWP ? "ON  (Windows cannot format/write container)" : "OFF (writable)");
+    dualPrint.printf("  GoTek img dir : %s\n", gotekImgDir.c_str());
+    dualPrint.printf("  Slots loaded  : %d  (ready: %s)\n", gkFC, gkRdy ? "yes" : "no");
+    for (int i = 0; i < gkFC; i++) {
+      const char* fn = strrchr(gkF[i].path, '/');
+      fn = fn ? fn+1 : gkF[i].path;
+      dualPrint.printf("  Slot %03u       : %-24s  %lu KB  LBA %lu\n",
+        gkF[i].slotNum, fn, (unsigned long)(gkF[i].sz/1024), (unsigned long)gkF[i].startLba);
+    }
+    dualPrint.printf("  Selected slot : %d  (%s)\n",
+      gkSelectedSlot, gkSelectedSlot < 0 ? "RAW multi-slot" : "single-slot mode");
+    dualPrint.printf("  Current slot  : %d  (last GoTek access)\n", gkCurSlot);
+    dualPrint.printf("  USB block cnt : %u  (%.2f MB)\n",
+      gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  }
   // DOS compat + driver (driver jen kdyz compat=ON)
   dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "ON  (UNIT ATTENTION, no USB re-enum)" : "OFF");
   if (cfg.dosCompat) {
@@ -4973,24 +5465,23 @@ void printStatus() {
   printSep();
   dualPrint.println(F("  STATUS"));
   printSep();
-  // WiFi
+
+  // ── WiFi ─────────────────────────────────────────────────────────────────
+  dualPrint.println(F("  ┌─ WiFi ─────────────────────────────────────────┐"));
   if (wifiConnected) {
     int rssi = WiFi.RSSI();
     const char* quality = rssi > -50 ? "Excellent" : rssi > -65 ? "Good" : rssi > -75 ? "Fair" : "Weak";
-    dualPrint.printf("  WiFi          : Connected  (%s, %d dBm)\n", quality, rssi);
+    dualPrint.printf("  Status        : Connected  (%s, %d dBm)\n", quality, rssi);
     dualPrint.printf("  TX power      : %d dBm\n", cfg.wifiTxPower / 4);
+    dualPrint.printf("  SSID          : %s\n", WiFi.SSID().c_str());
+    dualPrint.printf("  BSSID         : %s\n", WiFi.BSSIDstr().c_str());
+    dualPrint.printf("  Band/Channel  : %s / Ch %d\n", WiFi.channel()<=13?"2.4 GHz":"5 GHz", WiFi.channel());
     dualPrint.printf("  IP            : %s\n", WiFi.localIP().toString().c_str());
     dualPrint.printf("  Mask          : %s\n", WiFi.subnetMask().toString().c_str());
     dualPrint.printf("  Gateway       : %s\n", WiFi.gatewayIP().toString().c_str());
     dualPrint.printf("  DNS           : %s\n", WiFi.dnsIP().toString().c_str());
-    dualPrint.printf("  SSID          : %s\n", WiFi.SSID().c_str());
-    dualPrint.printf("  Band/Channel  : %s / Ch %d\n", WiFi.channel()<=13?"2.4 GHz":"5 GHz", WiFi.channel());
-    dualPrint.printf("  BSSID         : %s\n", WiFi.BSSIDstr().c_str());
-    // Security
-    dualPrint.println(F(""));
-  dualPrint.println(F("  ┌─ Security ─────────────────────────────────────┐"));
     const char* authStr = cfg.eapMode==1?"WPA2-Enterprise (PEAP)":cfg.eapMode==2?"WPA2-Enterprise (EAP-TLS)":"WPA2-Personal";
-    dualPrint.printf("  Auth method   : %s\n", authStr);
+    dualPrint.printf("  Auth          : %s\n", authStr);
     if (cfg.eapMode) {
       dualPrint.printf("  EAP Identity  : %s\n", strlen(cfg.eapIdentity) ? cfg.eapIdentity : "(auto from cert CN)");
       if (cfg.eapMode == 2) {
@@ -4998,7 +5489,6 @@ void printStatus() {
         dualPrint.printf("  Client key    : %s\n", strlen(cfg.eapKeyPath)  ? cfg.eapKeyPath  : "(not set)");
         dualPrint.printf("  Key passphrase: %s\n", strlen(cfg.eapKeyPass)  ? "set" : "(none)");
         if (s_eapCertBuf) {
-          // Show cert details using mbedTLS
           mbedtls_x509_crt crt; mbedtls_x509_crt_init(&crt);
           if (mbedtls_x509_crt_parse(&crt,(const unsigned char*)s_eapCertBuf,strlen(s_eapCertBuf)+1)==0) {
             char cnBuf[64]={};
@@ -5006,16 +5496,14 @@ void printStatus() {
             while(nm){if(nm->oid.len==3&&memcmp(nm->oid.p,"\x55\x04\x03",3)==0){memcpy(cnBuf,nm->val.p,min((int)nm->val.len,63));break;}nm=nm->next;}
             dualPrint.printf("  Cert CN       : %s\n", strlen(cnBuf)?cnBuf:"(unknown)");
             char notBefore[20]={},notAfter[20]={};
-            snprintf(notBefore,sizeof(notBefore),"%04d-%02d-%02d",
-              crt.valid_from.year,crt.valid_from.mon,crt.valid_from.day);
-            snprintf(notAfter,sizeof(notAfter),"%04d-%02d-%02d",
-              crt.valid_to.year,crt.valid_to.mon,crt.valid_to.day);
+            snprintf(notBefore,sizeof(notBefore),"%04d-%02d-%02d",crt.valid_from.year,crt.valid_from.mon,crt.valid_from.day);
+            snprintf(notAfter, sizeof(notAfter), "%04d-%02d-%02d",crt.valid_to.year,  crt.valid_to.mon,  crt.valid_to.day);
             dualPrint.printf("  Cert validity : %s → %s\n", notBefore, notAfter);
             dualPrint.printf("  Cert bits     : %u bit\n", (unsigned)mbedtls_pk_get_bitlen(&crt.pk));
           }
           mbedtls_x509_crt_free(&crt);
         }
-        dualPrint.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none — server not verified)");
+        dualPrint.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none)");
         if (s_eapKeyBuf) {
           const char* kfmt = strstr(s_eapKeyBuf,"BEGIN RSA PRIVATE KEY")?"PKCS#1 RSA":
                              strstr(s_eapKeyBuf,"BEGIN EC PRIVATE KEY") ?"EC":
@@ -5028,65 +5516,109 @@ void printStatus() {
         dualPrint.printf("  CA cert       : %s\n", strlen(cfg.eapCaPath) ? cfg.eapCaPath : "(none)");
       }
     }
-    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
-  dualPrint.println(F(""));
   } else {
-    dualPrint.println(F("  WiFi          : Not connected"));
+    dualPrint.println(F("  Status        : Not connected"));
   }
-  // SD
+  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+
+  // ── SD Card ──────────────────────────────────────────────────────────────
+  dualPrint.println(F("  ┌─ SD Card ──────────────────────────────────────┐"));
   dualPrint.printf("  SD card       : %s\n", sdReady ? "OK" : "NOT FOUND");
   if (sdReady) {
     uint64_t totalMb = SD_MMC.totalBytes() / (1024*1024);
     uint64_t usedMb  = SD_MMC.usedBytes()  / (1024*1024);
     uint64_t freeMb  = totalMb - usedMb;
-    dualPrint.printf("  SD storage    : %llu MB used / %llu MB total (%llu MB free)\n",
+    dualPrint.printf("  Storage       : %llu MB used / %llu MB total (%llu MB free)\n",
                   usedMb, totalMb, freeMb);
   }
-  // Image
-  if (isoOpen) {
-    dualPrint.printf("  Mounted image : %s\n", mountedFile.c_str());
-    dualPrint.printf("  Sectors       : %lu x 2048 B  (%.1f MB)\n",
-                  mountedBlocks, (float)mountedBlocks * 2048.0f / (1024.0f*1024.0f));
-    dualPrint.printf("  Raw sector    : %u B  header: +%u B\n", binRawSectorSize, binHeaderOffset);
-    dualPrint.printf("  USB media     : %s\n", mscMediaPresent ? "present" : "not present");
-  } else {
-    dualPrint.println(F("  Mounted image : (none)"));
-  }
-  // Default
-  dualPrint.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
-  // System
-  dualPrint.println(F(""));
-  dualPrint.println(F("  ┌─ Transfer Speed Note ──────────────────────────┐"));
-  dualPrint.println(F("  │ USB Full Speed = 12 Mbit/s max                 │"));
-  dualPrint.println(F("  │ Real copy: ~600-900 KB/s (hardware limit)      │"));
-  dualPrint.println(F("  │ SD card speed is NOT the bottleneck.           │"));
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
-  dualPrint.println(F("  ┌─ Audio ────────────────────────────────────────┐"));
-  dualPrint.printf("  Audio module  : %s\n", cfg.audioModule ? "PCM5102 I2S — enabled" : "disabled (no hardware)");
-  dualPrint.printf("  Win98 Stop    : %s\n", cfg.win98StopMs > 0 ?
-    (String(cfg.win98StopMs) + " ms — Stop/Pause detection active").c_str() :
-    "disabled");
-  if (cfg.audioModule) {
-    dualPrint.printf("  I2S pins      : BCK=%d  WS=%d  DATA=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
-    dualPrint.printf("  I2S state     : %s\n", i2sTx ? "initialized" : "init failed");
-    const char* astStr = audioState==1?"PLAYING":audioState==2?"PAUSED":"STOPPED";
-    dualPrint.printf("  Playback      : %s\n", astStr);
-    if (audioState > 0) {
-      uint8_t am,as_,af; lbaToMsf(audioCurrentLba,am,as_,af);
-      dualPrint.printf("  Position      : %02d:%02d:%02d  (LBA %lu)\n",am,as_,af,audioCurrentLba);
-      dualPrint.printf("  Track         : %d\n", subChannel.trackNum);
+
+  // ── Mode-specific sections ────────────────────────────────────────────────
+  if (cfg.deviceMode == 1) {
+    // GoTek mode
+    dualPrint.println(F("  ┌─ GoTek Floppy Emulator ────────────────────────┐"));
+    dualPrint.printf("  USB mode      : %s\n",
+      cfg.gotekUsbMode == 1
+        ? "FAT32 virtual (FlashFloppy indexed/native)"
+        : "Raw LBA      (stock GoTek firmware)");
+    if (cfg.gotekUsbMode == 1)
+      dualPrint.printf("  FAT32 WP      : %s\n",
+        cfg.gotekFatWP ? "ON  (Windows cannot format container)" : "OFF (writable)");
+    dualPrint.printf("  Image dir     : %s\n", gotekImgDir.c_str());
+    dualPrint.printf("  Slots loaded  : %d  (FS ready: %s)\n", gkFC, gkRdy ? "yes" : "no");
+    for (int i = 0; i < gkFC; i++) {
+      const char* fn = strrchr(gkF[i].path, '/');
+      fn = fn ? fn+1 : gkF[i].path;
+      bool isActive = (gkCurSlot == i);
+      bool isSel    = ((int)gkF[i].slotNum == gkSelectedSlot && gkSelectedSlot >= 0);
+      dualPrint.printf("  Slot %03u       : %-24s  %4lu KB%s%s\n",
+        gkF[i].slotNum, fn, (unsigned long)(gkF[i].sz/1024),
+        isActive ? "  \xe2\x86\x90 ACTIVE"  : "",
+        isSel    ? "  \xe2\x86\x90 MOUNTED" : "");
     }
-    dualPrint.printf("  Volume        : %d%%%s\n", audioVolume, audioMuted?" (MUTED)":"");
-    dualPrint.printf("  Audio tracks  : %d\n", audioTrackCount);
+    dualPrint.printf("  Mode          : %s\n",
+      gkSelectedSlot >= 0 ? ("Single-slot (slot " + String(gkSelectedSlot) + ")").c_str()
+                          : "GoTek RAW (all slots)");
+    dualPrint.printf("  USB sectors   : %u  (%.2f MB)\n",
+      gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+
+  } else {
+    // CD-ROM mode
+    dualPrint.println(F("  ┌─ CD-ROM ───────────────────────────────────────┐"));
+    if (isoOpen) {
+      dualPrint.printf("  Mounted image : %s\n", mountedFile.c_str());
+      dualPrint.printf("  Sectors       : %lu x 2048 B  (%.1f MB)\n",
+                    mountedBlocks, (float)mountedBlocks * 2048.0f / (1024.0f*1024.0f));
+      dualPrint.printf("  Raw sector    : %u B  header: +%u B\n", binRawSectorSize, binHeaderOffset);
+      dualPrint.printf("  USB media     : %s\n", mscMediaPresent ? "present" : "not present");
+    } else {
+      dualPrint.println(F("  Mounted image : (none)"));
+    }
+    dualPrint.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+    dualPrint.println(F(""));
+
+    dualPrint.println(F("  ┌─ Audio ────────────────────────────────────────┐"));
+    dualPrint.printf("  Audio module  : %s\n", cfg.audioModule ? "PCM5102 I2S — enabled" : "disabled");
+    dualPrint.printf("  Win98 Stop    : %s\n", cfg.win98StopMs > 0 ?
+      (String(cfg.win98StopMs) + " ms — Stop/Pause detection active").c_str() : "disabled");
+    if (cfg.audioModule) {
+      dualPrint.printf("  I2S pins      : BCK=%d  WS=%d  DATA=%d\n", I2S_BCK_PIN, I2S_WS_PIN, I2S_DATA_PIN);
+      dualPrint.printf("  I2S state     : %s\n", i2sTx ? "initialized" : "init failed");
+      const char* astStr = audioState==1?"PLAYING":audioState==2?"PAUSED":"STOPPED";
+      dualPrint.printf("  Playback      : %s\n", astStr);
+      if (audioState > 0) {
+        uint8_t am,as_,af; lbaToMsf(audioCurrentLba,am,as_,af);
+        dualPrint.printf("  Position      : %02d:%02d:%02d  (LBA %lu)\n",am,as_,af,audioCurrentLba);
+        dualPrint.printf("  Track         : %d\n", subChannel.trackNum);
+      }
+      dualPrint.printf("  Volume        : %d%%%s\n", audioVolume, audioMuted?" (MUTED)":"");
+      dualPrint.printf("  Audio tracks  : %d\n", audioTrackCount);
+    }
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+    dualPrint.println(F(""));
+
+    dualPrint.println(F("  ┌─ DOS Compatibility ─────────────────────────────┐"));
+    dualPrint.printf("  Debug logging : %s\n", cfg.debugMode ? "ON" : "OFF");
+    dualPrint.printf("  DOS compat    : %s\n", cfg.dosCompat ? "ON  (UNIT ATTENTION)" : "OFF");
+    if (cfg.dosCompat) {
+      const char* drvNames[] = {
+        "0=Generic", "1=USBCD2/TEAC", "2=ESPUSBCD/Panasonic", "3=DI1000DD"
+      };
+      dualPrint.printf("  DOS driver    : %s\n", drvNames[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
+    }
+    dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   }
-  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
+
+  // ── Web & HTTPS (common) ──────────────────────────────────────────────────
   dualPrint.println(F("  ┌─ Web & HTTPS ──────────────────────────────────┐"));
   dualPrint.printf("  Web auth      : %s\n", cfg.webAuth ? "enabled" : "disabled");
   dualPrint.printf("  HTTPS         : %s\n", cfg.httpsEnabled ?
-                   (httpsHandle ? "enabled + running (port 443)" : "enabled (start failed)") :
-                   "disabled");
+                   (httpsHandle ? "enabled + running (port 443)" : "enabled (start failed)") : "disabled");
   if (cfg.httpsEnabled) {
     dualPrint.printf("  TLS cert      : %s\n", strlen(cfg.httpsCertPath) ? cfg.httpsCertPath : "(not set)");
     dualPrint.printf("  TLS key       : %s\n", strlen(cfg.httpsKeyPath)  ? cfg.httpsKeyPath  : "(not set)");
@@ -5096,33 +5628,10 @@ void printStatus() {
   dualPrint.printf("  TLS version   : %s\n", cfg.tlsMinVer==0?"TLS 1.2 only":"TLS 1.2 + 1.3");
   dualPrint.printf("  TLS ciphers   : %s\n", cfg.tlsCiphers==1?"Strong/GCM":cfg.tlsCiphers==2?"Medium/CBC":cfg.tlsCiphers==3?"All/Legacy":"Auto");
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
+  dualPrint.println(F(""));
+
+  // ── System (common) ───────────────────────────────────────────────────────
   dualPrint.println(F("  ┌─ System ───────────────────────────────────────┐"));
-  dualPrint.println(F(""));
-  dualPrint.println(F("  ┌─ DOS Compatibility ─────────────────────────────┐"));
-  dualPrint.printf("  Debug logging : %s\n",  cfg.debugMode ? "ON  (verbose SCSI/API logs)" : "OFF (quiet)");
-  dualPrint.printf("  DOS compat    : %s\n",  cfg.dosCompat ? "ON  (UNIT ATTENTION, no USB re-enum)" : "OFF");
-  if (cfg.dosCompat) {
-    const char* drvNames[] = {
-      "0=Generic  (no special identity, works with any ASPI)",
-      "1=USBCD2   TEAC CD-56E  [BROKEN: needs INT 13h hook]",
-      "2=ESPUSBCD  MATSHITA CR-572  [audio via CDP.COM/cdp.com]",
-      "3=DI1000DD USBASPI 2.20  [data only, no audio]"
-    };
-    dualPrint.printf("  DOS driver    : %s\n",  drvNames[cfg.dosDriver < 4 ? cfg.dosDriver : 0]);
-  }
-  if (cfg.dosDriver == 2) {
-    dualPrint.println(F("  USBASPI needed: usbaspi2.sys (Novac) or usbaspi1.sys"));
-    dualPrint.println(F("  Audio player  : use CDP.COM (ESPUSBCD.SYS implements full IOCTL)"));
-    dualPrint.println(F("  Driver file   : ESPUSBCD.SYS  (custom driver — full audio)"));
-  } else if (cfg.dosDriver == 3) {
-    dualPrint.println(F("  USBASPI needed: usbaspi1.sys (Panasonic v2.20)"));
-    dualPrint.println(F("  Note          : data-only, no MSCDEX audio commands"));
-  } else if (cfg.dosDriver == 1) {
-    dualPrint.println(F("  WARNING       : USBCD2 uses INT 13h AH=0x50 (not std ASPI)"));
-    dualPrint.println(F("                  Standard USBASPI does not provide INT 13h hook"));
-  }
-  dualPrint.println(F("  └────────────────────────────────────────────────┘"));
-  dualPrint.println(F(""));
   dualPrint.printf("  Free heap     : %lu B\n", ESP.getFreeHeap());
   dualPrint.printf("  Uptime        : %lu s\n", millis()/1000);
   dualPrint.printf("  CPU freq      : %u MHz\n", getCpuFrequencyMhz());
@@ -5190,7 +5699,9 @@ void printHelp() {
   dualPrint.println(F("  set device-mode cdrom|gotek  Switch USB profile (reboot required)"));
   dualPrint.println(F("    cdrom  USB CD-ROM drive (default) — all CD/audio features active"));
   dualPrint.println(F("    gotek  USB flash drive for GoTek/FlashFloppy floppy emulator"));
-  dualPrint.println(F("  set gotek-dir <path>   SD folder with .img files (default: /gotek)"));
+  dualPrint.println(F("  set gotek-dir <path>      SD folder with .img files (default: /gotek)"));
+  dualPrint.println(F("  set gotek-usb-mode raw|fat      raw=LBA stride (stock GoTek FW)  fat=FAT32 virtual (FlashFloppy indexed/native)"));
+  dualPrint.println(F("  set gotek-fat-wp on|off         write-protect FAT32 virtual volume (default: on)"));
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   dualPrint.println(F(""));
   dualPrint.println(F("  ┌─ HTTPS / TLS ───────────────────────────────────┐"));
@@ -5436,10 +5947,34 @@ void processCommand(String &line) {
       }
     }
     else if (key=="gotek-dir") {
-      // Override GoTek image directory on SD card (default: /gotek)
       if (val.length() && val[0] != '/') val = "/" + val;
       gotekImgDir = val;
       dualPrint.printf("[GOTEK] Image directory set to: %s\n", gotekImgDir.c_str());
+    }
+    else if (key=="gotek-usb-mode") {
+      val.toLowerCase();
+      if (val=="fat" || val=="1") {
+        cfg.gotekUsbMode = 1;
+        dualPrint.println(F("[GOTEK] USB mode: FAT32 virtual (FlashFloppy: nav-mode=indexed in FF.CFG)"));
+      } else {
+        cfg.gotekUsbMode = 0;
+        dualPrint.println(F("[GOTEK] USB mode: Raw LBA (stock GoTek firmware)"));
+      }
+    }
+    else if (key=="gotek-fat-wp") {
+      val.toLowerCase();
+      uint8_t newWP = (val=="on"||val=="1"||val=="yes") ? 1 : 0;
+      cfg.gotekFatWP = newWP;
+      dualPrint.printf("[GOTEK] FAT32 write-protect: %s\n",
+        cfg.gotekFatWP ? "ON (Windows cannot format)" : "OFF (writable)");
+      if (cfg.deviceMode==1 && cfg.gotekUsbMode==1) {
+        tud_disconnect(); delay(400);
+        msc.isWritable(cfg.gotekFatWP==0);
+        msc.begin(gkBlockCount(), GK_SECTOR_SIZE);
+        msc.mediaPresent(true);
+        tud_connect();
+        dualPrint.println(F("[GOTEK] USB re-enumerated with new WP state"));
+      }
     }
     else if (key=="https-enable")  { String v=val; v.toLowerCase(); cfg.httpsEnabled=(v=="on"||v=="1"||v=="yes"); }
     else if (key=="https-cert")    { strlcpy(cfg.httpsCertPath, val.c_str(), sizeof(cfg.httpsCertPath)); }
@@ -5567,7 +6102,8 @@ void setup() {
     initI2S();
     sdMutex = xSemaphoreCreateMutex();  // shared between audio task and SCSI DAE reader
     startAudioTask();
-    cacheAlloc();    // allocate PSRAM read-ahead cache (512 KB, 2×128 sectors LRU)
+    cacheAlloc();    // CD-ROM PSRAM read-ahead cache (512 KB, 2×128 sectors LRU)
+    gkCacheAlloc();  // GoTek PSRAM sector cache (128 KB, 256 sectors)
     initUSBMSC();
     sdReady = initSD();
     startWiFi();
