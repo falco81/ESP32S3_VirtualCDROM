@@ -83,6 +83,8 @@ The `build_exfat_libs.py` patch script must be run before compiling either build
 - [GoTek Floppy Emulator Extension](#gotek-floppy-emulator-extension)
   - [Overview](#overview)
   - [GoTek Hardware and Firmware Compatibility](#gotek-hardware-and-firmware-compatibility)
+  - [USB Presentation Modes](#usb-presentation-modes)
+  - [FAT32 Write-Protect Mode](#fat32-write-protect-mode)
   - [Project Structure](#project-structure-1)
   - [GoTek Features](#gotek-features)
   - [Files in this Folder](#files-in-this-folder)
@@ -91,6 +93,7 @@ The `build_exfat_libs.py` patch script must be run before compiling either build
   - [Preparing the SD Card for GoTek Mode](#preparing-the-sd-card-for-gotek-mode)
   - [GoTek Web Interface](#gotek-web-interface)
   - [Slot Ordering and Image Names](#slot-ordering-and-image-names)
+  - [Catalog JSON Generator](#catalog-json-generator)
   - [Image Editor](#image-editor)
   - [Debug and Diagnostics](#debug-and-diagnostics)
   - [GoTek API Reference](#gotek-api-reference)
@@ -1866,35 +1869,120 @@ ESP32S3_VirtualCDROM-main/
 
 ## Overview
 
-The GoTek extension turns the ESP32-S3 into a USB floppy drive source for GoTek hardware. The GoTek reads floppy disk images from the ESP32 as if it were a USB flash drive containing raw concatenated disk images at fixed LBA offsets.
+The GoTek extension turns the ESP32-S3 into a USB floppy drive source for GoTek hardware. The GoTek reads floppy disk images from the ESP32 over USB. The ESP32 can present these images in two fundamentally different ways — Raw LBA mode and FAT32 virtual mode — each suited to a different GoTek firmware. In addition, single-slot mode allows a modern Windows PC to mount any individual image directly as a 1.44 MB USB floppy disk.
 
-In addition to serving GoTek hardware, the single-slot mode allows Windows direct access to any individual floppy image as a standard USB disk for reading, writing and browsing files.
-
-The mode is persistent — stored in NVS flash. After setting GoTek mode via the web interface Config tab, the device starts in GoTek mode on every subsequent boot until CD-ROM mode is restored.
+The device mode (CD-ROM vs GoTek) is persistent — stored in NVS flash. After setting GoTek mode via the Config tab or serial CLI, the device starts in GoTek mode on every subsequent boot until CD-ROM mode is restored.
 
 ---
 
 ## GoTek Hardware and Firmware Compatibility
 
-GoTek is the brand name of a widely sold floppy drive emulator. The same physical hardware is used with several different firmware variants, and they differ in how they read images from a USB source device.
+GoTek is the brand name of a widely sold floppy drive emulator. Several different firmware variants exist for the same hardware. They differ fundamentally in how they access image files from a USB source.
 
-### FlashFloppy
+### FlashFloppy (recommended, fully supported)
 
-[FlashFloppy](https://github.com/keirf/flashfloppy) is open-source third-party firmware for GoTek hardware and is the most commonly used alternative firmware. In USB Host mode (FF.CFG `host = usb`) FlashFloppy reads images from a USB storage device using raw LBA access with a configurable stride.
+[FlashFloppy](https://github.com/keirf/flashfloppy) is the recommended open-source firmware for GoTek hardware. **This project was developed and tested against FlashFloppy.** Two navigation modes are relevant:
 
-**This firmware was developed and tested against FlashFloppy.** The default stride of 3072 sectors was measured empirically on a GoTek running FlashFloppy with a standard PC floppy drive configuration (HD 1.44 MB). If your FlashFloppy configuration uses a different image size (e.g. Amiga DD, HD, or DMF extended), change `GK_SLOT_STRIDE` accordingly — see the stride table in the [Technical Notes](#technical-notes--how-gotek-raw-mode-works) section.
+**Indexed mode** (`nav-mode = indexed` in FF.CFG) — FlashFloppy reads a FAT32 USB drive and navigates files named `DSKA0000.*`, `DSKA0001.*` etc. from the root directory. Use the ESP32's **FAT32 virtual mode** for this.
+
+**Native mode** (default, no FF.CFG needed) — FlashFloppy reads any `.img` / `.adf` / `.hfe` file from a FAT32 USB drive. The user navigates with the GoTek buttons or display. Use the ESP32's **FAT32 virtual mode** for this.
+
+The `host` option in FF.CFG specifies the **vintage computer** connected to the GoTek via the floppy cable (ibmpc, shugart, acorn, akai...) — it has nothing to do with the USB source device.
 
 ### Stock GoTek firmware
 
-The stock firmware shipped on GoTek hardware reads images by filename from a FAT filesystem on the USB device. It does not use raw LBA access and is therefore **not compatible** with this firmware. If your GoTek is running stock firmware, replace it with FlashFloppy.
+The stock firmware pre-installed on GoTek hardware partitions the USB drive into a fixed number of raw slots and accesses them by physical LBA position. Use the ESP32's **Raw LBA mode** for this. Note that stock firmware does not support custom filenames — it reads slots positionally.
 
 ### HxC firmware
 
-[HxC](https://hxc2001.com/floppy_drive_emulator/) is a commercial firmware for GoTek. In USB mode it reads images using a protocol similar to FlashFloppy raw LBA access. Compatibility with this firmware has not been verified; the stride value may differ.
+[HxC](https://hxc2001.com/floppy_drive_emulator/) is commercial firmware. In USB mode it reads a FAT32 drive with files in a specific format. Compatibility has not been verified.
 
-### Goex / other variants
+### Other variants
 
-Other GoTek firmware variants have not been tested. If the GoTek reads slot 0 correctly but slot 1 appears blank or asks to format, the stride value does not match — see [Troubleshooting GoTek Mode](#troubleshooting-gotek-mode).
+If the GoTek reads slot 0 correctly but slot 1 appears blank or asks to format, the stride value does not match — see [Troubleshooting GoTek Mode](#troubleshooting-gotek-mode).
+
+---
+
+## USB Presentation Modes
+
+The ESP32 can present floppy images to GoTek in three different ways. The mode is set in the Config tab (GoTek USB mode) or via serial (`set gotek-usb-mode raw|fat`).
+
+### Raw LBA mode (for stock GoTek firmware)
+
+The ESP32 presents a raw block device. Slot N is served at `LBA N × GK_SLOT_STRIDE` (default 3072). GoTek reads each slot by seeking to the correct LBA offset — no filesystem is involved. The vintage computer sees the floppy image directly.
+
+- Compatible with: stock GoTek firmware, some HxC configurations
+- Not compatible with: FlashFloppy (which expects a FAT32 filesystem)
+- Slot stride: measured as 3072 sectors on the test device. Change `GK_SLOT_STRIDE` in firmware if your device uses a different value.
+- Image names: any filename, slot assignment by position in alphabetical or custom `order.json` order
+
+### FAT32 virtual mode (for FlashFloppy)
+
+The ESP32 dynamically generates a complete FAT32 filesystem in RAM and presents it over USB. The root directory contains virtual files `DSKA0000.IMG`, `DSKA0001.IMG`... mapped to the actual image files on the SD card in slot order. No files are renamed on SD.
+
+- Compatible with: FlashFloppy (indexed mode: `nav-mode = indexed`, or native mode)
+- Not compatible with: stock GoTek firmware (which uses raw LBA partitions)
+- FAT32 volume size: computed from actual image sizes + optional free space
+- PSRAM cache: 128 KB read-ahead cache for image data; FAT/directory metadata generated from RAM without SD access
+- Image names: virtual names always `DSKA0000.IMG` etc.; actual SD filenames unchanged
+
+### Single-slot mode (for Windows direct access)
+
+Mounts one specific image as a raw 1.44 MB USB disk (triggered by the Mount button in the GoTek tab). Windows sees a standard floppy disk and can read, write, and format it. The image file on SD is modified directly.
+
+- Use for: copying files into/out of a specific image from Windows
+- FAT12 content: Windows reads/writes the actual FAT12 filesystem inside the image
+- Slot switch: triggers USB re-enumeration (600 ms disconnect)
+- After use: click GoTek mode button to return to full multi-slot mode
+
+---
+
+## FAT32 Write-Protect Mode
+
+When using FAT32 virtual mode, the write-protect setting controls how the ESP32 handles write attempts from a connected PC. The setting has no effect in Raw LBA mode or single-slot mode.
+
+Set in Config tab (FAT32 write-protect) or via serial (`set gotek-fat-wp on|off`). Default: **ON**.
+
+### WP=ON — Write protected (default, recommended for most use cases)
+
+The USB volume is presented as write-protected. Windows cannot format, delete, or write to the virtual FAT32 volume. GoTek hardware **ignores** the write-protect flag for floppy image writes — it still writes modified image data back correctly. The vintage computer can read and write to the floppy normally.
+
+| Operation | Result |
+|---|---|
+| Vintage PC reads floppy | Works — image data served from SD |
+| Vintage PC writes to floppy | Works — GoTek writes back via USB, ignores WP flag |
+| Windows Explorer browses drive | Shows `DSKA0000.IMG` etc., read-only |
+| Windows deletes file | Blocked by OS (write-protected) |
+| Windows formats drive | Blocked by OS (write-protected) |
+| Windows copies new file | Blocked by OS (write-protected) |
+
+Use WP=ON when: loading software, games, or data from read-only images; when you do not need Windows to modify the virtual volume.
+
+### WP=OFF — Writable (for Windows file management during session)
+
+The USB volume is writable. Windows can delete virtual image files and perform metadata operations. A **shadow root directory** is maintained in RAM — changes visible to Windows during the current session are not persisted to the SD card. Real `.img` files are never deleted by Windows operations.
+
+The virtual FAT32 volume includes 5 MB of free space (1280 clusters) to allow Windows to create system folders (`$RECYCLE.BIN` etc.) needed for normal file operations.
+
+| Operation | Result | Real SD data |
+|---|---|---|
+| Vintage PC reads floppy | Works | Untouched |
+| Vintage PC writes to floppy | Works — GoTek writes back | Modified in `.img` file |
+| Windows deletes `DSKA0001.IMG` | File disappears from Explorer and GoTek this session | `.img` file on SD untouched |
+| Windows copies new file | Fails — no real free clusters for image files | Untouched |
+| Windows Quick Format | Shadow root cleared, FAT writes ignored | All `.img` files untouched |
+| Windows Full Format | **Zeros written to all image file data** | **IMAGE DATA LOST** |
+| Reconnect / reboot | Shadow reset — all files reappear | Untouched |
+
+**Full Format is the only dangerous operation with WP=OFF.** Quick Format (the Windows default) is safe. Full Format requires explicitly unchecking "Quick Format" in the format dialog and takes much longer — it is a deliberate destructive action.
+
+**GoTek writes with WP=OFF:** Zero sectors written by the vintage computer (empty floppy sectors) are written back correctly. There is no false zero-detection that would block legitimate writes.
+
+Use WP=OFF when: you want to delete specific image slots from Windows Explorer during a session, or when your GoTek firmware requires a writable USB source.
+
+### Shadow root directory behaviour
+
+When WP=OFF, writes to the virtual root directory (containing `DSKA0000.IMG` etc.) update an in-memory shadow copy. Changes are visible immediately to both Windows and GoTek for the duration of the current USB session. On USB disconnect or device reboot, the shadow is reset from the actual SD card contents — all files reappear. To permanently remove an image slot, use the web UI delete button in the GoTek tab.
 
 ---
 
@@ -1929,7 +2017,8 @@ ESP32S3_VirtualCDROM-main/
 
 ## GoTek Features
 
-- **USB floppy drive emulation** — ESP32 presents itself as a USB mass storage device with `peripheral_device_type = 0x00` (Direct-access block device). Windows installs Disk driver; GoTek hardware reads raw floppy images.
+- **Two USB presentation modes** — Raw LBA (for stock GoTek firmware: slot N at LBA N×stride) and FAT32 virtual (for FlashFloppy: generates a complete FAT32 volume dynamically with DSKA0000.IMG... mapped to actual SD files)
+- **USB floppy drive emulation** — ESP32 presents with `peripheral_device_type = 0x00` (Direct-access block device). Windows installs Disk driver; GoTek hardware reads raw floppy images.
 - **Multiple image slots** — up to 100 `.img` / `.ima` / `.adf` / `.dsk` / `.st` / `.d81` / `.d64` / `.hfe` image files, served at fixed LBA offsets matching GoTek's slot stride
 - **Custom image names** — files can have any name (not limited to `DSKA0000.img` convention); slot order is stored in `order.json`
 - **Persistent slot order** — drag-and-drop reordering in the web UI saved to `/GoTek/order.json` on the SD card; no file renaming
@@ -2153,6 +2242,169 @@ Click any cell in the **Description** column to edit inline:
 ```
 
 Labels survive slot reordering and file deletion (keyed by filename).
+
+---
+
+## Catalog JSON Generator
+
+When working with a large collection of pre-numbered floppy images (e.g. `FIMG000.img`, `FIMG001.img`, ...), use the provided Python script **`gotek_json_gen.py`** to automatically generate `order.json` and `labels.json` from a spreadsheet catalog, instead of editing the files by hand or entering descriptions one by one in the web UI.
+
+### Requirements
+
+```bash
+pip install pandas openpyxl
+```
+
+Python 3.8 or newer.
+
+### Catalog spreadsheet format
+
+The spreadsheet (XLSX) must contain at least two columns:
+
+| Column | Description |
+|---|---|
+| **Floppy ID** | Integer, 0-based. Must match the numeric part of the image filename. |
+| **Description** | Human-readable label. Shown in the GoTek web UI and written to `labels.json`. |
+
+Column names are detected automatically (case-insensitive). The script recognises common variants — `ID`, `Number`, `Floppy ID`, `Description`, `Desc`, `Label`, `Name`, `Popis`, etc. If your column names differ, use `--id-col` and `--desc-col`.
+
+A ready-to-use template spreadsheet (`USBFloppy_template.xlsx`) is included in the repository. It contains a formatted catalog sheet and a README sheet with instructions.
+
+### Image filename convention
+
+The default pattern is `FIMG{id:03d}.img` — matching files such as `FIMG000.img`, `FIMG001.img`, `FIMG042.img`.
+
+Use `--pattern` to match any other naming convention:
+
+| Pattern | Matches |
+|---|---|
+| `FIMG{id:03d}.img` | `FIMG000.img`, `FIMG001.img`, ... *(default)* |
+| `DSKA{id:04d}.img` | `DSKA0000.img`, `DSKA0001.img`, ... *(FlashFloppy indexed)* |
+| `disk{id}.img` | `disk0.img`, `disk1.img`, ... |
+| `floppy_{id:03d}.ima` | `floppy_000.ima`, `floppy_001.ima`, ... |
+
+The `{id}` placeholder marks where the number appears. The format spec (`:03d`, `:04d`) controls zero-padding in the output filename but the scanner accepts any number of digits — `FIMG3.img` and `FIMG003.img` both match ID 3.
+
+### Basic usage
+
+Place the script, image files and spreadsheet in the same directory and run with no arguments:
+
+```
+GoTek/
+  FIMG000.img
+  FIMG001.img
+  ...
+  USBFloppy.xlsx
+  gotek_json_gen.py
+```
+
+```bash
+cd GoTek
+python3 gotek_json_gen.py
+```
+
+On Windows:
+
+```cmd
+cd D:\GoTek
+python gotek_json_gen.py
+```
+
+The script scans the current directory for `FIMG*.img` files, finds the first `*.xlsx` file automatically, and writes `order.json` and `labels.json` into the same directory.
+
+### Full syntax
+
+```
+python3 gotek_json_gen.py [gotek_dir] [xlsx_file] [options]
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `gotek_dir` | Current directory | Directory containing the image files. `order.json` and `labels.json` are written here. |
+| `xlsx_file` | First `*.xlsx` in `gotek_dir` | Path to the catalog spreadsheet. |
+
+| Option | Default | Description |
+|---|---|---|
+| `--pattern TMPL` | `FIMG{id:03d}.img` | Filename template with `{id}` placeholder. Controls which files are scanned and how output filenames are formatted. |
+| `--sheet N` | `0` | Sheet index (0 = first) or sheet name to read from the spreadsheet. |
+| `--id-col NAME` | auto | Exact column name for Floppy ID. Use when auto-detection fails. |
+| `--desc-col NAME` | auto | Exact column name for Description. Use when auto-detection fails. |
+| `--dry-run` | — | Print the table and preview JSON output without writing any files. |
+
+### Examples
+
+```bash
+# Default: FIMG*.img in current directory, first *.xlsx found automatically
+python3 gotek_json_gen.py
+
+# Preview without writing
+python3 gotek_json_gen.py --dry-run
+
+# Different directories for images and spreadsheet
+python3 gotek_json_gen.py /media/sd/GoTek ~/Documents/catalog.xlsx
+
+# FlashFloppy indexed naming (DSKA0000.img, DSKA0001.img, ...)
+python3 gotek_json_gen.py --pattern "DSKA{id:04d}.img"
+
+# Custom naming with .ima extension
+python3 gotek_json_gen.py --pattern "floppy_{id:03d}.ima"
+
+# Non-standard column names in the spreadsheet
+python3 gotek_json_gen.py --id-col "Number" --desc-col "Label"
+
+# Specific sheet by name
+python3 gotek_json_gen.py --sheet "Floppies"
+
+# Windows — all options combined
+python gotek_json_gen.py D:\GoTek D:\catalog.xlsx --pattern "DISK{id:03d}.img" --dry-run
+```
+
+### Output
+
+The script prints a summary table and writes two files:
+
+```
+   ID  Filename       Description
+----------------------------------------------------------
+    0  FIMG000.img    MS DOS 6.22 Disk1
+    1  FIMG001.img    MS DOS 6.22 Disk2
+    2  FIMG002.img    MS DOS 6.22 Disk3
+    3  FIMG003.img    CD-ROM Driver
+   ...
+   99  FIMG099.img    *** no catalog entry ***
+
+Images : 100   Matched : 99   Unmatched : 1 (IDs: [99])
+
+Written : /media/sd/GoTek/order.json
+Written : /media/sd/GoTek/labels.json
+```
+
+Files with no catalog entry are included in `order.json` with an empty description in `labels.json`. A warning lists their IDs.
+
+**`order.json`** — array of filenames in slot order (sorted by Floppy ID):
+```json
+["FIMG000.img","FIMG001.img","FIMG002.img"]
+```
+
+**`labels.json`** — filename → description map:
+```json
+{"FIMG000.img":"MS DOS 6.22 Disk1","FIMG001.img":"MS DOS 6.22 Disk2"}
+```
+
+### Deploying to the SD card
+
+Copy the generated files and all image files to the `/GoTek` directory on the SD card:
+
+```
+SD card /GoTek/
+  FIMG000.img
+  FIMG001.img
+  ...
+  order.json    ← generated by script
+  labels.json   ← generated by script
+```
+
+The firmware reads both JSON files automatically on next boot. To reload without rebooting, click **Refresh** in the GoTek web UI tab — the slot table rebuilds and the display updates immediately.
 
 ---
 
