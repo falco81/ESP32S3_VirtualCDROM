@@ -52,10 +52,14 @@ tr:hover td{background:var(--border2)}
 td.ic,th.ic{width:28px;min-width:28px;text-align:center;font-size:1rem}
 td.nm{color:var(--tx);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;}
 td.nm.d{color:#79c0ff;cursor:pointer}td.nm.d:hover{text-decoration:underline}
+.bcl{color:var(--accent);text-decoration:underline;cursor:pointer}.bcl:hover{opacity:.7}
 td.sz,th.sz{color:var(--tx2);text-align:right;white-space:nowrap;width:100px}
 td.ac,th.ac{text-align:right;white-space:nowrap;min-width:100px;vertical-align:middle}
 td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 #mkModal.show{display:flex!important}
+#delModal.show{display:flex!important}
+#imgDelModal.show{display:flex!important}
+#imgMkModal.show{display:flex!important}
 .bc{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:clamp(6px,1vw,10px);font-size:clamp(.7rem,1.3vw,.85rem)}
 .bcp{color:var(--blue);cursor:pointer}.bcp:hover{text-decoration:underline}
 .bcs{color:var(--tx3)}
@@ -488,6 +492,13 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
             <option value="0">Disabled — fully writable (use only if GoTek firmware requires it)</option>
           </select>
         </div>
+        <div class="cfg-row" style="margin-top:10px">
+          <label class="cfg-lbl">Image editor upload</label>
+          <select class="cfg-inp" id="cfgImgFat83">
+            <option value="1">FAT 8.3 auto-convert (default) — unique ~N suffix, max compatibility</option>
+            <option value="0">VFAT long filenames — full name visible in Windows and image editor</option>
+          </select>
+        </div>
       </div>
       <div id="cfgDeviceModeNote0" style="margin-top:8px;font-size:.75rem;background:rgba(56,139,253,.1);border:1px solid rgba(56,139,253,.3);border-radius:4px;padding:8px 12px">
         &#10003; <b>CD-ROM mode:</b> Full virtual CD-ROM — ISO/BIN/CUE, audio playback, DOS compat, SCSI commands.
@@ -695,9 +706,10 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
           <button class="btn b" onclick="gkRefresh()" id="gkRefBtn">&#8635; Refresh</button>
           <button class="btn g" onclick="gkShowCreate()">&#43; New</button>
-          <button class="btn b" onclick="gkShowUpload()">&#8679; Upload</button>
+          <button class="btn b" onclick="gkOpenDz()">&#8679; Upload</button>
           <button class="btn gr" onclick="gkSaveOrder()" id="gkSaveOrderBtn" style="display:none" title="Save current drag-and-drop order as GoTek slot assignment">&#128204; Save order</button>
           <span id="gkOrderMsg" style="font-size:.75rem;color:var(--tx2)"></span>
+          <span id="gkMsg" style="font-size:.75rem;color:var(--tx2)"></span>
         </div>
       </div>
       <!-- Create row -->
@@ -712,18 +724,14 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <span class="sp" id="gkCrSp"></span>
         <span id="gkCrMsg" style="font-size:.8rem"></span>
       </div>
-      <!-- Upload row -->
-      <div id="gkUploadRow" style="display:none;padding:8px 0 6px;gap:8px;align-items:center;flex-wrap:wrap;border-bottom:1px solid var(--border2)">
-        <input type="file" id="gkUpFile" accept=".img,.ima,.adf,.hfe,.dsk,.st,.d81,.d64" style="flex:1;font-size:.8rem;color:var(--tx);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:4px 8px">
-        <button class="btn g" onclick="gkUpload()">&#8679; Upload</button>
-        <span id="gkMsg" style="font-size:.8rem"></span>
-        <div id="gkUpProg" style="display:none;width:100%">
-          <div style="height:4px;background:var(--border);border-radius:2px">
-            <div id="gkUpBar" style="height:4px;background:var(--green);border-radius:2px;width:0%;transition:width .2s"></div>
-          </div>
-          <span id="gkUpMsg" style="font-size:.75rem;color:var(--tx2)"></span>
-        </div>
+      <!-- Upload row — .dz style matching File Manager -->
+      <div class="dz" id="gkUploadRow">
+        Drop files here or
+        <button class="btn b" style="margin:0 6px" onclick="document.getElementById('gkUpFile').click()">Browse&hellip;</button>
+        <button class="btn gr" onclick="gkCloseDz()">&#10005;</button>
+        <input type="file" id="gkUpFile" multiple accept=".img,.ima,.adf,.hfe,.dsk,.st,.d81,.d64" style="display:none" onchange="gkQueueFiles(this.files)">
       </div>
+      <div class="pw" id="gkPw"><div class="pf" id="gkPf"></div><div class="pb"><div class="pbi" id="gkPbi"></div></div><div class="pp" id="gkPp"></div></div>
       <div class="tbl-wrap" style="flex:1">
         <table id="gkTbl" style="width:100%">
           <thead><tr>
@@ -752,26 +760,25 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <button class="btn gr" onclick="imgModalClose()" style="padding:3px 12px;font-size:.8rem">&#10005; Close</button>
     </div>
     <!-- Breadcrumb -->
-    <div id="imgBreadcrumb" style="padding:5px 14px;font-size:.75rem;color:var(--tx2);border-bottom:1px solid var(--border2);background:rgba(0,0,0,.15)"></div>
-    <!-- Toolbar: upload + mkdir -->
-    <div style="padding:7px 14px;border-bottom:1px solid var(--border2);display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <input type="file" id="imgUpFile" style="flex:1;min-width:150px;font-size:.75rem;color:var(--tx);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 6px" onchange="imgCheckFileSize()">
-      <button class="btn g" id="imgUpBtn" onclick="imgUpload()" style="font-size:.8rem;white-space:nowrap">&#8679; Write file</button>
-      <span id="imgUpMsg" style="font-size:.72rem;color:var(--tx2)"></span>
-      <span style="flex:1"></span>
-      <input type="text" id="imgMkdirName" placeholder="Folder name" style="width:130px;font-size:.75rem;color:var(--tx);background:var(--bg);border:1px solid var(--border);border-radius:4px;padding:3px 6px">
-      <button class="btn gr" onclick="imgMkdir()" style="font-size:.8rem;white-space:nowrap">&#128193; New folder</button>
-      <span id="imgMkdirMsg" style="font-size:.72rem;color:var(--tx2)"></span>
+    <div id="imgBreadcrumb" class="bc" style="padding:5px 14px;border-bottom:1px solid var(--border2);background:rgba(0,0,0,.15);margin-bottom:0"></div>
+    <!-- Toolbar: mirrors File Manager -->
+    <div class="tb" style="padding:7px 14px;border-bottom:1px solid var(--border2)">
+      <button class="btn b" onclick="imgOpenDz()">&#8679; Upload</button>
+      <button class="btn gr" onclick="imgOpenMkdir()">&#128193; New folder</button>
+      <span class="sp" id="imgUpMsg"></span>
     </div>
+    <div class="dz" id="imgDz">
+      Drop files here or
+      <button class="btn b" style="margin:0 6px" onclick="document.getElementById('imgUpFile').click()">Browse&hellip;</button>
+      <button class="btn gr" onclick="imgCloseDz()">&#10005;</button>
+      <input type="file" id="imgUpFile" multiple style="display:none" onchange="imgQueueFiles(this.files)">
+    </div>
+    <div class="pw" id="imgPw"><div class="pf" id="imgPf"></div><div class="pb"><div class="pbi" id="imgPbi"></div></div><div class="pp" id="imgPp"></div></div>
     <!-- File list -->
-    <div style="overflow-y:auto;overflow-x:hidden;flex:1;min-height:0">
-      <table style="width:100%;border-collapse:collapse;font-size:.85rem">
-        <thead><tr style="position:sticky;top:0;background:var(--surface);z-index:1;border-bottom:1px solid var(--border2)">
-          <th class="ic"></th>
-          <th style="text-align:left;padding:6px 6px;color:var(--tx2);font-weight:normal">Name</th>
-          <th class="sz" style="padding:6px 10px;color:var(--tx2);font-weight:normal">Size</th>
-          <th class="ac"></th>
-        </tr></thead>
+    <div id="imgFileList" style="overflow-y:auto;overflow-x:hidden;flex:1;min-height:0">
+      <table style="width:100%;border-collapse:collapse;font-size:.85rem;table-layout:fixed">
+        <colgroup><col style="width:32px"><col><col style="width:100px"><col style="width:130px"></colgroup>
+        <thead><tr><th class="ic"></th><th>Name</th><th class="sz">Size</th><th class="ac"></th></tr></thead>
         <tbody id="imgTbody"><tr><td colspan="4" style="padding:16px;color:var(--tx2)">Loading&hellip;</td></tr></tbody>
       </table>
     </div>
@@ -1116,6 +1123,7 @@ function gkApplyTabVisibility(isGotek){
 function gkInit(){
   fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){
     gkIsGotek=(s.device_mode===1);
+    window._imgFat83=(s.img_fat83!==false&&s.img_fat83!==0);
     gkApplyTabVisibility(gkIsGotek);
     var notice=$('gkCdromNotice'), panel=$('gkActivePanel');
     if(notice) notice.style.display=gkIsGotek?'none':'block';
@@ -1302,8 +1310,26 @@ function gkShowUsbDebug(){
 function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=show?'inline':'none'; }
 
 function gkShowCreate(){var r=$('gkCreateRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
-function gkShowUpload(){var r=$('gkUploadRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
-
+function gkOpenDz(){var dz=$('gkUploadRow');if(dz){dz.style.display='block';dz.classList.remove('ov');}}
+function gkCloseDz(){var dz=$('gkUploadRow');if(dz)dz.style.display='none';var pw=$('gkPw');if(pw)pw.style.display='none';var fi=$('gkUpFile');if(fi)fi.value='';gkUpQ=[];gkUpIdx=0;gkUpRun=false;}
+var gkUpQ=[],gkUpIdx=0,gkUpRun=false;
+function gkQueueFiles(files){if(!files||!files.length)return;var arr=Array.from(files);gkUpQ=gkUpRun?gkUpQ.concat(arr):arr;gkUpIdx=gkUpRun?gkUpIdx:0;if(!gkUpRun)gkUploadNext();}
+function gkUploadNext(){
+  if(gkUpIdx>=gkUpQ.length){gkUpRun=false;var pw=$('gkPw');if(pw)pw.style.display='none';gkCloseDz();gkRefresh();return;}
+  gkUpRun=true;var file=gkUpQ[gkUpIdx];
+  var pw=$('gkPw');if(pw)pw.style.display='block';
+  $('gkPf').textContent='('+(gkUpIdx+1)+'/'+gkUpQ.length+') '+file.name;
+  $('gkPbi').style.width='0%';$('gkPp').textContent='0%';
+  var dir='/'+($('gkDir').textContent||'gotek').replace(/^\//,'');
+  var fd=new FormData();fd.append('file',file,file.name);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/upload?path='+encodeURIComponent(dir));
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('gkPbi').style.width=p+'%';$('gkPp').textContent=p+'%';}};
+  xhr.onload=function(){gkUpIdx++;gkUploadNext();};
+  xhr.onerror=function(){gkUpIdx++;gkUploadNext();};
+  xhr.send(fd);
+}
+function gkUpload(){ gkOpenDz(); }
 function gkUsbModeNote(v){
   var el=$('cfgGotekUsbModeNote'); if(!el) return;
   var wpRow=$('cfgGotekFatWPRow');
@@ -1606,11 +1632,17 @@ function imgModalClose(){
   imgCurImg='';
 }
 function imgRenderBc(dir){
-  var parts=dir==='/'?['']:dir.split('/').filter(Boolean);
-  var bc='<span style="cursor:pointer;color:var(--accent)" onclick="imgLoadDir(\'/\')">&#128190; /</span>';
-  var path='';
-  parts.forEach(function(p){path+='/'+p;(function(q){bc+=' / <span style="cursor:pointer;color:var(--accent)" onclick="imgLoadDir(\''+q+'\')">'+escHtml(p)+'</span>';})(path);});
-  $('imgBreadcrumb').innerHTML=bc;
+  var bc=$('imgBreadcrumb'); bc.innerHTML='';
+  var r=document.createElement('span'); r.className='bcp'; r.textContent='💾 /';
+  r.onclick=function(){imgLoadDir('/');};
+  bc.appendChild(r);
+  if(dir!=='/')dir.split('/').filter(Boolean).reduce(function(acc,p){
+    acc+='/'+p;
+    var sep=document.createElement('span'); sep.className='bcs'; sep.textContent=' / ';
+    var sp=document.createElement('span'); sp.className='bcp'; sp.textContent=p;
+    sp.onclick=(function(a){return function(){imgLoadDir(a);};})(acc);
+    bc.appendChild(sep); bc.appendChild(sp); return acc;
+  },'');
 }
 function imgLoadDir(dir){
   imgCurDir=dir;
@@ -1619,37 +1651,39 @@ function imgLoadDir(dir){
   fetch('/api/img/ls?img='+encodeURIComponent(imgCurImg)+'&dir='+encodeURIComponent(dir))
     .then(function(r){return r.json();}).then(function(d){
     var tb=$('imgTbody'); if(!tb) return;
-    var rows='';
+    tb.innerHTML='';
     if(dir!=='/'){
-      rows+='<tr style="border-bottom:1px solid var(--border2)">'
-        +'<td class="ic">&#128193;</td>'
-        +'<td class="nm d" style="padding:5px 6px;cursor:pointer" onclick="imgNavUp()">.. (up)</td>'
-        +'<td class="sz"></td><td class="ac"></td></tr>';
+      var utr=mkTr(); var utdN=mkTd('nm d','.. (up)'); utdN.onclick=imgNavUp;
+      utr.append(mkTd('ic','📁'),utdN,mkTd('sz',''),mkTd('ac','')); tb.appendChild(utr);
     }
     if(!d.files||!d.files.length){
-      rows+='<tr><td colspan="4" style="padding:12px;color:var(--tx2)">(empty)</td></tr>';
+      var et=mkTr(); var etd=document.createElement('td'); etd.colSpan=4;
+      etd.style.cssText='padding:12px;color:var(--tx2)'; etd.textContent='(empty)';
+      et.appendChild(etd); tb.appendChild(et);
     } else {
-      var dirs=d.files.filter(function(e){return e.d;}).sort(function(a,b){return a.n.localeCompare(b.n);});
-      var files=d.files.filter(function(e){return!e.d;}).sort(function(a,b){return a.n.localeCompare(b.n);});
-      dirs.concat(files).forEach(function(e){
+      var dirs2=d.files.filter(function(e){return e.d;}).sort(function(a,b){return a.n.localeCompare(b.n);});
+      var files2=d.files.filter(function(e){return!e.d;}).sort(function(a,b){return a.n.localeCompare(b.n);});
+      dirs2.concat(files2).forEach(function(e){
         var sz=e.d?'':(e.s>1048576?(e.s/1048576).toFixed(1)+' MB':e.s>1024?(e.s/1024).toFixed(0)+' KB':e.s+' B');
-        var nm=e.n;
-        var fpath=(dir==='/'?'':dir)+'/'+nm;
-        var icon=e.d?'&#128193;':'&#128196;';
-        var nameCell=e.d
-          ?'<span style="color:#79c0ff;cursor:pointer" onclick="imgEnter(\''+escHtml(nm)+'\')">'+escHtml(nm)+'</span>'
-          :'<span style="color:var(--tx)">'+escHtml(nm)+'</span>';
-        var btns='';
-        if(!e.d) btns+='<a class="btn gr" style="text-decoration:none;margin-right:3px" title="Download" href="/api/img/get?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath)+'" download="'+escHtml(nm)+'">&#8681;</a>';
-        btns+='<button class="btn r" title="'+(e.d?'Delete folder':'Delete')+'" onclick="imgDelete(\''+escHtml(nm)+'\','+(e.d?'true':'false')+')">&#128465;</button>';
-        rows+='<tr style="border-bottom:1px solid rgba(255,255,255,.04)">'
-          +'<td style="padding:5px 10px;color:var(--tx2)">'+icon+'</td>'
-          +'<td style="padding:5px 6px">'+nameCell+'</td>'
-          +'<td style="text-align:right;padding:5px 10px;color:var(--tx2);white-space:nowrap;font-size:.8rem">'+sz+'</td>'
-          +'<td style="padding:5px 6px;white-space:nowrap">'+btns+'</td></tr>';
+        var nm=e.n; var fpath=(dir==='/'?'':dir)+'/'+nm;
+        var tr=mkTr();
+        var tdN=mkTd('nm'+(e.d?' d':''),nm);
+        if(e.d)tdN.onclick=(function(n){return function(){imgEnter(n);};})(nm);
+        var tdA=mkTd('ac','');
+        if(!e.d){
+          var dl=document.createElement('a'); dl.className='btn gr'; dl.textContent='⬇';
+          dl.href='/api/img/get?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath);
+          dl.download=nm; dl.style.textDecoration='none'; dl.style.display='inline-flex';
+          dl.style.alignItems='center'; dl.title='Download'; tdA.appendChild(dl);
+        }
+        var db=document.createElement('button'); db.className='btn r';
+        db.textContent='🗑'; db.title=(e.d?'Delete folder':'Delete');
+        db.onclick=(function(n,id){return function(){imgDelete(n,id);};})(nm,e.d);
+        tdA.appendChild(db);
+        tr.append(mkTd('ic',e.d?'📁':'📄'),tdN,mkTd('sz',sz),tdA);
+        tb.appendChild(tr);
       });
     }
-    tb.innerHTML=rows;
     var fc=d.free_clusters||0,bps=d.bps||512,spc=d.spc||1;
     var freeKB=Math.round(fc*spc*bps/1024);
     var totKB=Math.round((d.total||2880)*bps/1024);
@@ -1671,18 +1705,106 @@ function imgUpdateSpaceBar(freeKB, totKB){
     bar.style.background=pct>90?'var(--red)':pct>75?'#e3b341':'var(--green)';
   }
 }
-function imgCheckFileSize(){
-  var fi=$('imgUpFile'), warn=$('imgFreeWarn'), btn=$('imgUpBtn');
-  if(!fi||!fi.files||!fi.files.length){
-    if(warn) warn.style.display='none';
-    if(btn) btn.disabled=false;
+// Convert filename to FAT 8.3 format with ~N deduplication
+function toFat83(name, used) {
+  var d = name.lastIndexOf('.');
+  var base = d > 0 ? name.slice(0, d) : name;
+  var ext  = d > 0 ? name.slice(d + 1) : '';
+  var clean = function(s) {
+    return s.toUpperCase().replace(/[^A-Z0-9!#$%&'()\-@^_`{}~]/g, '');
+  };
+  var cb = clean(base), ce = clean(ext).slice(0, 3);
+  var suffix = ce ? '.' + ce : '';
+  // Fits in 8.3 as-is?
+  if (cb.length <= 8) {
+    var r83 = cb + suffix;
+    if (!used.has(r83)) { used.add(r83); return r83; }
+  }
+  // Need tilde: up to 6 clean base chars + ~N
+  var stem = cb.slice(0, 6);
+  for (var n = 1; n <= 999; n++) {
+    var t = '~' + n;
+    var r83 = stem.slice(0, 8 - t.length) + t + suffix;
+    if (!used.has(r83)) { used.add(r83); return r83; }
+  }
+  return cb.slice(0, 8) + suffix;
+}
+var imgBatchUsed = new Set();
+var imgUpQ=[],imgUpIdx=0,imgUpRun=false;
+function imgOpenDz(){$('imgDz').style.display='block';}
+function imgCloseDz(){$('imgDz').style.display='none';$('imgPw').style.display='none';$('imgUpFile').value='';imgUpQ=[];imgUpIdx=0;imgUpRun=false;}
+var _imgPendingFiles=null;
+function imgSpaceCancel(){$('imgSpaceModal').style.display='none';_imgPendingFiles=null;}
+function imgSpaceOk(){
+  $('imgSpaceModal').style.display='none';
+  if(!_imgPendingFiles)return;
+  imgUpQ=imgUpRun?imgUpQ.concat(_imgPendingFiles):_imgPendingFiles;
+  imgUpIdx=imgUpRun?imgUpIdx:0;
+  _imgPendingFiles=null;
+  if(!imgUpRun){imgBatchUsed=new Set();imgUploadNext();}
+}
+function imgQueueFiles(files){
+  if(!files||!files.length)return;
+  var arr=Array.from(files);
+  var totalBytes=arr.reduce(function(s,f){return s+f.size;},0);
+  var freeBytes=imgFreeKB*1024;
+  if(totalBytes>freeBytes){
+    var totalKB=Math.round(totalBytes/1024);
+    $('imgSpaceMsg').innerHTML=
+      'Files selected: <b>'+arr.length+'</b><br>'+
+      'Space needed: <b>'+totalKB+' KB</b><br>'+
+      'Space free: <b>'+imgFreeKB+' KB</b><br><br>'+
+      'Files that do not fit will be skipped individually.';
+    $('imgSpaceModal').style.display='flex';
+    _imgPendingFiles=arr;
     return;
   }
-  var sz=fi.files[0].size, freeB=imgFreeKB*1024;
-  var tooLarge=sz>freeB;
-  if(warn) warn.style.display=tooLarge?'inline':'none';
-  if(btn){ btn.disabled=tooLarge; btn.title=tooLarge?'File too large — not enough space in image':''; }
+  imgUpQ=imgUpRun?imgUpQ.concat(arr):arr;
+  imgUpIdx=imgUpRun?imgUpIdx:0;
+  if(!imgUpRun){imgBatchUsed=new Set();imgUploadNext();}
 }
+
+function imgUploadNext(){
+  if(imgUpIdx>=imgUpQ.length){
+    imgUpRun=false;
+    $('imgUpMsg').textContent='Done — '+imgUpQ.length+' file'+(imgUpQ.length>1?'s':'')+' written';
+    $('imgUpMsg').style.color='var(--green)';
+    $('imgPw').style.display='none';
+    imgLoadDir(imgCurDir);
+    imgCloseDz();
+    return;
+  }
+  imgUpRun=true;
+  var file=imgUpQ[imgUpIdx];
+  // Space check
+  if(file.size>imgFreeKB*1024){
+    $('imgUpMsg').textContent='⚠ '+file.name+' too large ('+Math.round(file.size/1024)+' KB, only '+imgFreeKB+' KB free) — skipping';
+    $('imgUpMsg').style.color='var(--red)';
+    imgUpIdx++;imgUploadNext();return;
+  }
+  $('imgPw').style.display='block';
+  $('imgPbi').style.width='0%';$('imgPp').textContent='0%';
+  $('imgUpMsg').textContent='';
+  var fat83name=(window._imgFat83!==false)?toFat83(file.name,imgBatchUsed):file.name;
+  // When FAT83 off: firmware still truncates to 8.3 in FAT12 dir entry
+  var displayName=fat83name;
+  if(window._imgFat83===false){var d83=toFat83(file.name,new Set());if(d83!==file.name)displayName=file.name+' (stored as '+d83+')';}
+  $("imgPf").textContent='('+( imgUpIdx+1)+'/'+imgUpQ.length+') '+displayName;
+  var fpath=(imgCurDir==='/'?'/':imgCurDir+'/')+fat83name;
+  var fd=new FormData(); fd.append('file',file,fat83name);
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/api/img/put?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath));
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('imgPbi').style.width=p+'%';$('imgPp').textContent=p+'% ('+Math.round(e.loaded/1024)+'/'+Math.round(e.total/1024)+' KB)';}};
+  xhr.onload=function(){
+    try{var d=JSON.parse(xhr.responseText);
+      if(!d.ok){$('imgUpMsg').textContent='Error: '+(d.error||'failed');$('imgUpMsg').style.color='var(--red)';}
+    }catch(e){}
+    imgUpIdx++;imgRefreshSpace();imgUploadNext();
+  };
+  xhr.onerror=function(){$('imgUpMsg').textContent='Network error: '+file.name;$('imgUpMsg').style.color='var(--red)';imgUpIdx++;imgUploadNext();};
+  xhr.send(fd);
+}
+function imgCheckFileSize(){ /* no-op — kept for compat */ }
 // Fetch fresh space info without reloading dir listing
 function imgRefreshSpace(){
   fetch('/api/img/stat?img='+encodeURIComponent(imgCurImg))
@@ -1700,57 +1822,41 @@ function imgEnter(name){
   imgCurDir=(imgCurDir==='/'?'':imgCurDir)+'/'+name;
   imgLoadDir(imgCurDir);
 }
+var _imgDelPending=null;
 function imgDelete(name,isDir){
-  var fpath=(imgCurDir==='/'?'':imgCurDir)+'/'+name;
-  var msg=isDir?'Delete folder "'+name+'" and all contents?':'Delete file "'+name+'"?';
-  if(!confirm(msg)) return;
-  fetch('/api/img/rm?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath))
-    .then(function(r){return r.json();}).then(function(d){
-      if(d.ok) imgLoadDir(imgCurDir);
-      else alert('Error: '+(d.error||'delete failed'));
-    }).catch(function(){alert('Delete failed');});
+  _imgDelPending={name:name,isDir:isDir,fpath:(imgCurDir==='/'?'':imgCurDir)+'/'+name};
+  $('imgDelTitle').textContent=(isDir?'Delete Folder':'Delete File');
+  $('imgDelMsg').innerHTML=(isDir
+    ?'Delete folder <b>'+escHtml(name)+'</b> and all its contents?'
+    :'Delete file <b>'+escHtml(name)+'</b>?');
+  $('imgDelModal').classList.add('show');
 }
+function imgDelCancel(){$('imgDelModal').classList.remove('show');_imgDelPending=null;}
+function imgDelConfirm(){
+  $('imgDelModal').classList.remove('show');
+  if(!_imgDelPending)return;
+  var p=_imgDelPending;_imgDelPending=null;
+  fetch('/api/img/rm?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(p.fpath))
+    .then(function(r){return r.json();})
+    .then(function(d){if(d.ok)imgLoadDir(imgCurDir);else alert('Error: '+(d.error||'delete failed'));})
+    .catch(function(){alert('Delete failed');});
+}
+function imgOpenMkdir(){$('imgMkName').value='';$('imgMkModal').classList.add('show');setTimeout(function(){$('imgMkName').focus();},80);}
+function imgCloseMkdir(){$('imgMkModal').classList.remove('show');}
 function imgMkdir(){
-  var name=($('imgMkdirName').value||'').trim().toUpperCase().replace(/[^A-Z0-9_]/g,'');
-  if(!name){alert('Enter folder name (A-Z 0-9 _ only).');return;}
-  if(name.length>8) name=name.substring(0,8);
-  $('imgMkdirMsg').textContent='';
+  var name=($('imgMkName').value||'').trim();
+  if(!name){alert('Enter folder name.');return;}
+  if(name.length>64) name=name.substring(0,64);
+  imgCloseMkdir();
   fetch('/api/img/mkdir?img='+encodeURIComponent(imgCurImg)+
         '&dir='+encodeURIComponent(imgCurDir)+
         '&name='+encodeURIComponent(name))
     .then(function(r){return r.json();}).then(function(d){
-      if(d.ok){$('imgMkdirName').value='';$('imgMkdirMsg').textContent='';imgLoadDir(imgCurDir);}
-      else{$('imgMkdirMsg').textContent='Error: '+(d.error||'failed');$('imgMkdirMsg').style.color='var(--red)';}
-    }).catch(function(){$('imgMkdirMsg').textContent='Network error';$('imgMkdirMsg').style.color='var(--red)';});
+      if(d.ok) imgLoadDir(imgCurDir);
+      else alert('Error: '+(d.error||'mkdir failed'));
+    }).catch(function(){alert('Network error');});
 }
-function imgUpload(){
-  var fi=$('imgUpFile'); if(!fi||!fi.files||!fi.files.length){alert('Select a file first.');return;}
-  var file=fi.files[0];
-  // Client-side space check
-  if(file.size>imgFreeKB*1024){
-    $('imgUpMsg').textContent='File too large ('+Math.round(file.size/1024)+' KB needed, only '+imgFreeKB+' KB free)';
-    $('imgUpMsg').style.color='var(--red)'; return;
-  }
-  var fpath=(imgCurDir==='/'?'/':imgCurDir+'/')+file.name;
-  $('imgUpMsg').textContent='Writing '+file.name+'…'; $('imgUpMsg').style.color='var(--tx2)';
-  var fd=new FormData(); fd.append('file',file,file.name);
-  var xhr=new XMLHttpRequest();
-  xhr.open('POST','/api/img/put?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath));
-  xhr.upload.onprogress=function(e){
-    if(e.lengthComputable){
-      var pct=Math.round(e.loaded/e.total*100);
-      $('imgUpMsg').textContent='Uploading… '+pct+'%';
-    }
-  };
-  xhr.onload=function(){
-    try{var d=JSON.parse(xhr.responseText);
-      if(d.ok){$('imgUpMsg').textContent='Done — '+Math.round(d.bytes/1024)+' KB';$('imgUpMsg').style.color='var(--green)';fi.value='';imgLoadDir(imgCurDir);}
-      else{$('imgUpMsg').textContent='Error: '+(d.error||'failed');$('imgUpMsg').style.color='var(--red)';}
-    }catch(e){$('imgUpMsg').textContent='Error '+xhr.status;$('imgUpMsg').style.color='var(--red)';}
-  };
-  xhr.onerror=function(){$('imgUpMsg').textContent='Network error';$('imgUpMsg').style.color='var(--red)';};
-  xhr.send(fd);
-}
+function imgUpload(){ imgOpenDz(); } // legacy — open dropzone instead
 // Close modal on backdrop click
 document.addEventListener('click',function(e){
   var m=$('imgModal');
@@ -1786,32 +1892,35 @@ function gkCreate(){
       }
     }).catch(function(){spin('gkCrSp',false);$('gkCrMsg').textContent='Chyba';$('gkCrMsg').style.color='var(--red)';});
 }
+var _gkDelPending=null;
 function gkDelete(name){
-  if(!confirm('Delete '+name+' from GoTek image folder?')) return;
-  fetch('/api/delete?path='+encodeURIComponent(($('gkDir')?$('gkDir').textContent:'/gotek')+'/'+name))
-    .then(function(){gkRefresh();})
-    .catch(function(){alert('Delete failed');});
+  _gkDelPending=name;
+  $('delTitle').textContent='Delete File';
+  $('delMsg').innerHTML='Delete <b>'+escHtml(name)+'</b> from GoTek image folder?';
+  $('delModal').classList.add('show');
 }
-function gkUpload(){
-  var f=$('gkUpFile'); if(!f||!f.files||!f.files.length){alert('Select a file first.');return;}
-  var file=f.files[0];
-  var dir=$('gkDir')?$('gkDir').textContent:'/gotek';
-  $('gkUpProg').style.display='block';
-  $('gkUpBar').style.width='0%';
-  $('gkUpMsg').textContent='Uploading '+file.name+'…';
-  var fd=new FormData(); fd.append('file',file,file.name);
-  var xhr=new XMLHttpRequest();
-  xhr.open('POST','/api/upload?path='+encodeURIComponent(dir));
-  xhr.upload.onprogress=function(e){if(e.lengthComputable){var pct=Math.round(e.loaded/e.total*100);$('gkUpBar').style.width=pct+'%';$('gkUpMsg').textContent=pct+'% uploaded';}};
-  xhr.onload=function(){
-    var ok=xhr.status===200&&xhr.responseText.indexOf('OK')===0;
-    $('gkUpMsg').textContent=ok?'Upload complete!':'Upload error: '+xhr.status;
-    $('gkUpMsg').style.color=ok?'var(--green)':'var(--red)';
-    if(ok){setTimeout(function(){$('gkUpProg').style.display='none';f.value='';gkRefresh();},1500);}
-  };
-  xhr.onerror=function(){$('gkUpMsg').textContent='Network error';$('gkUpMsg').style.color='var(--red)';};
-  xhr.send(fd);
+function delCancel(){
+  $('delModal').classList.remove('show');
+  _delPending=null;_gkDelPending=null;
 }
+function delConfirm(){
+  $('delModal').classList.remove('show');
+  if(_gkDelPending){
+    var n=_gkDelPending;_gkDelPending=null;
+    fetch('/api/delete?path='+encodeURIComponent(($('gkDir')?$('gkDir').textContent:'/gotek')+'/'+n))
+      .then(function(){gkRefresh();})
+      .catch(function(){alert('Delete failed');});
+    return;
+  }
+  if(!_delPending)return;
+  var p=_delPending;_delPending=null;
+  log('Deleting: '+p.path);
+  fetch('/api/delete?path='+encodeURIComponent(p.path))
+    .then(function(r){return r.text();})
+    .then(function(m){log(m);fmLoadDir(fmPath);loadStatus();})
+    .catch(function(){log('ERROR: delete failed.');});
+}
+function gkUpload(){ gkOpenDz(); }
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 // ── end GoTek JS ─────────────────────────────────────────────────────────────
 function showTab(n){curTab=n;for(var i=0;i<7;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===3){if($("logLiveUpdate")&&$("logLiveUpdate").checked){if(!logTimer)logTimer=setInterval(logFetch,1000);logFetch();}}else{if(n!==3&&logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===3){if(!logTimer&&$("logLiveUpdate")&&$("logLiveUpdate").checked){logTimer=setInterval(logFetch,1000);}logFetch();}else if(n!==3){if(logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===4)loadSysinfo();if(n===5)cfgLoad();if(n===6)gkInit();}
@@ -2132,6 +2241,7 @@ function cfgLoad(){
   var umEl=$('cfgGotekUsbMode'); if(umEl){ umEl.value=String(c.gotekUsbMode||0); gkUsbModeNote(parseInt(umEl.value)); }
   var wpEl=$('cfgGotekFatWP'); if(wpEl) wpEl.value=String(c.gotekFatWP!=null?c.gotekFatWP:1);
   var wpRow=$('cfgGotekFatWPRow'); if(wpRow) wpRow.style.display=(c.gotekUsbMode===1)?'flex':'none';
+  var f83El=$('cfgImgFat83'); if(f83El) f83El.value=(c.imgFat83===false||c.imgFat83===0)?'0':'1';
     eapRestoreSaved();
     if(c.dhcp){$('rDhcp').checked=true;}else{$('rStatic').checked=true;}
     cfgDhcpToggle();
@@ -2175,6 +2285,7 @@ function cfgSave(){
   var gd=$('cfgGotekDir'); if(gd&&gd.value.trim()) params.set('gotekDir',gd.value.trim());
   var um=$('cfgGotekUsbMode'); if(um) params.set('gotekUsbMode',um.value);
   var wp=$('cfgGotekFatWP'); if(wp) params.set('gotekFatWP',wp.value);
+  var f83=$('cfgImgFat83'); if(f83) params.set('imgFat83',f83.value);
   if(!dhcp){
     params.set('ip',$('cfgIp').value.trim());
     params.set('mask',$('cfgMask').value.trim());
@@ -2337,6 +2448,7 @@ function loadSysinfo(){
           siRow(gkt,'USB mode', s.gotek_usb_mode===1 ? 'FAT32 virtual (FlashFloppy)' : 'Raw LBA (stock GoTek)');
           if(s.gotek_usb_mode===1) siRow(gkt,'FAT32 write-protect', s.gotek_fat_wp===1 ? 'ON — Windows cannot format' : 'OFF — writable');
           siRow(gkt,'Slots loaded',String(s.gotek_files||0));
+          siRow(gkt,'Image upload names',s.img_fat83!==false&&s.img_fat83!==0?'FAT 8.3 auto-convert':'VFAT long names');
           if(s.gotek_cur_slot>=0) siRow(gkt,'Active slot','<span style="color:var(--ok)">'+String(s.gotek_cur_slot).padStart(3,'0')+'</span>');
           siRow(gkt,'Virtual disk','1000 slots × 1.44 MB, 512 B sectors, raw (no FAT)');
         } else {
@@ -2494,7 +2606,17 @@ function fmLoadDir(path){
   }).catch(function(){spin('fmSp',false);log('ERROR: cannot read directory.');});
 }
 
-function doDelete(path,isDir){if(!confirm((isDir?'Delete folder "':'Delete file "')+path+'"'+(isDir?' and all contents?':'?')))return;log('Deleting: '+path);fetch('/api/delete?path='+encodeURIComponent(path)).then(function(r){return r.text();}).then(function(m){log(m);fmLoadDir(fmPath);loadStatus();}).catch(function(){log('ERROR: delete failed.');});}
+var _delPending=null;
+function doDelete(path,isDir){
+  _delPending={path:path,isDir:isDir};
+  $('delTitle').textContent=(isDir?'Delete Folder':'Delete File');
+  $('delMsg').innerHTML=(isDir
+    ?'Delete folder <b>'+escHtml(path.split('/').pop())+'</b> and all its contents?'
+    :'Delete file <b>'+escHtml(path.split('/').pop())+'</b>?');
+  $('delModal').classList.add('show');
+}
+
+
 function openMkdir(){$('mkName').value='';$('mkModal').classList.add('show');setTimeout(function(){$('mkName').focus();},80);}
 function closeMkdir(){$('mkModal').classList.remove('show');}
 function doMkdir(){var name=$('mkName').value.trim();if(!name)return;closeMkdir();var fp=(fmPath==='/'?'':fmPath)+'/'+name;fetch('/api/mkdir?path='+encodeURIComponent(fp)).then(function(r){return r.text();}).then(function(m){log(m);fmLoadDir(fmPath);}).catch(function(){log('ERROR: mkdir failed.');});}
@@ -2514,6 +2636,43 @@ function uploadNext(){
   var fd=new FormData();fd.append('file',file,file.name);xhr.send(fd);
 }
 (function(){var dz=$('dz'),tb=$('fmTbl');[dz,tb].forEach(function(el){el.addEventListener('dragover',function(e){e.preventDefault();openDz();dz.classList.add('ov');});el.addEventListener('dragleave',function(){dz.classList.remove('ov');});el.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('ov');if(e.dataTransfer.files.length)queueFiles(e.dataTransfer.files);});});})();
+// Image editor drag-and-drop
+(function(){
+  function imgDdInit(){
+    var dz=$('imgDz'),fl=$('imgFileList');
+    if(!dz||!fl)return;
+    [dz,fl].forEach(function(el){
+      el.addEventListener('dragover',function(e){e.preventDefault();imgOpenDz();dz.classList.add('ov');});
+      el.addEventListener('dragleave',function(e){if(!dz.contains(e.relatedTarget))dz.classList.remove('ov');});
+      el.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('ov');if(e.dataTransfer.files.length)imgQueueFiles(e.dataTransfer.files);});
+    });
+  }
+  // Run after DOM ready; also exposed so imgOpenModal can re-run
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',imgDdInit);
+  else imgDdInit();
+})();
+// GoTek drag-and-drop
+(function(){
+  function gkDdInit(){
+    var dz=$('gkUploadRow'),tb=$('gkTbl');
+    if(!dz||!tb)return;
+    [dz,tb].forEach(function(el){
+      el.addEventListener('dragover',function(e){
+        if(e.dataTransfer.types&&(e.dataTransfer.types.indexOf('Files')>=0||Array.from(e.dataTransfer.types).indexOf('Files')>=0)){
+          e.preventDefault();gkOpenDz();dz.classList.add('ov');
+        }
+      });
+      el.addEventListener('dragleave',function(e){if(!dz.contains(e.relatedTarget))dz.classList.remove('ov');});
+      el.addEventListener('drop',function(e){
+        if(e.dataTransfer.files&&e.dataTransfer.files.length){
+          e.preventDefault();dz.classList.remove('ov');gkQueueFiles(e.dataTransfer.files);
+        }
+      });
+    });
+  }
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',gkDdInit);
+  else gkDdInit();
+})();
 
 function renderBc(elId,path,fn){
   var bc=$(elId);bc.innerHTML='';
@@ -2551,6 +2710,47 @@ loadStatus();cdLoadDir('/');fmLoadDir('/');setInterval(loadStatus,5000);
 
 function clearLog(){$('log').textContent='Log cleared.\n';}
 </script>
+<div id="imgMkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1001;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div class="ct" style="margin-bottom:12px">&#128193; New Folder</div>
+    <input id="imgMkName" type="text" class="cfg-inp" style="width:100%;margin-bottom:12px" placeholder="Folder name" onkeydown="if(event.key==='Enter')imgMkdir();if(event.key==='Escape')imgCloseMkdir();">
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="imgCloseMkdir()">Cancel</button>
+      <button class="btn b" onclick="imgMkdir()">&#10003; Create</button>
+    </div>
+  </div>
+</div>
+
+<div id="imgSpaceModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1002;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:440px;width:90%">
+    <div class="ct" style="margin-bottom:10px;color:var(--red)">&#9888; Not enough space</div>
+    <div id="imgSpaceMsg" style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="imgSpaceCancel()">Cancel</button>
+      <button class="btn b" onclick="imgSpaceOk()">Upload anyway</button>
+    </div>
+  </div>
+</div>
+<div id="delModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1001;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div id="delTitle" class="ct" style="margin-bottom:12px;color:var(--red)">&#128465; Delete</div>
+    <div id="delMsg" style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="delCancel()">Cancel</button>
+      <button class="btn r" onclick="delConfirm()">&#128465; Delete</button>
+    </div>
+  </div>
+</div>
+<div id="imgDelModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1002;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div id="imgDelTitle" class="ct" style="margin-bottom:12px;color:var(--red)">&#128465; Delete</div>
+    <div id="imgDelMsg" style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="imgDelCancel()">Cancel</button>
+      <button class="btn r" onclick="imgDelConfirm()">&#128465; Delete</button>
+    </div>
+  </div>
+</div>
 <div id="mkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;align-items:center;justify-content:center">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
     <div class="ct" style="margin-bottom:12px">&#128193; New Folder</div>

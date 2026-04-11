@@ -212,6 +212,7 @@ struct Config {
   // 8=2dBm  20=5dBm  40=10dBm  60=15dBm  80=20dBm
   uint8_t  wifiTxPower;        // default 40 = 10 dBm
   bool     debugMode;          // true = verbose SCSI/API logs (default: off)
+  bool     imgFat83;           // true = auto-convert upload names to FAT 8.3 format (default: on)
   uint16_t win98StopMs;        // Win98 Stop/Pause detect timeout ms (0=off, default:1200)
   // Device mode — determines which USB profile is presented at boot.
   // 0 = CD-ROM (default, all existing functionality)
@@ -267,6 +268,7 @@ void loadConfig() {
   cfg.tlsCiphers= (uint8_t) prefs.getUInt("tlsCiphers",0);
   cfg.wifiTxPower = (uint8_t)constrain((int)prefs.getUChar("wifiTxPow", 40), 8, 80);
   cfg.debugMode   = prefs.getBool("debugMode", false);
+  cfg.imgFat83    = prefs.getBool("imgFat83",  true);
   cfg.win98StopMs = (uint16_t)constrain((int)prefs.getUShort("win98StopMs", 1200), 0, 9999);
   cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
   strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
@@ -315,6 +317,7 @@ void saveConfig() {
   prefs.putUInt("tlsCiphers", cfg.tlsCiphers);
   prefs.putUChar("wifiTxPow", cfg.wifiTxPower);
   prefs.putBool("debugMode",   cfg.debugMode);
+  prefs.putBool("imgFat83",    cfg.imgFat83);
   prefs.putUShort("win98StopMs", cfg.win98StopMs);
   prefs.putUChar("deviceMode",   cfg.deviceMode);
   prefs.putUChar("gotekUsbMode", cfg.gotekUsbMode);
@@ -432,6 +435,7 @@ void clearConfig() {
   cfg.tlsCiphers = 0;
   cfg.wifiTxPower = 40;  // 10 dBm default — reduces RF→PCM5102 interference
   cfg.debugMode   = false;
+  cfg.imgFat83    = true;
   cfg.win98StopMs = 1200;  // default: 1.2s
   cfg.deviceMode  = 0;     // default: CD-ROM
   gotekImgDir     = "/gotek";
@@ -2303,6 +2307,7 @@ static uint16_t imgFreeClustersM() {
 }
 
 // Build 8.3 name from dir entry bytes
+static const uint8_t lfnOffsets[13]={1,3,5,7,9,14,16,18,20,22,24,28,30};
 static void imgEntry83Name(const uint8_t* de, char* out) {
   bool isDir=(de[11]&0x10)!=0; int ni=0;
   for (int k=0;k<8&&de[k]!=' ';k++){char c=de[k];if(c==0x05)c=0xE5;out[ni++]=(char)tolower((unsigned char)c);}
@@ -2315,6 +2320,7 @@ static String imgScanDirAt(uint32_t lba, uint16_t count) {
   String j="["; bool first=true;
   uint16_t ePerSec=g_sBPB.bps/32;
   uint16_t sectors=(count+ePerSec-1)/ePerSec;
+  char lfnBuf[256]={}; uint8_t lfnChk=0;
   for (uint16_t s=0; s<sectors; s++) {
     g_sFile.seek((uint64_t)(lba+s)*g_sBPB.bps);
     g_sFile.read(g_secBuf, g_sBPB.bps);
@@ -2322,16 +2328,45 @@ static String imgScanDirAt(uint32_t lba, uint16_t count) {
       uint16_t idx=s*ePerSec+e; if(idx>=count) return j+"]";
       uint8_t* de=g_secBuf+e*32;
       if (de[0]==0x00) return j+"]";
-      // Skip: deleted, LFN, volume-label, dot-entries, and UTF-16LE garbage
-      // (UTF-16LE stores null bytes in name positions 1-7; valid 8.3 names never have 0x00 there)
-      if (de[0]==0xE5 || de[11]==0x0F || (de[11]&0x08) || de[0]=='.') continue;
-      if (de[1]==0x00 || de[3]==0x00 || de[5]==0x00) continue;  // UTF-16LE guard
+      if (de[0]==0xE5) { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
+      if ((de[11]&0x08)||de[0]=='.') { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
+      if (de[11]==0x0F) { // LFN entry
+        uint8_t seq=de[0]&0x3F; if(seq<1||seq>20) continue;
+        uint8_t entChk=de[13];
+        if(de[0]&0x40){
+          // Standard: highest-seq entry first → reset for new file
+          if(entChk!=lfnChk){ memset(lfnBuf,0,sizeof(lfnBuf)); }
+          lfnChk=entChk;
+        } else {
+          // Non-last entry: start if we have no checksum yet, or skip if mismatch
+          if(lfnChk==0){ memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=entChk; }
+          else if(entChk!=lfnChk){ memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=entChk; }
+        }
+        // Store chars at their correct position (by seq number)
+        int base=(seq-1)*13;
+        for(int ci=0;ci<13;ci++){
+          if(de[lfnOffsets[ci]]==0xFF&&de[lfnOffsets[ci]+1]==0xFF){ lfnBuf[base+ci]=0; break; }
+          char c=(char)de[lfnOffsets[ci]];
+          if(base+ci<(int)sizeof(lfnBuf)-1) lfnBuf[base+ci]=c;
+          if(c==0) break;
+        }
+        continue;
+      }
+      if (de[1]==0x00 || de[3]==0x00 || de[5]==0x00) { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
       bool isDir=(de[11]&0x10)!=0;
-      char name[13]; imgEntry83Name(de,name);
+      char name83[13]; imgEntry83Name(de,name83);
+      const char* dispName=name83;
+      if(lfnChk!=0 && lfnChk==lfnChksum(de)){
+        // Find string length (null-terminated)
+        int len=0; while(len<(int)sizeof(lfnBuf)-1&&lfnBuf[len]) len++;
+        if(len>0){ lfnBuf[len]=0; dispName=lfnBuf; }
+      }
+      memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0;
       uint32_t sz=(uint32_t)de[28]|((uint32_t)de[29]<<8)|((uint32_t)de[30]<<16)|((uint32_t)de[31]<<24);
       uint16_t fc=(uint16_t)de[26]|((uint16_t)de[27]<<8);
+      String nm=String(dispName); nm.replace("\\","\\\\"); nm.replace("\"","\\\"");
       if(!first)j+=","; first=false;
-      j+="{\"n\":\""+String(name)+"\",\"d\":"+(isDir?"true":"false")+",\"s\":"+String(sz)+",\"c\":"+String(fc)+"}";
+      j+="{\"n\":\""+nm+"\",\"d\":"+(isDir?"true":"false")+",\"s\":"+String(sz)+",\"c\":"+String(fc)+"}";
     }
   }
   return j+"]";
@@ -2355,10 +2390,11 @@ static uint16_t imgNavPath(const String& path) {
   if (path=="/"||path=="") return 0;
   String p=path; if(p[0]=='/')p=p.substring(1);
   uint16_t curClu=0;
+  char navLfnBuf[256]={}; uint8_t navLfnChk=0;
   while (p.length()) {
     int sl=p.indexOf('/'); String part=(sl<0)?p:p.substring(0,sl); p=(sl<0)?"":p.substring(sl+1);
     part.toUpperCase();
-    bool found=false;
+    bool found=false; navLfnChk=0; memset(navLfnBuf,0,sizeof(navLfnBuf));
     uint16_t scanClu=curClu;
     do {
       uint32_t scanLBA=(scanClu<2)?g_sBPB.rootLBA:imgCluLBA(g_sBPB,scanClu);
@@ -2369,10 +2405,27 @@ static uint16_t imgNavPath(const String& path) {
         for (uint16_t e=0;e<ePerSec;e++){
           uint16_t idx=s*ePerSec+e; if(idx>=scanCnt||g_secBuf[e*32]==0) goto nextClu;
           uint8_t*de=g_secBuf+e*32;
-          if(de[0]==0xE5||de[11]==0x0F||(de[11]&0x08)||!(de[11]&0x10)) continue;
-          if(de[1]==0x00||de[3]==0x00||de[5]==0x00) continue; // UTF-16LE guard
-          char nm[13]; imgEntry83Name(de,nm); String nmU=String(nm);nmU.toUpperCase();
-          if(nmU==part){curClu=(uint16_t)de[26]|((uint16_t)de[27]<<8);found=true;break;}
+          if(de[0]==0xE5||(de[11]&0x08)) { navLfnChk=0; memset(navLfnBuf,0,sizeof(navLfnBuf)); continue; }
+          if(de[11]==0x0F){ // LFN entry
+            uint8_t seq=de[0]&0x3F; if(!seq||seq>20) continue;
+            uint8_t ec=de[13];
+            if(de[0]&0x40){ if(ec!=navLfnChk)memset(navLfnBuf,0,sizeof(navLfnBuf)); navLfnChk=ec; }
+            else{ if(!navLfnChk){memset(navLfnBuf,0,sizeof(navLfnBuf));navLfnChk=ec;} else if(ec!=navLfnChk){memset(navLfnBuf,0,sizeof(navLfnBuf));navLfnChk=ec;} }
+            int base=(seq-1)*13;
+            for(int ci=0;ci<13;ci++){if(de[lfnOffsets[ci]]==0xFF&&de[lfnOffsets[ci]+1]==0xFF){navLfnBuf[base+ci]=0;break;}char c=(char)de[lfnOffsets[ci]];if(base+ci<254)navLfnBuf[base+ci]=c;if(!c)break;}
+            continue;
+          }
+          if(!(de[11]&0x10)){navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));continue;} // not a dir
+          if(de[1]==0x00||de[3]==0x00||de[5]==0x00){navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));continue;}
+          // Check LFN match first, then 8.3
+          bool match=false;
+          if(navLfnChk&&navLfnChk==lfnChksum(de)){
+            int len=0;while(len<254&&navLfnBuf[len])len++;navLfnBuf[len]=0;
+            String lu=String(navLfnBuf);lu.toUpperCase();match=(lu==part);
+          }
+          if(!match){char nm[13];imgEntry83Name(de,nm);String nmU=String(nm);nmU.toUpperCase();match=(nmU==part);}
+          navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));
+          if(match){curClu=(uint16_t)de[26]|((uint16_t)de[27]<<8);found=true;break;}
         }
       }
       nextClu:
@@ -2387,7 +2440,9 @@ static uint16_t imgNavPath(const String& path) {
 // Find dir entry by name → byte offset in image, or -1
 static int64_t imgFindEntry(uint16_t dirClu, const String& name83) {
   String target=name83; target.toUpperCase();
+  static const uint8_t lfnOff2[13]={1,3,5,7,9,14,16,18,20,22,24,28,30};
   uint16_t clu=dirClu;
+  char lfnBuf2[256]=""; int lfnPos2=0; uint8_t lfnChk2=0; uint8_t lfnExp2=0;
   do {
     uint32_t lba=(clu<2)?g_sBPB.rootLBA:imgCluLBA(g_sBPB,clu);
     uint16_t cnt=(clu<2)?g_sBPB.rde:(uint16_t)(g_sBPB.spc*g_sBPB.bps/32);
@@ -2398,8 +2453,22 @@ static int64_t imgFindEntry(uint16_t dirClu, const String& name83) {
         uint16_t idx=s*ePerSec+e; if(idx>=cnt) return -1;
         uint8_t*de=g_secBuf+e*32;
         if(de[0]==0x00) return -1;
-        if(de[0]==0xE5||de[11]==0x0F||(de[11]&0x08)) continue;
-        if(de[1]==0x00||de[3]==0x00||de[5]==0x00) continue; // UTF-16LE guard
+        if(de[0]==0xE5||(de[11]&0x08)){lfnPos2=0;lfnExp2=0;continue;}
+        if(de[11]==0x0F){
+          uint8_t seq=de[0]&0x3F;
+          if(de[0]&0x40){memset(lfnBuf2,0,sizeof(lfnBuf2));lfnPos2=0;lfnChk2=de[13];lfnExp2=seq;}
+          else if(seq!=lfnExp2||de[13]!=lfnChk2){lfnPos2=0;lfnExp2=0;continue;}
+          int base=(seq-1)*13;
+          for(int ci=0;ci<13;ci++){char c=(char)de[lfnOff2[ci]];if(de[lfnOff2[ci]]==0xFF&&de[lfnOff2[ci]+1]==0xFF)c=0;if(base+ci<(int)sizeof(lfnBuf2)-1)lfnBuf2[base+ci]=c;}
+          if(base+13>lfnPos2)lfnPos2=base+13; lfnExp2=seq-1; continue;
+        }
+        if(de[1]==0x00||de[3]==0x00||de[5]==0x00){lfnPos2=0;lfnExp2=0;continue;}
+        if(lfnPos2>0&&lfnChk2==lfnChksum(de)){
+          lfnBuf2[lfnPos2<(int)sizeof(lfnBuf2)?(size_t)lfnPos2:sizeof(lfnBuf2)-1]=0;
+          String lfnU=String(lfnBuf2); lfnU.toUpperCase();
+          if(lfnU==target){lfnPos2=0;lfnExp2=0;return (int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;}
+        }
+        lfnPos2=0; lfnExp2=0;
         char nm[13]; imgEntry83Name(de,nm); String nmU=String(nm);nmU.toUpperCase();
         if(nmU==target) return (int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;
       }
@@ -2445,6 +2514,113 @@ static void imgMakeDirEntry(uint8_t* de, const char* name83, uint32_t size, uint
   de[28]=(uint8_t)size;de[29]=(uint8_t)(size>>8);de[30]=(uint8_t)(size>>16);de[31]=(uint8_t)(size>>24);
 }
 
+// ── VFAT LFN support ─────────────────────────────────────────────────────────
+// LFN checksum of 11-byte 8.3 name field
+static uint8_t lfnChksum(const uint8_t* de) {
+  uint8_t s=0;
+  for(int i=0;i<11;i++) s=((s&1)?0x80:0)+(s>>1)+de[i];
+  return s;
+}
+
+// Build one 32-byte LFN directory entry
+static void imgMakeLfnEntry(uint8_t* le, uint8_t seq, const char* name, int totalChars, uint8_t chk) {
+  memset(le,0xFF,32);
+  le[11]=0x0F; le[12]=0x00; le[13]=chk; le[26]=0x00; le[27]=0x00;
+  le[0]=seq;
+  int base=((seq&0x3F)-1)*13;
+  for(int i=0;i<13;i++){
+    int ci=base+i;
+    if(ci<totalChars){ le[lfnOffsets[i]]=(uint8_t)(unsigned char)name[ci]; le[lfnOffsets[i]+1]=0x00; }
+    else if(ci==totalChars){ le[lfnOffsets[i]]=0x00; le[lfnOffsets[i]+1]=0x00; }
+    // else 0xFF padding (already set)
+  }
+}
+
+// Find N consecutive free dir slots → offset of first, or -1
+static int64_t imgFindFreeSlots(uint16_t dirClu, int n) {
+  int64_t runStart=-1; int runLen=0;
+  uint16_t clu=dirClu;
+  do {
+    uint32_t lba=(clu<2)?g_sBPB.rootLBA:imgCluLBA(g_sBPB,clu);
+    uint16_t cnt=(clu<2)?g_sBPB.rde:(uint16_t)(g_sBPB.spc*g_sBPB.bps/32);
+    uint16_t ePerSec=g_sBPB.bps/32;
+    for(uint16_t s=0;s<(cnt+ePerSec-1)/ePerSec;s++){
+      g_sFile.seek((uint64_t)(lba+s)*g_sBPB.bps); g_sFile.read(g_secBuf,g_sBPB.bps);
+      for(uint16_t e=0;e<ePerSec;e++){
+        uint16_t idx=s*ePerSec+e; if(idx>=cnt) goto ffsEnd;
+        uint8_t f=g_secBuf[e*32];
+        if(f==0x00||f==0xE5){
+          if(runStart<0) runStart=(int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;
+          if(++runLen>=n) goto ffsEnd;
+        } else { runStart=-1; runLen=0; }
+      }
+    }
+    if(clu<2) break;
+    clu=imgFat12GetM(clu);
+  } while(clu>=2&&clu<0xFF8);
+  ffsEnd:
+  return (runLen>=n)?runStart:-1;
+}
+
+// Write dir entry with optional VFAT LFN entries; returns 8.3 slot offset or -1
+static int64_t imgWriteDirEntryLfn(uint16_t dirClu, const char* longName,
+                                    uint32_t size, uint16_t firstClu, bool isDir) {
+  int nameLen=(int)strlen(longName);
+  // Build 8.3 name field (11 bytes, space-padded)
+  const char* dot=strrchr(longName,'.');
+  int baseLen=dot?(int)(dot-longName):nameLen;
+  char name83[11]; memset(name83,' ',11);
+  int bi=0;
+  for(int i=0;i<baseLen&&bi<8;i++){
+    char c=toupper((unsigned char)longName[i]);
+    if(c<0x21||c==0x22||c=='*'||c=='/'||c==':'||c=='<'||c=='>'||c=='?'||c=='\\'||c=='|') c='_';
+    name83[bi++]=c;
+  }
+  if(dot){ const char* ext=dot+1; int ei=0;
+    for(int i=0;ext[i]&&ei<3;i++){
+      char c=toupper((unsigned char)ext[i]);
+      if(c<0x21||c==0x22||c=='*'||c=='/'||c==':'||c=='<'||c=='>'||c=='?'||c=='\\'||c=='|') c='_';
+      name83[8+ei++]=c;
+    }
+  }
+  // 32-byte 8.3 dir entry
+  uint8_t de[32]; memset(de,0,32);
+  memcpy(de,name83,11);
+  de[11]=isDir?0x10:0x20;
+  de[22]=0x00;de[23]=0x00;de[24]=0x21;de[25]=0x5A;
+  de[26]=(uint8_t)firstClu;de[27]=(uint8_t)(firstClu>>8);
+  de[28]=(uint8_t)size;de[29]=(uint8_t)(size>>8);de[30]=(uint8_t)(size>>16);de[31]=(uint8_t)(size>>24);
+
+  // Determine if LFN needed
+  bool needLfn=(baseLen>8)||(dot&&(int)strlen(dot+1)>3);
+  if(!needLfn) for(int i=0;i<nameLen&&!needLfn;i++) if((unsigned char)longName[i]>127||(unsigned char)longName[i]<0x21) needLfn=true;
+  // Also check for lowercase or spaces
+  for(int i=0;i<nameLen&&!needLfn;i++) if(longName[i]>='a'&&longName[i]<='z') needLfn=true;
+  for(int i=0;i<nameLen&&!needLfn;i++) if(longName[i]==' ') needLfn=true;
+
+  if(!needLfn){
+    int64_t slot=imgFindFreeSlot(dirClu);
+    if(slot<0) return -1;
+    g_sFile.seek((uint64_t)slot); g_sFile.write(de,32);
+    return slot;
+  }
+  // LFN: need ceil(nameLen/13)+1 consecutive slots
+  uint8_t chk=lfnChksum((const uint8_t*)name83);
+  int lfnCount=(nameLen+12)/13;
+  int64_t firstSlot=imgFindFreeSlots(dirClu,lfnCount+1);
+  if(firstSlot<0) return -1;
+  // Write LFN entries (last sequence first in file)
+  for(int i=lfnCount;i>=1;i--){
+    uint8_t le[32]; uint8_t seq=(uint8_t)i|(i==lfnCount?0x40:0x00);
+    imgMakeLfnEntry(le,seq,longName,nameLen,chk);
+    g_sFile.seek((uint64_t)(firstSlot+(int64_t)(lfnCount-i)*32)); // highest seq at slot 0
+    g_sFile.write(le,32);
+  }
+  int64_t de83=firstSlot+(int64_t)lfnCount*32;
+  g_sFile.seek((uint64_t)de83); g_sFile.write(de,32);
+  return de83;
+}
+
 // ── FAT12 API handlers ────────────────────────────────────────────────────────
 
 // Create directory inside a .img file
@@ -2456,7 +2632,7 @@ void handleImgMkdir() {
   String dirPath = httpServer.hasArg("dir")  ? httpServer.arg("dir")  : "/";
   String name    = httpServer.hasArg("name") ? httpServer.arg("name") : "";
   name.toUpperCase();
-  if (!imgPath.length()||!name.length()||name.length()>8) {
+  if (!imgPath.length()||!name.length()||name.length()>255) {
     httpServer.send(400,"application/json","{\"error\":\"Missing/invalid params\"}"); return;
   }
   if (!gkMtxTake()) { httpServer.send(503,"application/json","{\"error\":\"SD busy\"}"); return; }
@@ -2500,15 +2676,12 @@ void handleImgMkdir() {
   de[26]=(uint8_t)parentClu; de[27]=(uint8_t)(parentClu>>8);
   g_sFile.write(de,32);
   // Create dir entry in parent
-  int64_t slot=imgFindFreeSlot(dirClu);
+  int64_t slot=imgWriteDirEntryLfn(dirClu, name.c_str(), 0, nc, true);
   if (slot<0) {
     imgFat12SetM(nc,0);
     imgCloseSession(); gkMtxGive();
     httpServer.send(507,"application/json","{\"error\":\"Parent dir full\"}"); return;
   }
-  uint8_t dirEntry[32];
-  imgMakeDirEntry(dirEntry, name.c_str(), 0, nc, true);
-  g_sFile.seek((uint64_t)slot); g_sFile.write(dirEntry,32);
   imgCloseSession();
   gkMtxGive();
   gkInvalidateForPath(imgPath);
@@ -2554,7 +2727,20 @@ void handleImgRm() {
   g_sFile.seek((uint64_t)entOff);
   uint8_t de[32]; g_sFile.read(de,32);
   uint16_t fc=(uint16_t)de[26]|((uint16_t)de[27]<<8);
-  uint8_t del=0xE5; g_sFile.seek((uint64_t)entOff); g_sFile.write(&del,1);
+  uint8_t del=0xE5;
+  // Also mark any preceding LFN entries as deleted
+  {
+    uint8_t chk=lfnChksum(de);
+    int64_t off=entOff-32;
+    while(off>=0){
+      g_sFile.seek((uint64_t)off); uint8_t le[32]; g_sFile.read(le,32);
+      if(le[11]!=0x0F||le[13]!=chk||le[0]==0xE5) break; // not an LFN entry for this file
+      g_sFile.seek((uint64_t)off); g_sFile.write(&del,1);
+      if(le[0]&0x40) break; // this was the last (highest seq) LFN entry
+      off-=32;
+    }
+  }
+  g_sFile.seek((uint64_t)entOff); g_sFile.write(&del,1);
   if(fc>=2) imgFreeChainM(fc);
   imgCloseSession();
   gkMtxGive();
@@ -2681,12 +2867,8 @@ void handleImgPut() {
     if(!_iuOk||!g_sOpen){imgCloseSession();return;}
     if(_iuSecOff>0){memset(_iuSec+_iuSecOff,0,g_sBPB.bps-_iuSecOff);_iuFlushSector();}
     if(_iuFirst){
-      int64_t slotOff=imgFindFreeSlot(_iuDir);
-      if(slotOff>=0){
-        uint8_t de[32]; imgMakeDirEntry(de,_iuFile.c_str(),_iuWrit,_iuFirst,false);
-        g_sFile.seek((uint64_t)slotOff);g_sFile.write(de,32);
-        _iuDone=true;
-      }
+      int64_t slotOff=imgWriteDirEntryLfn(_iuDir,_iuFile.c_str(),_iuWrit,_iuFirst,false);
+      if(slotOff>=0){ _iuDone=true; }
     }
     imgCloseSession(); _iuOk=false; _iuDone=true;
     dualPrint.printf("[IMG] Upload done: %lu B\n",(unsigned long)_iuWrit);
@@ -3960,6 +4142,7 @@ void handleApiSysinfo() {
   j += ",\"dos_compat\":" + String(cfg.dosCompat ? "true" : "false");
   j += ",\"dos_driver\":" + String(cfg.dosDriver);
   j += ",\"debug_mode\":" + String(cfg.debugMode ? "true" : "false");
+  j += ",\"img_fat83\":" + String(cfg.imgFat83  ? "true" : "false");
   j += ",\"win98_stop_ms\":" + String(cfg.win98StopMs);
   j += ",\"device_mode\":" + String(cfg.deviceMode);
   j += ",\"gotek_dir\":\"" + jsonEsc(gotekImgDir.c_str()) + "\"";
@@ -4181,6 +4364,7 @@ void handleApiGetConfig() {
   j += ",\"dosCompat\":" + String(cfg.dosCompat ? "true" : "false");
   j += ",\"dosDriver\":" + String(cfg.dosDriver);
   j += ",\"debugMode\":" + String(cfg.debugMode ? "true" : "false");
+  j += ",\"imgFat83\":" + String(cfg.imgFat83  ? "true" : "false");
   j += ",\"win98StopMs\":" + String(cfg.win98StopMs);
   j += ",\"gotekUsbMode\":" + String(cfg.gotekUsbMode);
   j += ",\"gotekFatWP\":"  + String(cfg.gotekFatWP);
@@ -4293,6 +4477,10 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("dosDriver"))  {
     cfg.dosDriver=(uint8_t)constrain(httpServer.arg("dosDriver").toInt(),0,3); changed=true;
     if (cfg.dosDriver > 0) cfg.dosCompat=true;  // any specific driver mode requires dosCompat ON
+  }
+  if (httpServer.hasArg("imgFat83")) {
+    String v=httpServer.arg("imgFat83");
+    cfg.imgFat83=(v=="1"||v=="true"||v=="on"); changed=true;
   }
   if (httpServer.hasArg("win98StopMs")) {
     cfg.win98StopMs=(uint16_t)constrain(httpServer.arg("win98StopMs").toInt(),0,9999); changed=true;
@@ -5392,6 +5580,7 @@ void printConfig(bool showRuntime = true) {
     dualPrint.printf("  Current slot  : %d  (last GoTek access)\n", gkCurSlot);
     dualPrint.printf("  USB block cnt : %u  (%.2f MB)\n",
       gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
+    dualPrint.printf("  Image FAT 8.3 : %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
     dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   }
   // DOS compat + driver (driver jen kdyz compat=ON)
@@ -5563,6 +5752,7 @@ void printStatus() {
                           : "GoTek RAW (all slots)");
     dualPrint.printf("  USB sectors   : %u  (%.2f MB)\n",
       gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
+    dualPrint.printf("  Image FAT 8.3 : %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
     dualPrint.println(F("  └────────────────────────────────────────────────┘"));
 
   } else {
@@ -5730,6 +5920,7 @@ void printHelp() {
   dualPrint.println(F("  reboot                Restart ESP32"));
   dualPrint.println(F("  help                  Show this help"));
   dualPrint.println(F("  set debug on|off      Verbose SCSI/API logging (default: off, saved)"));
+  dualPrint.println(F("  set img-fat83 on|off  ON=FAT 8.3 auto-convert (~N dedup), OFF=VFAT long names"));
 
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
@@ -5817,6 +6008,12 @@ void processCommand(String &line) {
     cfg.debugMode = (v == "on" || v == "1" || v == "yes");
     saveConfig();
     dualPrint.printf("[OK]  Debug logging: %s\n", cfg.debugMode ? "ON" : "OFF");
+  }
+  else if (line.startsWith("set img-fat83") || line.startsWith("SET IMG-FAT83")) {
+    String v = line.substring(13); v.trim(); v.toLowerCase();
+    cfg.imgFat83 = (v == "on" || v == "1" || v == "yes");
+    saveConfig();
+    dualPrint.printf("[OK]  Image FAT 8.3: %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
   }
   else if (line.startsWith("set win98-stop") || line.startsWith("SET WIN98-STOP")) {
     String v = line.substring(14); v.trim();
