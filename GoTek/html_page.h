@@ -1123,7 +1123,7 @@ function gkApplyTabVisibility(isGotek){
 function gkInit(){
   fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){
     gkIsGotek=(s.device_mode===1);
-    window._imgFat83=(s.img_fat83!==false&&s.img_fat83!==0);
+    _imgFat83=(s.img_fat83!==false&&s.img_fat83!==0);
     gkApplyTabVisibility(gkIsGotek);
     var notice=$('gkCdromNotice'), panel=$('gkActivePanel');
     if(notice) notice.style.display=gkIsGotek?'none':'block';
@@ -1730,6 +1730,7 @@ function toFat83(name, used) {
   return cb.slice(0, 8) + suffix;
 }
 var imgBatchUsed = new Set();
+var _imgFat83=true; // default ON, updated from config/status
 var imgUpQ=[],imgUpIdx=0,imgUpRun=false;
 function imgOpenDz(){$('imgDz').style.display='block';}
 function imgCloseDz(){$('imgDz').style.display='none';$('imgPw').style.display='none';$('imgUpFile').value='';imgUpQ=[];imgUpIdx=0;imgUpRun=false;}
@@ -1785,10 +1786,10 @@ function imgUploadNext(){
   $('imgPw').style.display='block';
   $('imgPbi').style.width='0%';$('imgPp').textContent='0%';
   $('imgUpMsg').textContent='';
-  var fat83name=(window._imgFat83!==false)?toFat83(file.name,imgBatchUsed):file.name;
+  var fat83name=_imgFat83?toFat83(file.name,imgBatchUsed):file.name;
   // When FAT83 off: firmware still truncates to 8.3 in FAT12 dir entry
   var displayName=fat83name;
-  if(window._imgFat83===false){var d83=toFat83(file.name,new Set());if(d83!==file.name)displayName=file.name+' (stored as '+d83+')';}
+  if(!_imgFat83){var d83=toFat83(file.name,new Set());if(d83!==file.name)displayName=file.name+' (stored as '+d83+')';}
   $("imgPf").textContent='('+( imgUpIdx+1)+'/'+imgUpQ.length+') '+displayName;
   var fpath=(imgCurDir==='/'?'/':imgCurDir+'/')+fat83name;
   var fd=new FormData(); fd.append('file',file,fat83name);
@@ -1847,6 +1848,8 @@ function imgMkdir(){
   var name=($('imgMkName').value||'').trim();
   if(!name){alert('Enter folder name.');return;}
   if(name.length>64) name=name.substring(0,64);
+  // In FAT 8.3 mode, folder names must also follow 8.3 rules (DOS compatibility)
+  if(_imgFat83) name=toFat83(name, new Set());
   imgCloseMkdir();
   fetch('/api/img/mkdir?img='+encodeURIComponent(imgCurImg)+
         '&dir='+encodeURIComponent(imgCurDir)+
@@ -2242,6 +2245,7 @@ function cfgLoad(){
   var wpEl=$('cfgGotekFatWP'); if(wpEl) wpEl.value=String(c.gotekFatWP!=null?c.gotekFatWP:1);
   var wpRow=$('cfgGotekFatWPRow'); if(wpRow) wpRow.style.display=(c.gotekUsbMode===1)?'flex':'none';
   var f83El=$('cfgImgFat83'); if(f83El) f83El.value=(c.imgFat83===false||c.imgFat83===0)?'0':'1';
+  _imgFat83=(c.imgFat83!==false&&c.imgFat83!==0); // sync immediately on config load
     eapRestoreSaved();
     if(c.dhcp){$('rDhcp').checked=true;}else{$('rStatic').checked=true;}
     cfgDhcpToggle();
@@ -2296,6 +2300,7 @@ function cfgSave(){
   fetch('/api/config/save?'+params.toString()).then(function(r){return r.text();}).then(function(m){
     spin('cfgActSp',false);$('cfgSaveBtn').disabled=false;
     cfgMsg('cfgActMsg',m,m.indexOf('OK')===0);
+    var f83sv=$('cfgImgFat83');if(f83sv)_imgFat83=(f83sv.value!=='0'); // sync on save
     log(m);
   }).catch(function(){spin('cfgActSp',false);$('cfgSaveBtn').disabled=false;cfgMsg('cfgActMsg','ERROR: request failed',false);});
 }

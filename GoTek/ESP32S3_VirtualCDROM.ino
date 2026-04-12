@@ -2300,6 +2300,31 @@ static uint16_t imgFindFreeM() {
 static void imgFreeChainM(uint16_t clu) {
   while (clu>=2&&clu<0xFF8){uint16_t n=imgFat12GetM(clu);imgFat12SetM(clu,0);clu=n;}
 }
+// Recursively free all file/dir clusters inside a directory cluster chain
+static void imgFreeDirContentsM(uint16_t dirClu) {
+  uint16_t clu=dirClu;
+  while(clu>=2&&clu<0xFF8) {
+    uint32_t lba=imgCluLBA(g_sBPB,clu);
+    uint16_t cnt=(uint16_t)(g_sBPB.spc*g_sBPB.bps/32);
+    uint16_t ePerSec=g_sBPB.bps/32;
+    for(uint16_t s=0;s<(cnt+ePerSec-1)/ePerSec;s++) {
+      g_sFile.seek((uint64_t)(lba+s)*g_sBPB.bps);
+      g_sFile.read(g_secBuf,g_sBPB.bps);
+      for(uint16_t e=0;e<ePerSec;e++) {
+        uint8_t* de=g_secBuf+e*32;
+        if(de[0]==0x00) goto nextDirClu;
+        if(de[0]==0xE5||de[11]==0x0F||de[11]==0x08) continue;
+        if(de[0]=='.'||(de[0]=='.'&&de[1]=='.')) continue; // skip . and ..
+        uint16_t fc=(uint16_t)de[26]|((uint16_t)de[27]<<8);
+        bool isDir=(de[11]&0x10)!=0;
+        if(isDir && fc>=2) imgFreeDirContentsM(fc); // recurse
+        if(fc>=2) imgFreeChainM(fc); // free this entry's clusters
+      }
+    }
+    nextDirClu:
+    clu=imgFat12GetM(clu);
+  }
+}
 static uint16_t imgFreeClustersM() {
   uint16_t cnt=0;
   for (uint16_t c=2;c<(uint16_t)(g_sBPB.dataClu+2)&&c<0xFF8;c++) if(imgFat12GetM(c)==0) cnt++;
@@ -2307,6 +2332,26 @@ static uint16_t imgFreeClustersM() {
 }
 
 // Build 8.3 name from dir entry bytes
+// UTF-8 → UTF-16LE codepoints. Returns char count.
+static int utf8ToUtf16(const char* utf8, uint16_t* out, int maxChars) {
+  const uint8_t* p=(const uint8_t*)utf8; int n=0;
+  while(*p && n<maxChars){
+    uint32_t cp;
+    if(*p<0x80)                          { cp=*p++;                                             }
+    else if((*p&0xE0)==0xC0 && p[1])    { cp=((*p&0x1F)<<6)|(p[1]&0x3F); p+=2;               }
+    else if((*p&0xF0)==0xE0 && p[1]&&p[2]){ cp=((*p&0x0F)<<12)|((p[1]&0x3F)<<6)|(p[2]&0x3F); p+=3; }
+    else                                 { p++; continue; }
+    out[n++]=(uint16_t)(cp&0xFFFF);
+  }
+  return n;
+}
+// Single UTF-16LE codepoint → UTF-8 bytes. Returns byte count.
+static int utf16CharToUtf8(uint16_t cp, char* buf) {
+  if(cp<0x80)  { buf[0]=(char)cp; return 1; }
+  if(cp<0x800) { buf[0]=(char)(0xC0|(cp>>6)); buf[1]=(char)(0x80|(cp&0x3F)); return 2; }
+  buf[0]=(char)(0xE0|(cp>>12)); buf[1]=(char)(0x80|((cp>>6)&0x3F)); buf[2]=(char)(0x80|(cp&0x3F)); return 3;
+}
+
 static const uint8_t lfnOffsets[13]={1,3,5,7,9,14,16,18,20,22,24,28,30};
 static void imgEntry83Name(const uint8_t* de, char* out) {
   bool isDir=(de[11]&0x10)!=0; int ni=0;
@@ -2329,42 +2374,51 @@ static String imgScanDirAt(uint32_t lba, uint16_t count) {
       uint8_t* de=g_secBuf+e*32;
       if (de[0]==0x00) return j+"]";
       if (de[0]==0xE5) { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
-      if ((de[11]&0x08)||de[0]=='.') { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
-      if (de[11]==0x0F) { // LFN entry
+      if (de[11]==0x0F) { // LFN entry — must check BEFORE volume-label (0x0F&0x08=0x08!)
         uint8_t seq=de[0]&0x3F; if(seq<1||seq>20) continue;
         uint8_t entChk=de[13];
         if(de[0]&0x40){
-          // Standard: highest-seq entry first → reset for new file
           if(entChk!=lfnChk){ memset(lfnBuf,0,sizeof(lfnBuf)); }
           lfnChk=entChk;
         } else {
-          // Non-last entry: start if we have no checksum yet, or skip if mismatch
           if(lfnChk==0){ memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=entChk; }
           else if(entChk!=lfnChk){ memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=entChk; }
         }
-        // Store chars at their correct position (by seq number)
-        int base=(seq-1)*13;
-        for(int ci=0;ci<13;ci++){
-          if(de[lfnOffsets[ci]]==0xFF&&de[lfnOffsets[ci]+1]==0xFF){ lfnBuf[base+ci]=0; break; }
-          char c=(char)de[lfnOffsets[ci]];
-          if(base+ci<(int)sizeof(lfnBuf)-1) lfnBuf[base+ci]=c;
-          if(c==0) break;
+        // Store UTF-16LE codepoints in upper half of lfnBuf (as uint16_t tmp[62])
+        { int base=(seq-1)*13;
+          uint16_t* lfnTmp=(uint16_t*)(void*)(lfnBuf+128);
+          for(int ci=0;ci<13;ci++){
+            uint16_t cp=(uint16_t)de[lfnOffsets[ci]]|((uint16_t)de[lfnOffsets[ci]+1]<<8);
+            if(cp==0xFFFF) break;
+            if(base+ci<62) lfnTmp[base+ci]=cp;
+            if(cp==0) break;
+          }
         }
+        if(cfg.debugMode) dualPrint.printf("[LFN DBG] seq=0x%02X chk=0x%02X base=%d\n", de[0], entChk, (seq-1)*13);
         continue;
       }
+      // Volume label or dot-entry (checked AFTER LFN, since 0x0F&0x08=0x08 would false-match)
+      if ((de[11]&0x08)||de[0]=='.') { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
       if (de[1]==0x00 || de[3]==0x00 || de[5]==0x00) { memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0; continue; }
       bool isDir=(de[11]&0x10)!=0;
       char name83[13]; imgEntry83Name(de,name83);
-      const char* dispName=name83;
-      if(lfnChk!=0 && lfnChk==lfnChksum(de)){
-        // Find string length (null-terminated)
-        int len=0; while(len<(int)sizeof(lfnBuf)-1&&lfnBuf[len]) len++;
-        if(len>0){ lfnBuf[len]=0; dispName=lfnBuf; }
+      uint8_t computed=lfnChksum(de);
+      String nm;
+      if(lfnChk!=0 && lfnChk==computed){
+        uint16_t* lfnTmp=(uint16_t*)(void*)(lfnBuf+128);
+        char utf8out[192]={}; int pos=0;
+        for(int ci=0;ci<62&&lfnTmp[ci];ci++){
+          char u8[4]; int n=utf16CharToUtf8(lfnTmp[ci],u8);
+          for(int k=0;k<n&&pos<190;k++) utf8out[pos++]=u8[k];
+        }
+        if(pos>0) nm=String(utf8out);
       }
+      if(!nm.length()) nm=String(name83);
+      if(cfg.debugMode) dualPrint.printf("[LFN DBG] 8.3='%s' lfnChk=0x%02X computed=0x%02X nm='%s'\n", name83, lfnChk, computed, nm.c_str());
       memset(lfnBuf,0,sizeof(lfnBuf)); lfnChk=0;
       uint32_t sz=(uint32_t)de[28]|((uint32_t)de[29]<<8)|((uint32_t)de[30]<<16)|((uint32_t)de[31]<<24);
       uint16_t fc=(uint16_t)de[26]|((uint16_t)de[27]<<8);
-      String nm=String(dispName); nm.replace("\\","\\\\"); nm.replace("\"","\\\"");
+      nm.replace("\\","\\\\"); nm.replace("\"","\\\"");
       if(!first)j+=","; first=false;
       j+="{\"n\":\""+nm+"\",\"d\":"+(isDir?"true":"false")+",\"s\":"+String(sz)+",\"c\":"+String(fc)+"}";
     }
@@ -2405,14 +2459,19 @@ static uint16_t imgNavPath(const String& path) {
         for (uint16_t e=0;e<ePerSec;e++){
           uint16_t idx=s*ePerSec+e; if(idx>=scanCnt||g_secBuf[e*32]==0) goto nextClu;
           uint8_t*de=g_secBuf+e*32;
-          if(de[0]==0xE5||(de[11]&0x08)) { navLfnChk=0; memset(navLfnBuf,0,sizeof(navLfnBuf)); continue; }
-          if(de[11]==0x0F){ // LFN entry
+          if(de[0]==0xE5) { navLfnChk=0; memset(navLfnBuf,0,sizeof(navLfnBuf)); continue; }
+          if(de[11]==0x0F){ // LFN entry — must check BEFORE (de[11]&0x08)!
             uint8_t seq=de[0]&0x3F; if(!seq||seq>20) continue;
             uint8_t ec=de[13];
             if(de[0]&0x40){ if(ec!=navLfnChk)memset(navLfnBuf,0,sizeof(navLfnBuf)); navLfnChk=ec; }
             else{ if(!navLfnChk){memset(navLfnBuf,0,sizeof(navLfnBuf));navLfnChk=ec;} else if(ec!=navLfnChk){memset(navLfnBuf,0,sizeof(navLfnBuf));navLfnChk=ec;} }
             int base=(seq-1)*13;
-            for(int ci=0;ci<13;ci++){if(de[lfnOffsets[ci]]==0xFF&&de[lfnOffsets[ci]+1]==0xFF){navLfnBuf[base+ci]=0;break;}char c=(char)de[lfnOffsets[ci]];if(base+ci<254)navLfnBuf[base+ci]=c;if(!c)break;}
+            { uint16_t* navTmp=(uint16_t*)(void*)(navLfnBuf+128);
+              for(int ci=0;ci<13;ci++){
+                uint16_t cp=(uint16_t)de[lfnOffsets[ci]]|((uint16_t)de[lfnOffsets[ci]+1]<<8);
+                if(cp==0xFFFF) break; if(base+ci<62) navTmp[base+ci]=cp; if(!cp) break;
+              }
+            }
             continue;
           }
           if(!(de[11]&0x10)){navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));continue;} // not a dir
@@ -2420,10 +2479,15 @@ static uint16_t imgNavPath(const String& path) {
           // Check LFN match first, then 8.3
           bool match=false;
           if(navLfnChk&&navLfnChk==lfnChksum(de)){
-            int len=0;while(len<254&&navLfnBuf[len])len++;navLfnBuf[len]=0;
-            String lu=String(navLfnBuf);lu.toUpperCase();match=(lu==part);
+            { uint16_t* navTmp=(uint16_t*)(void*)(navLfnBuf+128);
+              char nu8[192]={}; int np=0;
+              for(int ci=0;ci<62&&navTmp[ci];ci++){char u8[4];int n=utf16CharToUtf8(navTmp[ci],u8);for(int k=0;k<n&&np<190;k++)nu8[np++]=u8[k];}
+              nu8[np]=0;
+              String lu=String(nu8);lu.toUpperCase();match=(lu==part);
+            }
           }
           if(!match){char nm[13];imgEntry83Name(de,nm);String nmU=String(nm);nmU.toUpperCase();match=(nmU==part);}
+          if(de[11]&0x08){navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));continue;} // vol label
           navLfnChk=0;memset(navLfnBuf,0,sizeof(navLfnBuf));
           if(match){curClu=(uint16_t)de[26]|((uint16_t)de[27]<<8);found=true;break;}
         }
@@ -2442,7 +2506,7 @@ static int64_t imgFindEntry(uint16_t dirClu, const String& name83) {
   String target=name83; target.toUpperCase();
   static const uint8_t lfnOff2[13]={1,3,5,7,9,14,16,18,20,22,24,28,30};
   uint16_t clu=dirClu;
-  char lfnBuf2[256]=""; int lfnPos2=0; uint8_t lfnChk2=0; uint8_t lfnExp2=0;
+  char lfnBuf2[256]={}; int lfnPos2=0; uint8_t lfnChk2=0; uint8_t lfnExp2=0;
   do {
     uint32_t lba=(clu<2)?g_sBPB.rootLBA:imgCluLBA(g_sBPB,clu);
     uint16_t cnt=(clu<2)?g_sBPB.rde:(uint16_t)(g_sBPB.spc*g_sBPB.bps/32);
@@ -2453,20 +2517,31 @@ static int64_t imgFindEntry(uint16_t dirClu, const String& name83) {
         uint16_t idx=s*ePerSec+e; if(idx>=cnt) return -1;
         uint8_t*de=g_secBuf+e*32;
         if(de[0]==0x00) return -1;
-        if(de[0]==0xE5||(de[11]&0x08)){lfnPos2=0;lfnExp2=0;continue;}
-        if(de[11]==0x0F){
+        if(de[0]==0xE5){lfnPos2=0;lfnExp2=0;continue;}
+        if(de[11]==0x0F){ // must check BEFORE (de[11]&0x08) — 0x0F&0x08=0x08!
           uint8_t seq=de[0]&0x3F;
           if(de[0]&0x40){memset(lfnBuf2,0,sizeof(lfnBuf2));lfnPos2=0;lfnChk2=de[13];lfnExp2=seq;}
           else if(seq!=lfnExp2||de[13]!=lfnChk2){lfnPos2=0;lfnExp2=0;continue;}
-          int base=(seq-1)*13;
-          for(int ci=0;ci<13;ci++){char c=(char)de[lfnOff2[ci]];if(de[lfnOff2[ci]]==0xFF&&de[lfnOff2[ci]+1]==0xFF)c=0;if(base+ci<(int)sizeof(lfnBuf2)-1)lfnBuf2[base+ci]=c;}
-          if(base+13>lfnPos2)lfnPos2=base+13; lfnExp2=seq-1; continue;
+          { int base=(seq-1)*13;
+            uint16_t* t2=(uint16_t*)(void*)(lfnBuf2+128);
+            for(int ci=0;ci<13;ci++){
+              uint16_t cp=(uint16_t)de[lfnOff2[ci]]|((uint16_t)de[lfnOff2[ci]+1]<<8);
+              if(cp==0xFFFF) break; if(base+ci<62) t2[base+ci]=cp; if(!cp) break;
+            }
+            if(base+13>lfnPos2)lfnPos2=base+13;
+          }
+          lfnExp2=seq-1; continue;
         }
+        if(de[11]&0x08){lfnPos2=0;lfnExp2=0;continue;} // vol label (after LFN check)
         if(de[1]==0x00||de[3]==0x00||de[5]==0x00){lfnPos2=0;lfnExp2=0;continue;}
         if(lfnPos2>0&&lfnChk2==lfnChksum(de)){
-          lfnBuf2[lfnPos2<(int)sizeof(lfnBuf2)?(size_t)lfnPos2:sizeof(lfnBuf2)-1]=0;
-          String lfnU=String(lfnBuf2); lfnU.toUpperCase();
-          if(lfnU==target){lfnPos2=0;lfnExp2=0;return (int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;}
+          { uint16_t* t2=(uint16_t*)(void*)(lfnBuf2+128);
+            char u8out[192]={}; int p2=0;
+            for(int ci=0;ci<62&&t2[ci];ci++){char u8[4];int n=utf16CharToUtf8(t2[ci],u8);for(int k=0;k<n&&p2<190;k++)u8out[p2++]=u8[k];}
+            u8out[p2]=0;
+            String lfnU=String(u8out); lfnU.toUpperCase();
+            if(lfnU==target){lfnPos2=0;lfnExp2=0;return (int64_t)(lba+s)*g_sBPB.bps+(int64_t)e*32;}
+          }
         }
         lfnPos2=0; lfnExp2=0;
         char nm[13]; imgEntry83Name(de,nm); String nmU=String(nm);nmU.toUpperCase();
@@ -2523,14 +2598,14 @@ static uint8_t lfnChksum(const uint8_t* de) {
 }
 
 // Build one 32-byte LFN directory entry
-static void imgMakeLfnEntry(uint8_t* le, uint8_t seq, const char* name, int totalChars, uint8_t chk) {
+static void imgMakeLfnEntry(uint8_t* le, uint8_t seq, const uint16_t* name16, int totalChars, uint8_t chk) {
   memset(le,0xFF,32);
   le[11]=0x0F; le[12]=0x00; le[13]=chk; le[26]=0x00; le[27]=0x00;
   le[0]=seq;
   int base=((seq&0x3F)-1)*13;
   for(int i=0;i<13;i++){
     int ci=base+i;
-    if(ci<totalChars){ le[lfnOffsets[i]]=(uint8_t)(unsigned char)name[ci]; le[lfnOffsets[i]+1]=0x00; }
+    if(ci<totalChars){ le[lfnOffsets[i]]=(uint8_t)(name16[ci]&0xFF); le[lfnOffsets[i]+1]=(uint8_t)(name16[ci]>>8); }
     else if(ci==totalChars){ le[lfnOffsets[i]]=0x00; le[lfnOffsets[i]+1]=0x00; }
     // else 0xFF padding (already set)
   }
@@ -2598,6 +2673,7 @@ static int64_t imgWriteDirEntryLfn(uint16_t dirClu, const char* longName,
   for(int i=0;i<nameLen&&!needLfn;i++) if(longName[i]>='a'&&longName[i]<='z') needLfn=true;
   for(int i=0;i<nameLen&&!needLfn;i++) if(longName[i]==' ') needLfn=true;
 
+  if(cfg.debugMode) dualPrint.printf("[LFN DBG] WriteLFN '%s' needLfn=%d baseLen=%d\n", longName, (int)needLfn, baseLen);
   if(!needLfn){
     int64_t slot=imgFindFreeSlot(dirClu);
     if(slot<0) return -1;
@@ -2606,17 +2682,23 @@ static int64_t imgWriteDirEntryLfn(uint16_t dirClu, const char* longName,
   }
   // LFN: need ceil(nameLen/13)+1 consecutive slots
   uint8_t chk=lfnChksum((const uint8_t*)name83);
-  int lfnCount=(nameLen+12)/13;
+  uint16_t name16[256]; int nameLen16=utf8ToUtf16(longName,name16,255);
+  int lfnCount=(nameLen16+12)/13;
   int64_t firstSlot=imgFindFreeSlots(dirClu,lfnCount+1);
-  if(firstSlot<0) return -1;
+  if(cfg.debugMode) dualPrint.printf("[LFN DBG] WriteLFN '%s' needLfn=1 lfnCount=%d firstSlot=%lld chk=0x%02X\n", longName, lfnCount, (long long)firstSlot, chk);
+  if(firstSlot<0){ if(cfg.debugMode) dualPrint.println(F("[LFN DBG] imgFindFreeSlots FAILED - no consecutive slots")); return -1; }
   // Write LFN entries (last sequence first in file)
   for(int i=lfnCount;i>=1;i--){
     uint8_t le[32]; uint8_t seq=(uint8_t)i|(i==lfnCount?0x40:0x00);
-    imgMakeLfnEntry(le,seq,longName,nameLen,chk);
-    g_sFile.seek((uint64_t)(firstSlot+(int64_t)(lfnCount-i)*32)); // highest seq at slot 0
-    g_sFile.write(le,32);
+    imgMakeLfnEntry(le,seq,name16,nameLen16,chk);
+    int64_t off=firstSlot+(int64_t)(lfnCount-i)*32;
+    if(cfg.debugMode) dualPrint.printf("[LFN DBG]  write seq=0x%02X at offset %lld\n", seq, (long long)off);
+    g_sFile.seek((uint64_t)off);
+    size_t wr=g_sFile.write(le,32);
+    if(cfg.debugMode&&wr!=32) dualPrint.printf("[LFN DBG]  WRITE FAILED: wrote %u bytes\n",(unsigned)wr);
   }
   int64_t de83=firstSlot+(int64_t)lfnCount*32;
+  if(cfg.debugMode) dualPrint.printf("[LFN DBG]  write 8.3 at offset %lld\n",(long long)de83);
   g_sFile.seek((uint64_t)de83); g_sFile.write(de,32);
   return de83;
 }
@@ -2631,7 +2713,6 @@ void handleImgMkdir() {
   String imgPath = httpServer.hasArg("img")  ? httpServer.arg("img")  : "";
   String dirPath = httpServer.hasArg("dir")  ? httpServer.arg("dir")  : "/";
   String name    = httpServer.hasArg("name") ? httpServer.arg("name") : "";
-  name.toUpperCase();
   if (!imgPath.length()||!name.length()||name.length()>255) {
     httpServer.send(400,"application/json","{\"error\":\"Missing/invalid params\"}"); return;
   }
@@ -2741,7 +2822,11 @@ void handleImgRm() {
     }
   }
   g_sFile.seek((uint64_t)entOff); g_sFile.write(&del,1);
-  if(fc>=2) imgFreeChainM(fc);
+  if(fc>=2) {
+    bool isDir=(de[11]&0x10)!=0;
+    if(isDir) imgFreeDirContentsM(fc); // free files inside dir recursively
+    imgFreeChainM(fc); // free the dir/file cluster chain itself
+  }
   imgCloseSession();
   gkMtxGive();
   gkInvalidateForPath(imgPath);
