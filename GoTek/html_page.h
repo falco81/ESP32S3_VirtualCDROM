@@ -155,6 +155,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
   <div class="card">
     <div class="ct">&#127908; Current medium</div>
     <div class="sbar">
+      <span id="cdInfoBadge" class="badge def" style="display:none;cursor:pointer" onclick="cdShowInfo()" title="Click for USB debug info">USB info</span>
       <span class="badge off" id="badge">NONE</span>
       <span class="mname" id="mname">&#8212; nothing mounted &#8212;</span>
       <button class="btn r" onclick="doEject()">&#9167; Eject</button>
@@ -165,6 +166,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       <button class="btn yw" onclick="doSetDefault()" id="btnSetDef" title="Set current as default">&#11088; Set default</button>
       <button class="btn gr" onclick="doClearDefault()" id="btnClrDef" title="Clear default">&#10005; Clear</button>
     </div>
+    <div id="cdInfoBox" style="display:none;margin-top:8px;font-size:.72rem;background:rgba(0,0,0,.3);border:1px solid var(--border2);border-radius:4px;padding:8px 10px;color:var(--tx2)"></div>
   </div>
   <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
     <div class="ct" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
@@ -540,7 +542,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
           </div>
         </div>
         <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-          &#9432; Detekce Stop/Pause Win98 CDPlayer. Pokud READ_SUB_CHANNEL polling ustane na tuto dobu, PCM5102 se zastaví. Default: 1200 ms.
+          &#9432; Win98 CDPlayer Stop/Pause detection. If READ_SUB_CHANNEL polling stops for this duration, PCM5102 playback halts. Default: 1200 ms.
         </div>
       </div>
     </div>
@@ -713,7 +715,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <span class="mname" id="gkCurName">&#8212; no slot selected &#8212;</span>
         <button class="btn gr" onclick="gkSelectSlot(-1)" title="GoTek raw mode — all slots for GoTek hardware">&#128190; GoTek mode</button>
       </div>
-      <div id="gkUsbDebugBox" style="display:none;margin-top:8px;font-size:.72rem;background:rgba(0,0,0,.3);border:1px solid var(--border2);border-radius:4px;padding:8px 10px;color:var(--tx2)">
+      <div id="gkUsbDebugBox" style="display:none;margin-top:8px;font-size:.72rem;background:rgba(0,0,0,.3);border:1px solid var(--border2);border-radius:4px;padding:8px 10px;color:var(--tx2);max-height:260px;overflow-y:auto">
         Loading USB debug info&hellip;
       </div>
     </div><!-- end Current image card -->
@@ -1271,6 +1273,40 @@ function addEditHint(td, filename){
   td.onclick=function(){ gkLabelEdit(filename, td); };
 }
 
+function cdShowInfo(){
+  var box=$('cdInfoBox');
+  if(!box) return;
+  if(box.style.display!=='none'){box.style.display='none';return;}
+  box.style.display='block';
+  box.innerHTML='<span style="color:var(--tx2)">Loading…</span>';
+  fetch('/api/cdinfo').then(function(r){return r.json();}).then(function(d){
+    var audioSt=['stopped','playing','paused','completed'][d.audio_state]||'?';
+    var drvN=['Generic','USBCD2/TEAC','ESPUSBCD/Panasonic','DI1000DD'];
+    var h='<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 16px;margin-bottom:6px">';
+    h+='<span><b>Mounted:</b> '+(d.mounted?'<span style="color:var(--green)">✓ yes</span>':'<span style="color:var(--tx3)">no</span>')+'</span>';
+    h+='<span><b>Media present:</b> '+(d.media_present?'<span style="color:var(--green)">✓ yes</span>':'<span style="color:var(--red)">✗ no</span>')+'</span>';
+    if(d.mounted){
+      h+='<span style="grid-column:span 2"><b>File:</b> <span style="color:var(--tx)">'+escHtml(d.file)+'</span></span>';
+      h+='<span><b>Sectors:</b> '+d.sectors+' × '+d.blk_size+' B</span>';
+      h+='<span><b>Size:</b> '+(d.sectors*d.blk_size/1048576).toFixed(1)+' MB</span>';
+      h+='<span><b>Raw sector:</b> '+d.raw_sector+' B</span>';
+      h+='<span><b>Hdr offset:</b> '+d.hdr_offset+' B</span>';
+    }
+    h+='<span><b>DOS compat:</b> '+(d.dos_compat?'ON — '+(drvN[d.dos_driver]||d.dos_driver):'OFF')+'</span>';
+    h+='<span><b>Audio module:</b> '+(d.audio_module?'<span style="color:var(--green)">✓ enabled</span>':'disabled')+'</span>';
+    h+='<span><b>Audio:</b> '+audioSt+(d.audio_state>0?' tr.'+d.audio_track+' LBA '+d.audio_lba:'')+'</span>';
+    h+='<span><b>Tracks:</b> '+d.audio_tracks+' &nbsp; vol '+(d.audio_muted?'<span style="color:#e3b341">muted</span>':d.audio_volume+'%')+'</span>';
+    h+='</div>';
+    h+='<div style="border-top:1px solid var(--border2);padding-top:4px;margin-top:2px">';
+    h+='<b>PSRAM cache:</b> '+d.cache_windows+'×'+d.cache_sectors_per_win+' sec/win';
+    if(d.cache_win0_base>=0) h+=' &nbsp; W0: LBA '+d.cache_win0_base+'+'+d.cache_win0_cnt;
+    else h+=' &nbsp; W0: empty';
+    if(d.cache_windows>1){if(d.cache_win1_base>=0) h+=' &nbsp; W1: LBA '+d.cache_win1_base+'+'+d.cache_win1_cnt; else h+=' &nbsp; W1: empty';}
+    h+='</div>';
+    h+='<div style="color:var(--tx3);font-size:.68rem;margin-top:3px">heap '+d.sys_heap+' B &nbsp; uptime '+d.sys_uptime+'s</div>';
+    box.innerHTML=h;
+  }).catch(function(){box.innerHTML='<span style="color:var(--red)">Error</span>';});
+}
 function gkShowUsbDebug(){
   var box=$('gkUsbDebugBox');
   if(!box) return;
@@ -1946,7 +1982,7 @@ function gkCreate(){
         $('gkCrMsg').textContent='Error: '+(d.error||'failed');
         $('gkCrMsg').style.color='var(--red)';
       }
-    }).catch(function(){spin('gkCrSp',false);$('gkCrMsg').textContent='Chyba';$('gkCrMsg').style.color='var(--red)';});
+    }).catch(function(){spin('gkCrSp',false);$('gkCrMsg').textContent='Error';$('gkCrMsg').style.color='var(--red)';});
 }
 var _gkDelPending=null;
 function gkDelete(name){
@@ -2423,7 +2459,7 @@ function sdRemount(){
   fetch('/api/sd/mount').then(function(r){return r.text();}).then(function(m){
     spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;
     sdCfgMsg(m, m.indexOf('OK')===0);
-    log(m);loadStatus();cdLoadDir('/');fmLoadDir('/');apBgTimer=setInterval(apBgPoll,2000);apBgPoll();setTimeout(apBgPoll,600);setTimeout(apBgPoll,1500);apPoll();logFetch();logFetch();
+    log(m);loadStatus();cdInfoRefresh();cdLoadDir('/');fmLoadDir('/');apBgTimer=setInterval(apBgPoll,2000);apBgPoll();setTimeout(apBgPoll,600);setTimeout(apBgPoll,1500);apPoll();logFetch();logFetch();
   }).catch(function(){spin('sdCfgSp',false);$('sdUmBtn').disabled=false;$('sdMtBtn').disabled=false;sdCfgMsg('ERROR: request failed',false);});
 }
 
@@ -2543,6 +2579,7 @@ function loadSysinfo(){
         _debugMode=on;
         var lbl=$('siDebugLbl');if(lbl){lbl.style.color=on?'var(--warn)':'var(--ok)';lbl.innerHTML=on?'&#9888; ON &mdash; verbose SCSI/API logs':'OFF &mdash; quiet';}
         var cb=$('cmdBar');if(cb)cb.style.display=on?'flex':'none';
+        var cib=$('cdInfoBadge');if(cib)cib.style.display=on?'inline':'none';
         if(typeof gkShowUsbBadge==='function'){var b=$('gkUsbBadge');if(b&&b.style.display!=='none'||on)gkShowUsbBadge(on);}
       }).catch(function(){this.checked=!on;}.bind(this));
     });}}
@@ -2595,6 +2632,7 @@ function loadStatus(){
     if(typeof s.debug_mode!=='undefined'){
       _debugMode=(s.debug_mode===true||s.debug_mode===1);
       var cb=$('cmdBar');if(cb)cb.style.display=_debugMode?'flex':'none';
+      var cib=$('cdInfoBadge');if(cib)cib.style.display=_debugMode?'inline':'none';
     }
     $('badge').textContent=s.mounted?'MOUNTED':'NONE';
     $('badge').className='badge '+(s.mounted?'on':'off');
@@ -2657,6 +2695,37 @@ function cdLoadDir(path){
   }).catch(function(){spin('cdSp',false);log('ERROR: cannot read directory.');});
 }
 
+function cdInfoRefresh(){
+  var box=$('cdInfoBox');
+  if(!box||box.style.display==='none') return;
+  fetch('/api/cdinfo').then(function(r){return r.json();}).then(function(d){
+    var audioSt=['stopped','playing','paused','completed'][d.audio_state]||'?';
+    var drvN=['Generic','USBCD2/TEAC','ESPUSBCD/Panasonic','DI1000DD'];
+    var h='<div style="display:grid;grid-template-columns:1fr 1fr;gap:2px 16px;margin-bottom:6px">';
+    h+='<span><b>Mounted:</b> '+(d.mounted?'<span style="color:var(--green)">✓ yes</span>':'<span style="color:var(--tx3)">no</span>')+'</span>';
+    h+='<span><b>Media present:</b> '+(d.media_present?'<span style="color:var(--green)">✓ yes</span>':'<span style="color:var(--red)">✗ no</span>')+'</span>';
+    if(d.mounted){
+      h+='<span style="grid-column:span 2"><b>File:</b> <span style="color:var(--tx)">'+escHtml(d.file)+'</span></span>';
+      h+='<span><b>Sectors:</b> '+d.sectors+' × '+d.blk_size+' B</span>';
+      h+='<span><b>Size:</b> '+(d.sectors*d.blk_size/1048576).toFixed(1)+' MB</span>';
+      h+='<span><b>Raw sector:</b> '+d.raw_sector+' B</span>';
+      h+='<span><b>Hdr offset:</b> '+d.hdr_offset+' B</span>';
+    }
+    h+='<span><b>DOS compat:</b> '+(d.dos_compat?'ON — '+(drvN[d.dos_driver]||d.dos_driver):'OFF')+'</span>';
+    h+='<span><b>Audio module:</b> '+(d.audio_module?'<span style="color:var(--green)">✓ enabled</span>':'disabled')+'</span>';
+    h+='<span><b>Audio:</b> '+audioSt+(d.audio_state>0?' tr.'+d.audio_track+' LBA '+d.audio_lba:'')+'</span>';
+    h+='<span><b>Tracks:</b> '+d.audio_tracks+' &nbsp; vol '+(d.audio_muted?'<span style="color:#e3b341">muted</span>':d.audio_volume+'%')+'</span>';
+    h+='</div>';
+    h+='<div style="border-top:1px solid var(--border2);padding-top:4px;margin-top:2px">';
+    h+='<b>PSRAM cache:</b> '+d.cache_windows+'×'+d.cache_sectors_per_win+' sec/win';
+    if(d.cache_win0_base>=0) h+=' &nbsp; W0: LBA '+d.cache_win0_base+'+'+d.cache_win0_cnt;
+    else h+=' &nbsp; W0: empty';
+    if(d.cache_windows>1){if(d.cache_win1_base>=0) h+=' &nbsp; W1: LBA '+d.cache_win1_base+'+'+d.cache_win1_cnt; else h+=' &nbsp; W1: empty';}
+    h+='</div>';
+    h+='<div style="color:var(--tx3);font-size:.68rem;margin-top:3px">heap '+d.sys_heap+' B &nbsp; uptime '+d.sys_uptime+'s</div>';
+    box.innerHTML=h;
+  }).catch(function(){});
+}
 function doMount(path){
   var btn=event&&event.target?event.target:null;
   var origText=btn?btn.textContent:'';
@@ -2667,7 +2736,7 @@ function doMount(path){
       .then(function(r){return r.text();})
       .then(function(m){
         if(btn){btn.disabled=false;btn.textContent=origText;}
-        log(m);loadStatus();
+        log(m);loadStatus();cdInfoRefresh();
       })
       .catch(function(){
         if(btn){btn.disabled=false;btn.textContent=origText;}
@@ -2692,7 +2761,7 @@ function doEject(){
   if(btn){btn.disabled=true;btn.textContent='⏳';}
   fetch('/api/umount').then(function(r){return r.text();}).then(function(m){
     if(btn){btn.disabled=false;btn.textContent=origText;}
-    log(m);loadStatus();
+    log(m);loadStatus();cdInfoRefresh();
   }).catch(function(){if(btn){btn.disabled=false;btn.textContent=origText;}});
 }
 

@@ -5348,6 +5348,37 @@ void setupWebServer() {
   new (&httpServer) WebServer(hport);
   httpServer.on("/",                 HTTP_GET,  handleRoot);
   httpServer.on("/api/status",       HTTP_GET,  handleApiStatus);
+  httpServer.on("/api/cdinfo",        HTTP_GET,  [](){
+    if (!checkAuth()) return;
+    if (!cfg.debugMode) { httpServer.send(403,"application/json","{\"error\":\"debug off\"}"); return; }
+    String j="{";
+    j+="\"mounted\":"+String(isoOpen&&mountedFile.length()?"true":"false");
+    j+=",\"file\":\""+jsonEsc(mountedFile.c_str())+"\"";
+    j+=",\"default\":\""+jsonEsc(defaultMount.c_str())+"\"";
+    j+=",\"media_present\":"+String(mscMediaPresent?"true":"false");
+    j+=",\"sectors\":"+String(mountedBlocks);
+    j+=",\"blk_size\":"+String(mscBlockSize);
+    j+=",\"raw_sector\":"+String(binRawSectorSize);
+    j+=",\"hdr_offset\":"+String(binHeaderOffset);
+    j+=",\"dos_compat\":"+String(cfg.dosCompat?"true":"false");
+    j+=",\"dos_driver\":"+String(cfg.dosDriver);
+    j+=",\"audio_state\":"+String((int)audioState);
+    j+=",\"audio_track\":"+String(subChannel.trackNum);
+    j+=",\"audio_lba\":"+String(audioCurrentLba);
+    j+=",\"audio_tracks\":"+String(audioTrackCount);
+    j+=",\"audio_volume\":"+String(audioVolume);
+    j+=",\"audio_muted\":"+String(audioMuted?"true":"false");
+    j+=",\"cache_windows\":"+String(CACHE_WINDOWS);
+    j+=",\"cache_sectors_per_win\":"+String(CACHE_SECTOR_COUNT);
+    j+=",\"cache_win0_base\":"+String(g_cacheBase[0]==0xFFFFFFFFu?-1:(int32_t)g_cacheBase[0]);
+    j+=",\"cache_win0_cnt\":"+String(g_cacheCnt[0]);
+    j+=",\"cache_win1_base\":"+String(CACHE_WINDOWS>1&&g_cacheBase[1]!=0xFFFFFFFFu?(int32_t)g_cacheBase[1]:-1);
+    j+=",\"cache_win1_cnt\":"+String(CACHE_WINDOWS>1?g_cacheCnt[1]:0);
+    j+=",\"sys_heap\":"+String(ESP.getFreeHeap());
+    j+=",\"sys_uptime\":"+String(millis()/1000);
+    j+=",\"audio_module\":"+String(cfg.audioModule?"true":"false");
+    j+="}"; httpServer.send(200,"application/json",j);
+  });
   httpServer.on("/api/log",          HTTP_GET,  handleApiLog);
   httpServer.on("/api/cmd",          HTTP_GET,  [](){
     if (!checkAuth()) return;
