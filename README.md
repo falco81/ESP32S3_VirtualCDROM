@@ -647,6 +647,12 @@ All `set` commands save the value to NVS immediately. Most take effect after `re
 |---|---|---|
 | `set debug on\|off` | `off` | Verbose SCSI/API logging. When off: no `[SCSI]`, `[AUDIO] SLOW BATCH` or `[API]` lines. Saved to NVS. |
 
+#### Image Editor
+
+| Command | Default | Notes |
+|---|---|---|
+| `set img-fat83 on\|off` | `on` | Image editor upload filename mode. `on` = FAT 8.3 auto-convert with `~N` deduplication (max DOS compatibility). `off` = VFAT long filenames stored as proper UTF-16LE LFN entries. Folder names follow the same setting. Saved to NVS. |
+
 #### Web UI Security
 
 | Command | Default | Notes |
@@ -1388,6 +1394,7 @@ Full device status used by the Status tab in the web UI.
   "disc": {"mounted": true, "file": "/games/TombRaider.cue", "sectors": 204923},
   "audio":{"moduleEnabled": true, "state": "playing", "track": 2, "volume": 80},
   "dosCompat": true, "dosDriver": 2,
+  "img_fat83": true,
   "uptime": 3742, "freeHeap": 184320, "exfat": true
 }
 ```
@@ -1428,6 +1435,7 @@ Read all configuration keys. Password fields (`pass`, `eap-pass`, `web-pass`, `e
   "eap-ca": "", "eap-cert": "", "eap-key": "", "eap-kpass": "",
   "audio-module": "off",
   "dos-compat": "on", "dos-driver": "2",
+  "img-fat83": "on",
   "web-auth": "off", "web-user": "admin", "web-pass": "",
   "https-enable": "off", "https-cert": "", "https-key": ""
 }
@@ -2023,7 +2031,7 @@ ESP32S3_VirtualCDROM-main/
 - **Custom image names** — files can have any name (not limited to `DSKA0000.img` convention); slot order is stored in `order.json`
 - **Persistent slot order** — drag-and-drop reordering in the web UI saved to `/GoTek/order.json` on the SD card; no file renaming
 - **Image labels** — per-image description text stored in `/GoTek/labels.json`; inline editing in the web UI
-- **Image editor** — browse, upload, download and delete files inside individual FAT12 floppy images directly from the browser
+- **Image editor** — browse, upload, download, delete and create folders inside individual FAT12 floppy images directly from the browser; full VFAT long filename support (UTF-16LE); configurable FAT 8.3 auto-convert mode with `~N` deduplication
 - **Free space monitoring** — per-slot used/free space with colour-coded progress bar (green/yellow/red)
 - **Single-slot mode** — mount one specific image as a standard 1.44 MB USB disk for Windows direct access (read/write); re-enumerates USB automatically
 - **GoTek RAW mode** — all slots concatenated at fixed LBA offsets for GoTek hardware; re-enumerates USB automatically
@@ -2433,8 +2441,16 @@ Click the **💾** button in the Actions column of any image row → modal opens
 ### Limitations
 
 - Images must be FAT12 formatted (standard floppy format)
-- Maximum filename length: 8.3 format (FAT12 limitation)
 - Image must be less than 2880 sectors (standard 1.44 MB) for standard GoTek compatibility
+
+### Filename modes
+
+| Mode | Setting | Behaviour |
+|---|---|---|
+| FAT 8.3 auto-convert (default) | `set img-fat83 on` | Client converts filenames with `~N` deduplication before upload; max compatibility with DOS |
+| VFAT long filenames | `set img-fat83 off` | Firmware writes proper VFAT LFN entries (UTF-16LE); full names visible in Windows and the image editor |
+
+Both modes store the 8.3 directory entry required by FAT12. In VFAT mode, preceding LFN directory entries are also written so Windows and the image editor display the full name. Non-ASCII characters (diacritics, etc.) are encoded as proper UTF-16LE codepoints in LFN entries. In FAT 8.3 mode, folder names typed in the browser are also auto-converted to 8.3 format.
 
 ---
 
@@ -2635,7 +2651,7 @@ Download a file from inside a FAT12 image.
 
 #### `GET /api/img/rm?img=PATH&file=FILEPATH`
 
-Delete a file or folder from inside a FAT12 image.
+Delete a file or folder from inside a FAT12 image. When deleting a folder, all cluster chains for files and sub-folders inside it are recursively freed before the folder entry is removed.
 
 #### `GET /api/img/mkdir?img=PATH&dir=DIRPATH&name=NAME`
 
