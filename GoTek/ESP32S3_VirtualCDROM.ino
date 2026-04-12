@@ -3003,8 +3003,14 @@ static void gkInvalidateForPath(const String& imgPath) {
       if ((int)gkF[i].slotNum == gkSelectedSlot && gkSelectedSlot >= 0) {
         msc_set_unit_attention();
         dualPrint.printf("[GK] UA → Windows will refresh disk view: %s\n", imgPath.c_str());
+      } else if (cfg.gotekUsbMode == 1) {
+        // FAT32 virtual mode: signal UA so FlashFloppy re-reads the virtual filesystem
+        msc_set_unit_attention();
+        dualPrint.printf("[GK] UA → FlashFloppy will re-read FAT32: %s\n", imgPath.c_str());
       } else {
-        dualPrint.printf("[GK] Cache invalidated: %s\n", imgPath.c_str());
+        // Raw LBA mode: cache cleared; GoTek hardware will read fresh data on next sector request.
+        // GoTek hardware has no UA mechanism — it re-reads sectors on its own schedule.
+        dualPrint.printf("[GK] Cache invalidated (raw LBA): %s\n", imgPath.c_str());
       }
       break;
     }
@@ -4102,7 +4108,9 @@ void handleApiStatus() {
   j += ",\"blksize\":"  + String(mscBlockSize);
   j += ",\"rawsector\":" + String(binRawSectorSize);
   j += ",\"hdroffset\":" + String(binHeaderOffset);
-  j += ",\"default\":\"" + jsonEsc(defaultMount.c_str()) + "\"}";
+  j += ",\"default\":\"" + jsonEsc(defaultMount.c_str()) + "\"";
+  j += ",\"debug_mode\":" + String(cfg.debugMode ? "true" : "false");
+  j += "}";
   httpServer.send(200, "application/json", j);
 }
 
@@ -4562,6 +4570,11 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("dosDriver"))  {
     cfg.dosDriver=(uint8_t)constrain(httpServer.arg("dosDriver").toInt(),0,3); changed=true;
     if (cfg.dosDriver > 0) cfg.dosCompat=true;  // any specific driver mode requires dosCompat ON
+  }
+  if (httpServer.hasArg("debugMode")) {
+    String v=httpServer.arg("debugMode");
+    cfg.debugMode=(v=="1"||v=="true"||v=="on"); changed=true;
+    dualPrint.printf("[OK]  Debug logging: %s\n", cfg.debugMode?"ON":"OFF");
   }
   if (httpServer.hasArg("imgFat83")) {
     String v=httpServer.arg("imgFat83");
@@ -5336,6 +5349,15 @@ void setupWebServer() {
   httpServer.on("/",                 HTTP_GET,  handleRoot);
   httpServer.on("/api/status",       HTTP_GET,  handleApiStatus);
   httpServer.on("/api/log",          HTTP_GET,  handleApiLog);
+  httpServer.on("/api/cmd",          HTTP_GET,  [](){
+    if (!checkAuth()) return;
+    if (!cfg.debugMode) { httpServer.send(403,"application/json","{\"error\":\"Debug mode not enabled\"}"); return; }
+    String cmd = httpServer.hasArg("c") ? httpServer.arg("c") : "";
+    cmd.trim();
+    if (!cmd.length()) { httpServer.send(400,"application/json","{\"error\":\"Empty command\"}"); return; }
+    processCommand(cmd);
+    httpServer.send(200,"application/json","{\"ok\":true}");
+  });
   httpServer.on("/api/sysinfo",      HTTP_GET,  handleApiSysinfo);
   httpServer.on("/api/isos",         HTTP_GET,  handleApiIsos);
   httpServer.on("/api/ls",           HTTP_GET,  handleApiLs);

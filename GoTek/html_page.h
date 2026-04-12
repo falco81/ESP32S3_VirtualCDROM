@@ -57,6 +57,9 @@ td.sz,th.sz{color:var(--tx2);text-align:right;white-space:nowrap;width:100px}
 td.ac,th.ac{text-align:right;white-space:nowrap;min-width:100px;vertical-align:middle}
 td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 #mkModal.show{display:flex!important}
+#rebootModal.show{display:flex!important}
+#rebootProgress.show{display:flex!important}
+#factoryModal.show{display:flex!important}
 #delModal.show{display:flex!important}
 #imgDelModal.show{display:flex!important}
 #imgMkModal.show{display:flex!important}
@@ -76,6 +79,12 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 .sp{display:none;width:13px;height:13px;border:2px solid var(--border);border-top-color:var(--blue);border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle;margin-left:5px}
 #log{background:#010409;border:1px solid var(--border2);border-radius:var(--rs);padding:clamp(8px,1.5vw,14px);font-size:clamp(.72rem,1.4vw,.85rem);color:var(--green);flex:1;overflow-y:auto;font-family:monospace;white-space:pre-wrap;word-break:break-all}
 .si-tbl{width:100%;table-layout:auto;border-collapse:collapse;font-size:clamp(.72rem,1.4vw,.88rem)}
+.tog{position:relative;display:inline-block;width:40px;height:22px;flex-shrink:0}
+.tog input{opacity:0;width:0;height:0;position:absolute}
+.tog-sl{position:absolute;inset:0;background:var(--border2);border-radius:11px;cursor:pointer;transition:.25s}
+.tog-sl:before{content:"";position:absolute;width:16px;height:16px;left:3px;top:50%;transform:translateY(-50%);background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:.25s}
+.tog input:checked+.tog-sl{background:var(--green)}
+.tog input:checked+.tog-sl:before{transform:translateX(18px) translateY(-50%)}
 .si-tbl td{padding:clamp(3px,.6vw,6px) clamp(4px,.8vw,8px);border-bottom:1px solid var(--bg);vertical-align:top}
 .si-tbl tr:last-child td{border-bottom:none}
 .si-tbl td:first-child{color:var(--tx2);white-space:nowrap;width:1%;padding-right:clamp(12px,2vw,24px)}
@@ -251,6 +260,13 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
     <div id="log" style="flex:1;overflow-y:auto;font-size:.75rem;white-space:pre-wrap;word-break:break-all;min-height:0;background:var(--bg);padding:6px;border-radius:4px;border:1px solid var(--border)">Ready.</div>
+    <div id="cmdBar" style="display:none;gap:6px;margin-top:8px;align-items:center">
+      <span style="font-size:.75rem;color:var(--tx3);font-family:monospace;white-space:nowrap">&gt;_</span>
+      <input id="cmdInput" class="cfg-inp" type="text" placeholder="Serial command (e.g. status, help, set debug on)" autocomplete="off" autocorrect="off" spellcheck="false"
+             style="flex:1;font-family:monospace;font-size:.8rem;padding:4px 8px"
+             onkeydown="if(event.key==='Enter')sendCmd();">
+      <button class="btn b" onclick="sendCmd()" style="font-size:.75rem;padding:4px 10px;white-space:nowrap">&#9654; Send</button>
+    </div>
   </div>
 </div>
 
@@ -403,169 +419,6 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
 
-    <!-- Audio Module -->
-    <div class="card" id="cfgCardAudio">
-      <div class="ct">&#127925; Audio Module</div>
-      <div class="cfg-row">
-        <label class="cfg-lbl">PCM5102 I2S module</label>
-        <select class="cfg-inp" id="cfgAudioModule" style="width:100%">
-          <option value="0">Disabled (no hardware connected)</option>
-          <option value="1">GY-PCM5102 I2S &#8212; GPIO 8/15/16</option>
-        </select>
-      </div>
-      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-        &#9432; Requires reboot. BCK&#8594;GPIO8 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
-      </div>
-      <!-- Win98 Stop/Pause detection -->
-      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
-        <div class="cfg-row">
-          <label class="cfg-lbl">&#9200; Win98 Stop/Pause</label>
-          <div style="display:flex;align-items:center;gap:8px">
-            <input type="number" class="cfg-inp" id="cfgWin98StopMs" min="0" max="9999" step="100" style="width:90px" placeholder="ms">
-            <span style="color:var(--muted);font-size:0.82em">ms &nbsp;(0&nbsp;=&nbsp;off)</span>
-          </div>
-        </div>
-        <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-          &#9432; Detekce Stop/Pause Win98 CDPlayer. Pokud READ_SUB_CHANNEL polling ustane na tuto dobu, PCM5102 se zastaví. Default: 1200 ms.
-        </div>
-      </div>
-    </div>
-
-    <!-- Web UI Authentication -->
-    <div class="card">
-      <div class="ct">&#128272; Web UI Authentication</div>
-      <div class="cfg-row">
-        <label class="cfg-lbl">HTTP Basic Auth</label>
-        <select class="cfg-inp" id="cfgWebAuth" onchange="webAuthToggle()">
-          <option value="0">Disabled (no login required)</option>
-          <option value="1">Enabled &#8212; require username &amp; password</option>
-        </select>
-      </div>
-      <div id="webAuthFields" style="display:none">
-        <div class="cfg-row" style="margin-top:8px">
-          <label class="cfg-lbl">Username</label>
-          <input class="cfg-inp" id="cfgWebUser" type="text" maxlength="31"
-                 autocomplete="username" placeholder="admin">
-        </div>
-        <div class="cfg-row" style="margin-top:8px">
-          <label class="cfg-lbl">New password</label>
-          <input class="cfg-inp" id="cfgWebPass" type="password" maxlength="63"
-                 autocomplete="new-password" placeholder="(leave empty to keep current)">
-        </div>
-      </div>
-      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-        &#9432; Default: <b>admin / admin</b>. Changes take effect immediately. Password is write-only.
-      </div>
-    </div>
-
-    <!-- Device Mode -->
-    <div class="card">
-      <div class="ct">&#128270; Device Mode</div>
-      <div class="cfg-row">
-        <label class="cfg-lbl">USB device profile</label>
-        <select class="cfg-inp" id="cfgDeviceMode" style="width:100%" onchange="deviceModeChanged()">
-          <option value="0">&#128249; CD-ROM emulator (default)</option>
-          <option value="1">&#128190; GoTek floppy emulator (FlashFloppy)</option>
-        </select>
-      </div>
-      <div id="cfgGotekDirRow" style="display:none;margin-top:10px">
-        <div class="cfg-row">
-          <label class="cfg-lbl">GoTek image folder</label>
-          <input class="cfg-inp" id="cfgGotekDir" type="text" placeholder="/gotek" style="width:100%">
-        </div>
-        <div style="font-size:.75rem;color:var(--tx2);margin-top:6px">
-          Place <code>.img</code> / <code>.adf</code> / <code>.hfe</code> and other floppy images in this SD folder.
-          Slot order is alphabetical or set via drag-and-drop in the GoTek tab.
-        </div>
-        <div class="cfg-row" style="margin-top:10px">
-          <label class="cfg-lbl">GoTek USB mode</label>
-          <select class="cfg-inp" id="cfgGotekUsbMode">
-            <option value="0">Raw LBA — slot N at LBA N×stride (stock GoTek firmware)</option>
-            <option value="1">FAT32 virtual — DSKA0000.IMG… navigable by FlashFloppy (nav-mode=indexed)</option>
-          </select>
-        </div>
-        <div id="cfgGotekUsbModeNote" style="font-size:.75rem;color:var(--tx2);margin-top:6px"></div>
-        <div id="cfgGotekFatWPRow" class="cfg-row" style="margin-top:10px;display:none">
-          <label class="cfg-lbl">FAT32 write-protect</label>
-          <select class="cfg-inp" id="cfgGotekFatWP">
-            <option value="1">Enabled — Windows cannot format or delete (recommended)</option>
-            <option value="0">Disabled — fully writable (use only if GoTek firmware requires it)</option>
-          </select>
-        </div>
-        <div class="cfg-row" style="margin-top:10px">
-          <label class="cfg-lbl">Image editor upload</label>
-          <select class="cfg-inp" id="cfgImgFat83">
-            <option value="1">FAT 8.3 auto-convert (default) — unique ~N suffix, max compatibility</option>
-            <option value="0">VFAT long filenames — full name visible in Windows and image editor</option>
-          </select>
-        </div>
-      </div>
-      <div id="cfgDeviceModeNote0" style="margin-top:8px;font-size:.75rem;background:rgba(56,139,253,.1);border:1px solid rgba(56,139,253,.3);border-radius:4px;padding:8px 12px">
-        &#10003; <b>CD-ROM mode:</b> Full virtual CD-ROM — ISO/BIN/CUE, audio playback, DOS compat, SCSI commands.
-      </div>
-      <div id="cfgDeviceModeNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(210,153,34,.15);border:1px solid rgba(210,153,34,.4);border-radius:4px;padding:8px 12px">
-        &#128190; <b>GoTek mode:</b> ESP32 acts as a USB flash drive for GoTek/FlashFloppy.
-        Audio, CD-ROM, DOS compat and disc mounting are <b>disabled</b>.<br>
-        &#9888; Requires <b>reboot</b> to take effect (USB descriptor changes at boot).
-      </div>
-    </div>
-
-    <!-- DOS Compatibility Mode -->
-    <div class="card" id="cfgCardDos">
-      <div class="ct">&#128190; DOS Compatibility Mode</div>
-      <div class="cfg-row">
-        <label class="cfg-lbl">Mount behavior</label>
-        <select class="cfg-inp" id="cfgDosCompat" style="width:100%" onchange="dosCompatChanged()">
-          <option value="0">Normal (USB re-enumeration on mount/eject)</option>
-          <option value="1">DOS compatible (UNIT ATTENTION only, no re-enum)</option>
-        </select>
-      </div>
-      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
-        &#9432; DOS compat prevents the device from disappearing on disc swap.
-        Uses UNIT&nbsp;ATTENTION&nbsp;0x28 instead of USB re-enumeration.
-        Automatically enabled when a DOS driver is selected above.
-      </div>
-      <div id="dosDriverSection" style="display:none;margin-top:12px">
-        <div class="cfg-row">
-          <label class="cfg-lbl">DOS CD-ROM driver</label>
-          <select class="cfg-inp" id="cfgDosDriver" onchange="dosDriverChanged()">
-            <option value="0">Generic &mdash; any ASPI driver [audio supported]</option>
-            <option value="1">USBCD2.SYS &mdash; TEAC CD-56E [BROKEN &ndash; needs INT 13h hook]</option>
-            <option value="2">ESPUSBCD.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
-            <option value="3">DI1000DD.SYS + usbaspi1.sys &mdash; data only, no audio</option>
-          </select>
-        </div>
-        <div id="dosDriverNote0" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
-          &#10003; <b>Generic mode:</b> No specific INQUIRY identity &mdash; works with any ASPI-compatible DOS driver.<br>
-          Audio: READ&nbsp;TOC, PLAY, STOP, PAUSE, READ&nbsp;SUB-CHANNEL fully supported via SCSI.<br>
-          Use with any standard USBASPI (e.g. <code>usbaspi1.sys</code> or <code>usbaspi2.sys</code>) + MSCDEX.<br>
-          CONFIG.SYS: <code>usbaspi1.sys /w /v</code> + <code>MSCDEX.EXE /D:USBCD0</code>
-        </div>
-        <div id="dosDriverNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(241,196,15,.1);border:1px solid rgba(241,196,15,.3);border-radius:4px;padding:8px 12px">
-          &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.<br>
-          <b style="color:#e74c3c">Driver communication is broken:</b> USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) &mdash; standard USBASPI does not provide this hook.<br>
-          Audio SCSI commands (READ&nbsp;TOC, PLAY, SUB-CHANNEL) are handled by firmware but unreachable via broken driver.<br>
-          <b>Not recommended</b> &mdash; use Generic or ESPUSBCD.SYS instead.
-        </div>
-        <div id="dosDriverNote2" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(52,152,219,.1);border:1px solid rgba(52,152,219,.3);border-radius:4px;padding:8px 12px">
-          &#10003; <b>ESPUSBCD.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
-          Audio: PLAY, STOP, RESUME, READ_SUB-CHANNEL via MSCDEX IOCTL.<br>
-          Communicates via <b>SCSIMGR$ DOS device</b> &mdash; works with usbaspi1.sys/usbaspi2.sys.<br>
-          <b style="color:#e67e22">CD Player compatibility:</b><br>
-          &bull; <b style="color:#e74c3c">cdplayer.exe fails with original USBCD1.SYS:</b> missing IOCTL OUT sf3 &rarr; <code>error 3</code><br>
-          &bull; <b style="color:#27ae60">CDP.COM works:</b> tolerates missing sf3, continues to PLAY/STOP/SEEK<br>
-          &bull; <b style="color:#27ae60">ESPUSBCD.SYS:</b> custom DOS driver — full IOCTL audio support, cdplayer.exe works<br>
-          CONFIG.SYS: <code>usbaspi2.sys /w /v</code> + <code>ESPUSBCD.SYS /D:USBCD0</code>
-        </div>
-        <div id="dosDriverNote3" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
-          &#128190; <b>DI1000DD.SYS (NOVAC) + USBASPI 2.20:</b> Data-only USB storage &mdash; <b>no audio</b>.<br>
-          SD card files accessible as regular DOS drive letter (FAT).<br>
-          Use <b>usbaspi1.sys</b> as ASPI layer (Panasonic v2.20): <code>usbaspi1.sys /w /v</code> + <code>DI1000DD.SYS</code><br>
-          No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively.
-        </div>
-      </div><!-- end dosDriverSection -->
-    </div><!-- end DOS card -->
-
         <!-- HTTPS -->
     <div class="card">
       <div class="ct">&#128274; HTTPS / TLS</div>
@@ -636,8 +489,175 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         </div>
       </div>
     </div>
-  </div>
 
+    <!-- Web UI Authentication -->
+    <div class="card">
+      <div class="ct">&#128272; Web UI Authentication</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">HTTP Basic Auth</label>
+        <select class="cfg-inp" id="cfgWebAuth" onchange="webAuthToggle()">
+          <option value="0">Disabled (no login required)</option>
+          <option value="1">Enabled &#8212; require username &amp; password</option>
+        </select>
+      </div>
+      <div id="webAuthFields" style="display:none">
+        <div class="cfg-row" style="margin-top:8px">
+          <label class="cfg-lbl">Username</label>
+          <input class="cfg-inp" id="cfgWebUser" type="text" maxlength="31"
+                 autocomplete="username" placeholder="admin">
+        </div>
+        <div class="cfg-row" style="margin-top:8px">
+          <label class="cfg-lbl">New password</label>
+          <input class="cfg-inp" id="cfgWebPass" type="password" maxlength="63"
+                 autocomplete="new-password" placeholder="(leave empty to keep current)">
+        </div>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; Default: <b>admin / admin</b>. Changes take effect immediately. Password is write-only.
+      </div>
+    </div>
+
+    <!-- Audio Module -->
+    <div class="card" id="cfgCardAudio">
+      <div class="ct">&#127925; Audio Module</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">PCM5102 I2S module</label>
+        <select class="cfg-inp" id="cfgAudioModule" style="width:100%">
+          <option value="0">Disabled (no hardware connected)</option>
+          <option value="1">GY-PCM5102 I2S &#8212; GPIO 8/15/16</option>
+        </select>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; Requires reboot. BCK&#8594;GPIO8 &nbsp;WS&#8594;GPIO15 &nbsp;DIN&#8594;GPIO16 &nbsp;VCC&#8594;3V3.
+      </div>
+      <!-- Win98 Stop/Pause detection -->
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+        <div class="cfg-row">
+          <label class="cfg-lbl">&#9200; Win98 Stop/Pause</label>
+          <div style="display:flex;align-items:center;gap:8px">
+            <input type="number" class="cfg-inp" id="cfgWin98StopMs" min="0" max="9999" step="100" style="width:90px" placeholder="ms">
+            <span style="color:var(--muted);font-size:0.82em">ms &nbsp;(0&nbsp;=&nbsp;off)</span>
+          </div>
+        </div>
+        <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+          &#9432; Detekce Stop/Pause Win98 CDPlayer. Pokud READ_SUB_CHANNEL polling ustane na tuto dobu, PCM5102 se zastaví. Default: 1200 ms.
+        </div>
+      </div>
+    </div>
+
+    <!-- Device Mode -->
+    <div class="card">
+      <div class="ct">&#128270; Device Mode</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">USB device profile</label>
+        <select class="cfg-inp" id="cfgDeviceMode" style="width:100%" onchange="deviceModeChanged()">
+          <option value="0">&#128249; CD-ROM emulator (default)</option>
+          <option value="1">&#128190; GoTek floppy emulator (FlashFloppy)</option>
+        </select>
+      </div>
+      <div id="cfgDeviceModeNote0" style="margin-top:8px;font-size:.75rem;background:rgba(56,139,253,.1);border:1px solid rgba(56,139,253,.3);border-radius:4px;padding:8px 12px">
+        &#10003; <b>CD-ROM mode:</b> Full virtual CD-ROM — ISO/BIN/CUE, audio playback, DOS compat, SCSI commands.
+      </div>
+      <div id="cfgDeviceModeNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(210,153,34,.15);border:1px solid rgba(210,153,34,.4);border-radius:4px;padding:8px 12px">
+        &#128190; <b>GoTek mode:</b> ESP32 acts as a USB flash drive for GoTek/FlashFloppy.
+        Audio, CD-ROM, DOS compat and disc mounting are <b>disabled</b>.<br>
+        &#9888; Requires <b>reboot</b> to take effect (USB descriptor changes at boot).
+      </div>
+    </div>
+
+    <!-- GoTek Configuration — visible only in GoTek mode -->
+    <div class="card" id="cfgCardGotek" style="display:none">
+      <div class="ct">&#128190; GoTek Configuration</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">Image folder</label>
+        <input class="cfg-inp" id="cfgGotekDir" type="text" placeholder="/gotek" style="width:100%">
+      </div>
+      <div style="font-size:.75rem;color:var(--tx2);margin-top:6px;margin-bottom:10px">
+        Place <code>.img</code> / <code>.adf</code> / <code>.hfe</code> and other floppy images in this SD folder.
+        Slot order is alphabetical or set via drag-and-drop in the GoTek tab.
+      </div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">USB mode</label>
+        <select class="cfg-inp" id="cfgGotekUsbMode">
+          <option value="0">Raw LBA — slot N at LBA N×stride (stock GoTek firmware)</option>
+          <option value="1">FAT32 virtual — DSKA0000.IMG… navigable by FlashFloppy (nav-mode=indexed)</option>
+        </select>
+      </div>
+      <div id="cfgGotekUsbModeNote" style="font-size:.75rem;color:var(--tx2);margin-top:6px"></div>
+      <div id="cfgGotekFatWPRow" class="cfg-row" style="margin-top:10px;display:none">
+        <label class="cfg-lbl">FAT32 write-protect</label>
+        <select class="cfg-inp" id="cfgGotekFatWP">
+          <option value="1">Enabled — Windows cannot format or delete (recommended)</option>
+          <option value="0">Disabled — fully writable (use only if GoTek firmware requires it)</option>
+        </select>
+      </div>
+      <div class="cfg-row" style="margin-top:10px">
+        <label class="cfg-lbl">Image editor upload</label>
+        <select class="cfg-inp" id="cfgImgFat83">
+          <option value="1">FAT 8.3 auto-convert (default) — unique ~N suffix, max compatibility</option>
+          <option value="0">VFAT long filenames — full name visible in Windows and image editor</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- DOS Compatibility Mode -->
+    <div class="card" id="cfgCardDos">
+      <div class="ct">&#128190; DOS Compatibility Mode</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">Mount behavior</label>
+        <select class="cfg-inp" id="cfgDosCompat" style="width:100%" onchange="dosCompatChanged()">
+          <option value="0">Normal (USB re-enumeration on mount/eject)</option>
+          <option value="1">DOS compatible (UNIT ATTENTION only, no re-enum)</option>
+        </select>
+      </div>
+      <div style="font-size:.75rem;color:var(--muted);margin-top:6px">
+        &#9432; DOS compat prevents the device from disappearing on disc swap.
+        Uses UNIT&nbsp;ATTENTION&nbsp;0x28 instead of USB re-enumeration.
+        Automatically enabled when a DOS driver is selected above.
+      </div>
+      <div id="dosDriverSection" style="display:none;margin-top:12px">
+        <div class="cfg-row">
+          <label class="cfg-lbl">DOS CD-ROM driver</label>
+          <select class="cfg-inp" id="cfgDosDriver" onchange="dosDriverChanged()">
+            <option value="0">Generic &mdash; any ASPI driver [audio supported]</option>
+            <option value="1">USBCD2.SYS &mdash; TEAC CD-56E [BROKEN &ndash; needs INT 13h hook]</option>
+            <option value="2">ESPUSBCD.SYS &mdash; MATSHITA CR-572 [audio via CDP.COM]</option>
+            <option value="3">DI1000DD.SYS + usbaspi1.sys &mdash; data only, no audio</option>
+          </select>
+        </div>
+        <div id="dosDriverNote0" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
+          &#10003; <b>Generic mode:</b> No specific INQUIRY identity &mdash; works with any ASPI-compatible DOS driver.<br>
+          Audio: READ&nbsp;TOC, PLAY, STOP, PAUSE, READ&nbsp;SUB-CHANNEL fully supported via SCSI.<br>
+          Use with any standard USBASPI (e.g. <code>usbaspi1.sys</code> or <code>usbaspi2.sys</code>) + MSCDEX.<br>
+          CONFIG.SYS: <code>usbaspi1.sys /w /v</code> + <code>MSCDEX.EXE /D:USBCD0</code>
+        </div>
+        <div id="dosDriverNote1" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(241,196,15,.1);border:1px solid rgba(241,196,15,.3);border-radius:4px;padding:8px 12px">
+          &#9888; <b>USBCD2.SYS mode:</b> Device identifies as <code>TEAC CD-56E</code>.<br>
+          <b style="color:#e74c3c">Driver communication is broken:</b> USBCD2 uses INT&nbsp;13h AH=0x50 (non-standard) &mdash; standard USBASPI does not provide this hook.<br>
+          Audio SCSI commands (READ&nbsp;TOC, PLAY, SUB-CHANNEL) are handled by firmware but unreachable via broken driver.<br>
+          <b>Not recommended</b> &mdash; use Generic or ESPUSBCD.SYS instead.
+        </div>
+        <div id="dosDriverNote2" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(52,152,219,.1);border:1px solid rgba(52,152,219,.3);border-radius:4px;padding:8px 12px">
+          &#10003; <b>ESPUSBCD.SYS (Panasonic) &mdash; RECOMMENDED:</b> Device: <code>MATSHITA CD-ROM CR-572</code>, SCSI-2.<br>
+          Audio: PLAY, STOP, RESUME, READ_SUB-CHANNEL via MSCDEX IOCTL.<br>
+          Communicates via <b>SCSIMGR$ DOS device</b> &mdash; works with usbaspi1.sys/usbaspi2.sys.<br>
+          <b style="color:#e67e22">CD Player compatibility:</b><br>
+          &bull; <b style="color:#e74c3c">cdplayer.exe fails with original USBCD1.SYS:</b> missing IOCTL OUT sf3 &rarr; <code>error 3</code><br>
+          &bull; <b style="color:#27ae60">CDP.COM works:</b> tolerates missing sf3, continues to PLAY/STOP/SEEK<br>
+          &bull; <b style="color:#27ae60">ESPUSBCD.SYS:</b> custom DOS driver — full IOCTL audio support, cdplayer.exe works<br>
+          CONFIG.SYS: <code>usbaspi2.sys /w /v</code> + <code>ESPUSBCD.SYS /D:USBCD0</code>
+        </div>
+        <div id="dosDriverNote3" style="display:none;margin-top:8px;font-size:.75rem;background:rgba(46,204,113,.1);border:1px solid rgba(46,204,113,.3);border-radius:4px;padding:8px 12px">
+          &#128190; <b>DI1000DD.SYS (NOVAC) + USBASPI 2.20:</b> Data-only USB storage &mdash; <b>no audio</b>.<br>
+          SD card files accessible as regular DOS drive letter (FAT).<br>
+          Use <b>usbaspi1.sys</b> as ASPI layer (Panasonic v2.20): <code>usbaspi1.sys /w /v</code> + <code>DI1000DD.SYS</code><br>
+          No MSCDEX needed. DI1000DD accepts device type 0x05 (CD-ROM) natively.
+        </div>
+      </div><!-- end dosDriverSection -->
+    </div><!-- end DOS card -->
+
+
+  </div>
     <!-- Actions -->
     <div class="card">
       <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
@@ -656,7 +676,6 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
         <span class="sp" id="sdCfgSp"></span>
       </div>
     </div>
-
 </div>
 
 <!-- ═══ GoTek Panel ══════════════════════════════════════════════════ -->
@@ -808,6 +827,16 @@ function log(m){
   if($('logAutoScroll')&&$('logAutoScroll').checked) el.scrollTop=el.scrollHeight;
 }
 
+function sendCmd(){
+  var inp=$('cmdInput'); if(!inp) return;
+  var cmd=inp.value.trim(); if(!cmd) return;
+  inp.value='';
+  log('> '+cmd);
+  fetch('/api/cmd?c='+encodeURIComponent(cmd)).then(function(r){return r.json();}).then(function(d){
+    if(!d.ok) log('[ERROR] '+(d.error||'failed'));
+    // Response will appear via log polling
+  }).catch(function(){ log('[ERROR] request failed'); });
+}
 function logFetch(){
   fetch('/api/log?seq='+logSeq).then(function(r){return r.json();}).then(function(d){
     if(!d||d.seq===undefined) return;
@@ -1058,21 +1087,16 @@ function webAuthToggle(){
   $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
 }
 function cfgApplyMode(isGotek){
-  // CD-ROM only cards — hidden in GoTek mode
   var cdCards=['cfgCardAudio','cfgCardDos'];
-  cdCards.forEach(function(id){
-    var el=$(id); if(el) el.style.display=isGotek?'none':'';
-  });
-  // Placeholder: add GoTek-only card IDs here when created
-  // var gkCards=['cfgCardGotek'];
-  // gkCards.forEach(function(id){ var el=$(id); if(el) el.style.display=isGotek?'':'none'; });
+  cdCards.forEach(function(id){ var el=$(id); if(el) el.style.display=isGotek?'none':''; });
+  var gkCards=['cfgCardGotek'];
+  gkCards.forEach(function(id){ var el=$(id); if(el) el.style.display=isGotek?'':'none'; });
 }
 function deviceModeChanged(){
   var v=parseInt($('cfgDeviceMode')?$('cfgDeviceMode').value:0);
-  var n0=$('cfgDeviceModeNote0'),n1=$('cfgDeviceModeNote1'),gr=$('cfgGotekDirRow');
+  var n0=$('cfgDeviceModeNote0'),n1=$('cfgDeviceModeNote1');
   if(n0) n0.style.display=(v===0)?'block':'none';
   if(n1) n1.style.display=(v===1)?'block':'none';
-  if(gr) gr.style.display=(v===1)?'block':'none';
   cfgApplyMode(v===1);
 }
 // ── GoTek tab functions ──────────────────────────────────────────────────────
@@ -1124,6 +1148,8 @@ function gkInit(){
   fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){
     gkIsGotek=(s.device_mode===1);
     _imgFat83=(s.img_fat83!==false&&s.img_fat83!==0);
+    _debugMode=(s.debug_mode===true||s.debug_mode===1);
+    var cb=$("cmdBar"); if(cb) cb.style.display=_debugMode?"flex":"none";
     gkApplyTabVisibility(gkIsGotek);
     var notice=$('gkCdromNotice'), panel=$('gkActivePanel');
     if(notice) notice.style.display=gkIsGotek?'none':'block';
@@ -1307,7 +1333,7 @@ function gkShowUsbDebug(){
     box.innerHTML=h;
   }).catch(function(){box.innerHTML='<span style="color:var(--red)">Error fetching debug info</span>';});
 }
-function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=show?'inline':'none'; }
+function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=(show&&_debugMode)?'inline':'none'; }
 
 function gkShowCreate(){var r=$('gkCreateRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
 function gkOpenDz(){var dz=$('gkUploadRow');if(dz){dz.style.display='block';dz.classList.remove('ov');}}
@@ -1629,7 +1655,9 @@ function imgOpen(imgPath, displayName){
 function imgModalClose(){
   $('imgModal').style.display='none';
   document.body.style.overflow='';
-  imgCurImg='';
+  var wasImg=imgCurImg; imgCurImg='';
+  // Refresh GoTek slot space display if we edited an image in the GoTek list
+  if(wasImg && typeof gkLoadList==='function') gkRefreshOneSlot(wasImg);
 }
 function imgRenderBc(dir){
   var bc=$('imgBreadcrumb'); bc.innerHTML='';
@@ -1731,6 +1759,7 @@ function toFat83(name, used) {
 }
 var imgBatchUsed = new Set();
 var _imgFat83=true; // default ON, updated from config/status
+var _debugMode=false;
 var imgUpQ=[],imgUpIdx=0,imgUpRun=false;
 function imgOpenDz(){$('imgDz').style.display='block';}
 function imgCloseDz(){$('imgDz').style.display='none';$('imgPw').style.display='none';$('imgUpFile').value='';imgUpQ=[];imgUpIdx=0;imgUpRun=false;}
@@ -1866,6 +1895,30 @@ document.addEventListener('click',function(e){
   if(m&&m.style.display!=='none'&&e.target===m) imgModalClose();
 });
 // ── end GoTek JS ─────────────────────────────────────────────────────────────
+// Refresh space display for a single slot after image editor changes
+function gkRefreshOneSlot(imgPath){
+  var fname=imgPath.split('/').pop();
+  // Find the slot that matches this filename
+  if(!gkFilesList) return;
+  gkFilesList.forEach(function(f){
+    if(f.name!==fname) return;
+    var spEl=$('gkSpace_'+f.slot), barEl=$('gkBar_'+f.slot);
+    if(!spEl) return;
+    fetch('/api/img/stat?img='+encodeURIComponent(imgPath))
+      .then(function(r){return r.json();}).then(function(st){
+        if(!st.ok) return;
+        var freeKB=Math.round(st.free_bytes/1024);
+        var usedKB=Math.round(st.used_bytes/1024);
+        var totKB=Math.round(st.total_bytes/1024);
+        var pct=totKB>0?Math.round(st.used_bytes/st.total_bytes*100):0;
+        var col=pct>90?'var(--red)':pct>75?'#e3b341':'var(--green)';
+        spEl.innerHTML='<span style="color:'+col+';font-weight:bold">'+usedKB+' KB</span>'
+          +' <span style="color:var(--tx2)">used &bull; </span>'
+          +'<span style="color:var(--tx2)">'+freeKB+' KB free</span>';
+        if(barEl){barEl.style.width=pct+'%';barEl.style.background=col;}
+      }).catch(function(){});
+  });
+}
 function gkRefresh(){
   spin('gkSp',true);$('gkRefBtn').disabled=true;
   fetch('/api/gotek/refresh').then(function(r){return r.json();}).then(function(d){
@@ -1926,7 +1979,7 @@ function delConfirm(){
 function gkUpload(){ gkOpenDz(); }
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 // ── end GoTek JS ─────────────────────────────────────────────────────────────
-function showTab(n){curTab=n;for(var i=0;i<7;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===3){if($("logLiveUpdate")&&$("logLiveUpdate").checked){if(!logTimer)logTimer=setInterval(logFetch,1000);logFetch();}}else{if(n!==3&&logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===3){if(!logTimer&&$("logLiveUpdate")&&$("logLiveUpdate").checked){logTimer=setInterval(logFetch,1000);}logFetch();}else if(n!==3){if(logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===4)loadSysinfo();if(n===5)cfgLoad();if(n===6)gkInit();}
+function showTab(n){var _tgt=$('t'+n);if(_tgt&&_tgt.classList.contains('disabled'))return;curTab=n;for(var i=0;i<7;i++){var tEl=$('t'+i);if(tEl&&!tEl.classList.contains('disabled'))tEl.classList.toggle('active',i===n);var pEl=$('p'+i);if(pEl)pEl.classList.toggle('active',i===n);}if(n===1){apStartPoll();}else{apStopPoll();}if(n===0)cdLoadDir(cdPath);if(n===2)fmLoadDir(fmPath);if(n===3){if($("logLiveUpdate")&&$("logLiveUpdate").checked){if(!logTimer)logTimer=setInterval(logFetch,1000);logFetch();}}else{if(n!==3&&logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===3){if(!logTimer&&$("logLiveUpdate")&&$("logLiveUpdate").checked){logTimer=setInterval(logFetch,1000);}logFetch();}else if(n!==3){if(logTimer&&!($("logLiveUpdate")&&$("logLiveUpdate").checked)){clearInterval(logTimer);logTimer=null;}}if(n===4)loadSysinfo();if(n===5)cfgLoad();if(n===6)gkInit();}
 
 function cfgMsg(id,txt,isOk){var el=$(id);el.style.display='block';el.style.color=isOk?'var(--green)':'var(--red)';el.textContent=txt;}
 
@@ -2306,16 +2359,49 @@ function cfgSave(){
 }
 
 function cfgReboot(){
-  if(!confirm('Reboot the ESP32?'))return;
-  spin('cfgActSp',true);
-  fetch('/api/reboot').then(function(r){return r.text();}).then(function(m){
-    spin('cfgActSp',false);
-    cfgMsg('cfgActMsg','Rebooting... reconnect in ~5s',true);log(m);
-  }).catch(function(){spin('cfgActSp',false);cfgMsg('cfgActMsg','Rebooting...',true);});
+  $('rebootModal').classList.add('show');
+}
+function rebootCancel(){$('rebootModal').classList.remove('show');}
+function rebootConfirm(){
+  $('rebootModal').classList.remove('show');
+  fetch('/api/reboot').catch(function(){});
+  // Show countdown overlay
+  var total=12, elapsed=0;
+  var ovl=$('rebootProgress');
+  var txt=$('rebootProgressTxt');
+  var bar=$('rebootProgressBar');
+  var sub=$('rebootProgressSub');
+  ovl.classList.add('show');
+  function tick(){
+    elapsed++;
+    var left=Math.max(0,total-elapsed);
+    if(txt) txt.textContent=left+'s';
+    if(bar) bar.style.width=Math.min(100,Math.round(elapsed/total*100))+'%';
+    // After initial wait, start polling
+    if(elapsed>=4){
+      if(sub) sub.textContent='Connecting…';
+      fetch('/api/status',{cache:'no-store'}).then(function(r){
+        if(r.ok){ location.reload(); return; }
+        if(elapsed<total) setTimeout(tick,1000);
+        else location.reload();
+      }).catch(function(){
+        if(elapsed<total) setTimeout(tick,1000);
+        else location.reload();
+      });
+    } else {
+      if(sub) sub.textContent='Rebooting…';
+      setTimeout(tick,1000);
+    }
+  }
+  setTimeout(tick,1000);
 }
 
 function cfgFactory(){
-  if(!confirm('Factory reset will erase ALL settings and reboot. Continue?'))return;
+  $('factoryModal').classList.add('show');
+}
+function factoryCancel(){$('factoryModal').classList.remove('show');}
+function factoryConfirm(){
+  $('factoryModal').classList.remove('show');
   spin('cfgActSp',true);
   fetch('/api/factory').then(function(r){return r.text();}).then(function(m){
     spin('cfgActSp',false);
@@ -2437,9 +2523,29 @@ function loadSysinfo(){
     siRow(sy,'Device mode',s.device_mode===1
       ?'<span style="color:#e3b341">&#128190; GoTek floppy emulator</span>'
       :'<span style="color:var(--ok)">&#128249; CD-ROM emulator</span>');
-    siRow(sy,'Debug logging',s.debug_mode
-      ?'<span style="color:var(--warn)">&#9888; ON &mdash; verbose SCSI/API logs</span>'
-      :'<span style="color:var(--ok)">OFF &mdash; quiet</span>');
+    // Debug logging row with toggle
+    {var tr=document.createElement('tr');
+    var t1=document.createElement('td');t1.textContent='Debug logging';
+    var t2=document.createElement('td');
+    var dbOn=s.debug_mode===true||s.debug_mode===1;
+    t2.innerHTML='<span style="display:flex;align-items:center;gap:10px">'
+      +'<label class="tog" title="Toggle debug logging">'
+      +'<input type="checkbox" id="siDebugToggle"'+(dbOn?' checked':'')+'>'  
+      +'<span class="tog-sl"></span></label>'
+      +'<span id="siDebugLbl" style="font-size:.82rem;color:'+(dbOn?'var(--warn)':'var(--ok)')+'">'  
+      +(dbOn?'&#9888; ON &mdash; verbose SCSI/API logs':'OFF &mdash; quiet')
+      +'</span></span>';
+    sy.appendChild(tr);tr.append(t1,t2);
+    var tog=$('siDebugToggle');
+    if(tog&&!tog._bound){tog._bound=true;tog.addEventListener('change',function(){
+      var on=this.checked;
+      fetch('/api/config/save?debugMode='+(on?'true':'false')).then(function(){
+        _debugMode=on;
+        var lbl=$('siDebugLbl');if(lbl){lbl.style.color=on?'var(--warn)':'var(--ok)';lbl.innerHTML=on?'&#9888; ON &mdash; verbose SCSI/API logs':'OFF &mdash; quiet';}
+        var cb=$('cmdBar');if(cb)cb.style.display=on?'flex':'none';
+        if(typeof gkShowUsbBadge==='function'){var b=$('gkUsbBadge');if(b&&b.style.display!=='none'||on)gkShowUsbBadge(on);}
+      }).catch(function(){this.checked=!on;}.bind(this));
+    });}}
       // GoTek section
       var gkCard=$('siGotekCard'), gkt=$('siGotek');
       // gkApplyTabVisibility handles siImgCard/siAudioCard visibility
@@ -2485,6 +2591,11 @@ function loadSysinfo(){
 var curDefault='', dosCompatOn=false, curMounted='';
 function loadStatus(){
   fetch('/api/status').then(function(r){return r.json();}).then(function(s){
+    // Sync debug mode and cmdBar visibility on every status poll
+    if(typeof s.debug_mode!=='undefined'){
+      _debugMode=(s.debug_mode===true||s.debug_mode===1);
+      var cb=$('cmdBar');if(cb)cb.style.display=_debugMode?'flex':'none';
+    }
     $('badge').textContent=s.mounted?'MOUNTED':'NONE';
     $('badge').className='badge '+(s.mounted?'on':'off');
     $('mname').textContent=s.mounted?s.file:'— nothing mounted —';
@@ -2763,6 +2874,35 @@ function clearLog(){$('log').textContent='Log cleared.\n';}
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn" onclick="closeMkdir()">Cancel</button>
       <button class="btn b" onclick="doMkdir()">&#10003; Create</button>
+    </div>
+  </div>
+</div>
+<div id="rebootProgress" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:2000;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:28px 32px;min-width:260px;max-width:360px;width:90%;text-align:center">
+    <div style="font-size:2.8rem;font-weight:bold;color:#e3b341;line-height:1;margin-bottom:8px" id="rebootProgressTxt">12s</div>
+    <div style="font-size:.8rem;color:var(--tx2);margin-bottom:16px" id="rebootProgressSub">Rebooting…</div>
+    <div style="height:6px;background:var(--border2);border-radius:3px;overflow:hidden">
+      <div id="rebootProgressBar" style="height:100%;width:0%;background:#e3b341;border-radius:3px;transition:width .9s linear"></div>
+    </div>
+  </div>
+</div>
+<div id="rebootModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1003;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div class="ct" style="margin-bottom:12px;color:#e3b341">&#8635; Reboot</div>
+    <div style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5">Reboot the ESP32? The device will be unreachable for ~5 seconds.</div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="rebootCancel()">Cancel</button>
+      <button class="btn yw" onclick="rebootConfirm()">&#8635; Reboot</button>
+    </div>
+  </div>
+</div>
+<div id="factoryModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1003;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div class="ct" style="margin-bottom:12px;color:var(--red)">&#9888; Factory Reset</div>
+    <div style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5">Erase <b>all settings</b> and reboot?<br>Wi-Fi, certificates and all configuration will be lost.</div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="factoryCancel()">Cancel</button>
+      <button class="btn r" onclick="factoryConfirm()">&#9888; Factory reset</button>
     </div>
   </div>
 </div>
