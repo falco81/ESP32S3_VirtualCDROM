@@ -819,9 +819,9 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 <script>
 function $(id){return document.getElementById(id);}
 var logSeq=0, logTimer=null;
+var logClearedSeq=-1;  // -1=normal mode; >=0=server seq at last clear
 
 function log(m){
-  // Client-side log — for UI action feedback
   var el=$('log');
   if(!el) return;
   var t=new Date().toTimeString().slice(0,8);
@@ -836,18 +836,31 @@ function sendCmd(){
   log('> '+cmd);
   fetch('/api/cmd?c='+encodeURIComponent(cmd)).then(function(r){return r.json();}).then(function(d){
     if(!d.ok) log('[ERROR] '+(d.error||'failed'));
-    // Response will appear via log polling
   }).catch(function(){ log('[ERROR] request failed'); });
 }
+
 function logFetch(){
   fetch('/api/log?seq='+logSeq).then(function(r){return r.json();}).then(function(d){
     if(!d||d.seq===undefined) return;
     if(d.seq!==logSeq){
-      // New content available — replace entire log content
       logSeq=d.seq;
       var el=$('log');
       if(!el) return;
-      el.textContent=d.log;
+      var newLog=d.log||'';
+      if(logClearedSeq<0){
+        // Normal mode — show full server log
+        el.textContent=newLog;
+      } else {
+        // After clear: show only lines added since clear.
+        // d.seq - logClearedSeq = number of webLog() calls since clear ≈ number of new lines.
+        // Slice the tail of the ring buffer to extract just the new content.
+        // This works even when the ring buffer has wrapped (unlike startsWith approach).
+        var newCount=d.seq-logClearedSeq;
+        var lines=newLog?newLog.split('\n'):[];
+        if(lines.length&&lines[lines.length-1]==='') lines.pop();
+        var fresh=newCount>0?lines.slice(Math.max(0,lines.length-newCount)):[];
+        el.textContent=fresh.length?fresh.join('\n')+'\n':'';
+      }
       if($('logAutoScroll')&&$('logAutoScroll').checked) el.scrollTop=el.scrollHeight;
     }
   }).catch(function(){});
@@ -858,7 +871,6 @@ function logLiveToggle(){
   if(live){
     if(!logTimer) logTimer=setInterval(logFetch,1000);
     logFetch();
-  // Pre-fetch dosCompatOn so doMount knows mode before Status tab is opened
   fetch('/api/sysinfo').then(function(r){return r.json();}).then(function(s){
     dosCompatOn=s.dos_compat||false;
     gkApplyTabVisibility(s.device_mode===1);
@@ -870,9 +882,18 @@ function logLiveToggle(){
 
 function clearLog(){
   var el=$('log');
-  if(el) el.textContent='Log cleared.\n';
+  if(!el) return;
+  el.textContent='';
+  // Snapshot current server seq — used as baseline for "lines added since clear".
+  // seq increments once per webLog() call ≈ once per log line.
+  // New content after clear = last (d.seq - logClearedSeq) lines of ring buffer.
+  fetch('/api/log?seq=0').then(function(r){return r.json();}).then(function(d){
+    logClearedSeq=d?d.seq:logSeq;
+    logSeq=logClearedSeq;
+  }).catch(function(){ logClearedSeq=logSeq; });
 }
 function fmtSz(b){if(!b||b<0)return '';var u=['B','KB','MB','GB'],i=0;while(b>=1024&&i<3){b/=1024;i++;}return(i?b.toFixed(1):b)+'\u00a0'+u[i];}
+function fmtSpeed(bps){if(!bps||bps<0)return '';var u=['B/s','KB/s','MB/s'],i=0,v=bps;while(v>=1024&&i<2){v/=1024;i++;}return(i?v.toFixed(1):Math.round(v))+'\u00a0'+u[i];}
 function spin(id,on){$(id).style.display=on?'inline-block':'none';}
 function jp(b,n){return b==='/'?'/'+n:b+'/'+n;}
 function mkTr(){return document.createElement('tr');}
@@ -1373,22 +1394,24 @@ function gkShowUsbBadge(show){ var b=$('gkUsbBadge'); if(b) b.style.display=(sho
 
 function gkShowCreate(){var r=$('gkCreateRow');if(r){var v=r.style.display==='none'||!r.style.display;r.style.display=v?'flex':'none';}}
 function gkOpenDz(){var dz=$('gkUploadRow');if(dz){dz.style.display='block';dz.classList.remove('ov');}}
-function gkCloseDz(){var dz=$('gkUploadRow');if(dz)dz.style.display='none';var pw=$('gkPw');if(pw)pw.style.display='none';var fi=$('gkUpFile');if(fi)fi.value='';gkUpQ=[];gkUpIdx=0;gkUpRun=false;}
-var gkUpQ=[],gkUpIdx=0,gkUpRun=false;
+function gkCloseDz(){if(gkUpXhr){gkUpXhr.abort();gkUpXhr=null;}var dz=$('gkUploadRow');if(dz)dz.style.display='none';var pw=$('gkPw');if(pw)pw.style.display='none';var fi=$('gkUpFile');if(fi)fi.value='';gkUpQ=[];gkUpIdx=0;gkUpRun=false;}
+var gkUpQ=[],gkUpIdx=0,gkUpRun=false,gkUpXhr=null;
 function gkQueueFiles(files){if(!files||!files.length)return;var arr=Array.from(files);gkUpQ=gkUpRun?gkUpQ.concat(arr):arr;gkUpIdx=gkUpRun?gkUpIdx:0;if(!gkUpRun)gkUploadNext();}
 function gkUploadNext(){
-  if(gkUpIdx>=gkUpQ.length){gkUpRun=false;var pw=$('gkPw');if(pw)pw.style.display='none';gkCloseDz();gkRefresh();return;}
+  if(gkUpIdx>=gkUpQ.length){gkUpRun=false;gkUpXhr=null;var pw=$('gkPw');if(pw)pw.style.display='none';gkCloseDz();gkRefresh();return;}
   gkUpRun=true;var file=gkUpQ[gkUpIdx];
   var pw=$('gkPw');if(pw)pw.style.display='block';
   $('gkPf').textContent='('+(gkUpIdx+1)+'/'+gkUpQ.length+') '+file.name;
   $('gkPbi').style.width='0%';$('gkPp').textContent='0%';
   var dir='/'+($('gkDir').textContent||'gotek').replace(/^\//,'');
   var fd=new FormData();fd.append('file',file,file.name);
-  var xhr=new XMLHttpRequest();
+  var _upStart=Date.now();
+  var xhr=new XMLHttpRequest();gkUpXhr=xhr;
   xhr.open('POST','/api/upload?path='+encodeURIComponent(dir));
-  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('gkPbi').style.width=p+'%';$('gkPp').textContent=p+'%';}};
-  xhr.onload=function(){gkUpIdx++;gkUploadNext();};
-  xhr.onerror=function(){gkUpIdx++;gkUploadNext();};
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('gkPbi').style.width=p+'%';var dt=(Date.now()-_upStart)/1000;var spd=dt>0.2?fmtSpeed(e.loaded/dt):'';$('gkPp').textContent=p+'%  '+fmtSz(e.loaded)+'/'+fmtSz(e.total)+(spd?'  • '+spd:'');}};
+  xhr.onload=function(){gkUpXhr=null;gkUpIdx++;gkUploadNext();};
+  xhr.onerror=function(){gkUpXhr=null;gkUpIdx++;gkUploadNext();};
+  xhr.onabort=function(){gkUpXhr=null;gkUpRun=false;};
   xhr.send(fd);
 }
 function gkUpload(){ gkOpenDz(); }
@@ -1796,9 +1819,9 @@ function toFat83(name, used) {
 var imgBatchUsed = new Set();
 var _imgFat83=true; // default ON, updated from config/status
 var _debugMode=false;
-var imgUpQ=[],imgUpIdx=0,imgUpRun=false;
+var imgUpQ=[],imgUpIdx=0,imgUpRun=false,imgUpXhr=null;
 function imgOpenDz(){$('imgDz').style.display='block';}
-function imgCloseDz(){$('imgDz').style.display='none';$('imgPw').style.display='none';$('imgUpFile').value='';imgUpQ=[];imgUpIdx=0;imgUpRun=false;}
+function imgCloseDz(){if(imgUpXhr){imgUpXhr.abort();imgUpXhr=null;}$('imgDz').style.display='none';$('imgPw').style.display='none';$('imgUpFile').value='';imgUpQ=[];imgUpIdx=0;imgUpRun=false;}
 var _imgPendingFiles=null;
 function imgSpaceCancel(){$('imgSpaceModal').style.display='none';_imgPendingFiles=null;}
 function imgSpaceOk(){
@@ -1858,16 +1881,19 @@ function imgUploadNext(){
   $("imgPf").textContent='('+( imgUpIdx+1)+'/'+imgUpQ.length+') '+displayName;
   var fpath=(imgCurDir==='/'?'/':imgCurDir+'/')+fat83name;
   var fd=new FormData(); fd.append('file',file,fat83name);
-  var xhr=new XMLHttpRequest();
+  var _upStart=Date.now();
+  var xhr=new XMLHttpRequest();imgUpXhr=xhr;
   xhr.open('POST','/api/img/put?img='+encodeURIComponent(imgCurImg)+'&file='+encodeURIComponent(fpath));
-  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('imgPbi').style.width=p+'%';$('imgPp').textContent=p+'% ('+Math.round(e.loaded/1024)+'/'+Math.round(e.total/1024)+' KB)';}};
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('imgPbi').style.width=p+'%';var dt=(Date.now()-_upStart)/1000;var spd=dt>0.2?fmtSpeed(e.loaded/dt):'';$('imgPp').textContent=p+'%  '+Math.round(e.loaded/1024)+'/'+Math.round(e.total/1024)+' KB'+(spd?'  • '+spd:'');}};
   xhr.onload=function(){
+    imgUpXhr=null;
     try{var d=JSON.parse(xhr.responseText);
       if(!d.ok){$('imgUpMsg').textContent='Error: '+(d.error||'failed');$('imgUpMsg').style.color='var(--red)';}
     }catch(e){}
     imgUpIdx++;imgRefreshSpace();imgUploadNext();
   };
-  xhr.onerror=function(){$('imgUpMsg').textContent='Network error: '+file.name;$('imgUpMsg').style.color='var(--red)';imgUpIdx++;imgUploadNext();};
+  xhr.onerror=function(){imgUpXhr=null;$('imgUpMsg').textContent='Network error: '+file.name;$('imgUpMsg').style.color='var(--red)';imgUpIdx++;imgUploadNext();};
+  xhr.onabort=function(){imgUpXhr=null;imgUpRun=false;};
   xhr.send(fd);
 }
 function imgCheckFileSize(){ /* no-op — kept for compat */ }
@@ -2806,18 +2832,23 @@ function openMkdir(){$('mkName').value='';$('mkModal').classList.add('show');set
 function closeMkdir(){$('mkModal').classList.remove('show');}
 function doMkdir(){var name=$('mkName').value.trim();if(!name)return;closeMkdir();var fp=(fmPath==='/'?'':fmPath)+'/'+name;fetch('/api/mkdir?path='+encodeURIComponent(fp)).then(function(r){return r.text();}).then(function(m){log(m);fmLoadDir(fmPath);}).catch(function(){log('ERROR: mkdir failed.');});}
 
-var upQ=[],upIdx=0,upRun=false;
+var upQ=[],upIdx=0,upRun=false,upXhr=null;
 function openDz(){$('dz').style.display='block';}
-function closeDz(){$('dz').style.display='none';$('pw').style.display='none';$('fi').value='';upQ=[];upIdx=0;}
+function closeDz(){
+  if(upXhr){upXhr.abort();upXhr=null;}
+  $('dz').style.display='none';$('pw').style.display='none';$('fi').value='';upQ=[];upIdx=0;upRun=false;
+}
 function queueFiles(files){if(!files||!files.length)return;upQ=upRun?upQ.concat(Array.from(files)):Array.from(files);upIdx=upRun?upIdx:0;if(!upRun)uploadNext();}
 function uploadNext(){
-  if(upIdx>=upQ.length){upRun=false;log('All files uploaded.');fmLoadDir(fmPath);closeDz();return;}
+  if(upIdx>=upQ.length){upRun=false;upXhr=null;log('All files uploaded.');fmLoadDir(fmPath);closeDz();return;}
   upRun=true;var file=upQ[upIdx];
   $('pw').style.display='block';$('pf').textContent='('+(upIdx+1)+'/'+upQ.length+') '+file.name;$('pbi').style.width='0%';$('pp').textContent='0%';
-  var xhr=new XMLHttpRequest();xhr.open('POST','/api/upload?path='+encodeURIComponent(fmPath));
-  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('pbi').style.width=p+'%';$('pp').textContent=p+'% ('+fmtSz(e.loaded)+'/'+fmtSz(e.total)+')';}};
-  xhr.onload=function(){if(xhr.status===200)log('Uploaded: '+file.name);else log('ERROR: '+file.name);upIdx++;uploadNext();};
-  xhr.onerror=function(){log('Network error: '+file.name);upIdx++;uploadNext();};
+  var _upStart=Date.now();
+  var xhr=new XMLHttpRequest();upXhr=xhr;xhr.open('POST','/api/upload?path='+encodeURIComponent(fmPath));
+  xhr.upload.onprogress=function(e){if(e.lengthComputable){var p=Math.round(e.loaded/e.total*100);$('pbi').style.width=p+'%';var dt=(Date.now()-_upStart)/1000;var spd=dt>0.2?fmtSpeed(e.loaded/dt):'';$('pp').textContent=p+'%  '+fmtSz(e.loaded)+'/'+fmtSz(e.total)+(spd?'  • '+spd:'');}};
+  xhr.onload=function(){upXhr=null;if(xhr.status===200)log('Uploaded: '+file.name);else log('ERROR: '+file.name);upIdx++;uploadNext();};
+  xhr.onerror=function(){upXhr=null;log('Network error: '+file.name);upIdx++;uploadNext();};
+  xhr.onabort=function(){upXhr=null;upRun=false;log('Upload cancelled: '+file.name);};
   var fd=new FormData();fd.append('file',file,file.name);xhr.send(fd);
 }
 (function(){var dz=$('dz'),tb=$('fmTbl');[dz,tb].forEach(function(el){el.addEventListener('dragover',function(e){e.preventDefault();openDz();dz.classList.add('ov');});el.addEventListener('dragleave',function(){dz.classList.remove('ov');});el.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('ov');if(e.dataTransfer.files.length)queueFiles(e.dataTransfer.files);});});})();
@@ -2892,8 +2923,6 @@ function sdMount(){
 }
 
 loadStatus();cdLoadDir('/');fmLoadDir('/');setInterval(loadStatus,5000);
-
-function clearLog(){$('log').textContent='Log cleared.\n';}
 </script>
 <div id="imgMkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1001;align-items:center;justify-content:center">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">

@@ -38,6 +38,7 @@
 #include <mbedtls/x509_crt.h>
 #include <mbedtls/base64.h>  // for reading CN from client cert
 #include <esp_log.h>             // for WPA debug logging
+#define HTTP_UPLOAD_BUFLEN 8192  // default 1436 → ~5ms recv() overhead/chunk → 200 KB/s; 8192 → ~5.7× faster
 #include <WebServer.h>
 #include <esp_https_server.h>   // ESP-IDF HTTPS server
 #include <SPI.h>
@@ -47,6 +48,7 @@
 #include "USB.h"
 #include "USBMSC.h"
 #include <driver/i2s_std.h>       // PCM5102 audio output
+#include <lwip/sockets.h>          // setsockopt SO_RCVTIMEO for upload abort detection
 extern "C" { bool tud_disconnect(void); bool tud_connect(void); void msc_set_unit_attention(void); }
 
 // Forward declarations for Arduino prototype generator
@@ -4031,6 +4033,36 @@ bool   uploadActive   = false;
 bool   uploadOk       = false;
 bool   downloadActive = false;
 
+// Write buffer — accumulates small TCP chunks before flushing to SD.
+// SD cards have ~5-15 ms latency per write call regardless of size.
+// Buffering to 32 KB reduces write calls by ~22× → upload speed 3-5× faster.
+// Upload write buffer — in PSRAM (large, keeps up with WiFi receive rate).
+// NOTE: SDMMC DMA cannot read directly from PSRAM on ESP32-S3 when DRAM heap
+// is nearly exhausted (~11KB free) — the driver's bounce buffer allocation fails,
+// causing writes to degrade to tiny pieces.  uploadFlush() works around this by
+// copying through a small DRAM stack buffer that DMA can access directly.
+#define UPLOAD_BUF_SIZE (64 * 1024)
+static uint8_t* uploadBuf     = nullptr;
+static size_t   uploadBufUsed = 0;
+
+static bool uploadFlush() {
+  if (!uploadBuf || uploadBufUsed == 0) return true;
+  // Write in 4 KB chunks through a stack buffer (DRAM).
+  // SDMMC DMA works directly on DRAM without a bounce buffer —
+  // bypassing the PSRAM→DRAM bounce allocation that fails with <11KB free heap.
+  const size_t CHUNK = 4096;
+  uint8_t tmp[CHUNK];
+  size_t done = 0;
+  while (done < uploadBufUsed) {
+    size_t n = (uploadBufUsed - done < CHUNK) ? uploadBufUsed - done : CHUNK;
+    memcpy(tmp, (const uint8_t*)uploadBuf + done, n);
+    if (uploadFile.write(tmp, n) != n) { uploadBufUsed = 0; return false; }
+    done += n;
+  }
+  uploadBufUsed = 0;
+  return true;
+}
+
 void handleFileUpload() {
   if (!checkAuth()) return;
   HTTPUpload &upload = httpServer.upload();
@@ -4038,26 +4070,64 @@ void handleFileUpload() {
     String dir = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "/";
     uploadFilePath = (dir == "/" ? "" : dir) + "/" + String(upload.filename);
     dualPrint.printf("[UPLOAD] Start: %s\n", uploadFilePath.c_str());
+    if (!uploadBuf) {
+      // Allocate receive buffer from PSRAM — 64 KB for WiFi data accumulation.
+      // DRAM is nearly exhausted at runtime (~11KB free), so MALLOC_CAP_INTERNAL
+      // would fail. PSRAM has plenty of space. The uploadFlush() function handles
+      // the PSRAM→SD path via a small DRAM stack buffer.
+      uploadBuf = (uint8_t*)heap_caps_malloc(UPLOAD_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (!uploadBuf) uploadBuf = (uint8_t*)malloc(UPLOAD_BUF_SIZE);
+    }
+    uploadBufUsed = 0;
     uploadOk     = (bool)(uploadFile = SD_MMC.open(uploadFilePath.c_str(), FILE_WRITE));
     uploadActive = true;
     if (!uploadOk) dualPrint.printf("[ERR] Cannot open for write: %s\n", uploadFilePath.c_str());
+    // Set socket receive timeout — detects abort (browser stops sending) within 3 seconds.
+    // xhr.abort() in Chrome doesn't immediately close TCP; it just stops sending data.
+    // Without timeout, ESP32 blocks inside recv() indefinitely after abort.
+    // 3s is safe: normal upload data arrives every few ms at 300+ KB/s.
+    int fd = httpServer.client().fd();
+    if (fd >= 0) {
+      struct timeval tv = {3, 0};  // 3 second receive timeout
+      setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
   } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (uploadOk && uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
-      dualPrint.println(F("[ERR] Write error!")); uploadOk = false;
+    if (uploadOk && uploadBuf) {
+      size_t remaining = upload.currentSize;
+      const uint8_t* src = upload.buf;
+      while (remaining > 0) {
+        size_t space = UPLOAD_BUF_SIZE - uploadBufUsed;
+        size_t chunk = (remaining < space) ? remaining : space;
+        memcpy(uploadBuf + uploadBufUsed, src, chunk);
+        uploadBufUsed += chunk;
+        src           += chunk;
+        remaining     -= chunk;
+        if (uploadBufUsed == UPLOAD_BUF_SIZE) {
+          if (!uploadFlush()) { uploadOk = false; break; }
+        }
+      }
+    } else if (uploadOk) {
+      if (uploadFile.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        dualPrint.println(F("[ERR] Write error!")); uploadOk = false;
+      }
     }
   } else if (upload.status == UPLOAD_FILE_END) {
     if (uploadOk) {
+      uploadFlush();
       uploadFile.close();
       dualPrint.printf("[UPLOAD] OK: %s  (%zu B)\n", uploadFilePath.c_str(), upload.totalSize);
     } else {
       if (uploadFile) uploadFile.close();
       SD_MMC.remove(uploadFilePath.c_str());
     }
-    uploadActive = false;
+    uploadBufUsed = 0;
+    uploadActive  = false;
   } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    uploadBufUsed = 0;
     if (uploadFile) uploadFile.close();
     if (uploadActive) SD_MMC.remove(uploadFilePath.c_str());
     uploadActive = false; uploadOk = false;
+    dualPrint.println(F("[UPLOAD] Aborted by client."));
   }
 }
 
@@ -4094,9 +4164,55 @@ bool checkAuth() {
   return false;
 }
 
+// Offset of "<script src="/api/mode.js"></script>" in HTML_PAGE PROGMEM.
+// Computed once on first request and cached.  This avoids 6+ second page load
+// stall caused by the single-threaded WebServer: with send_P the 157KB HTML
+// transfer blocks for ~6s, and the browser's synchronous <script src="mode.js">
+// request waits in the TCP queue the whole time.  Inlining eliminates the separate
+// request entirely — the page renders as fast as the HTML transfer allows.
+static size_t _rootMarkerPos  = SIZE_MAX;  // SIZE_MAX = not yet found
+static size_t _rootMarkerLen  = 0;
+
 void handleRoot() {
   if (!checkAuth()) return;
-  httpServer.send_P(200, "text/html; charset=utf-8", HTML_PAGE);
+
+  // ETag caching: after the first (slow) load, subsequent reloads return 304 in <50ms.
+  // ETag includes deviceMode so cache invalidates when mode changes.
+  String etag = "\"espcd-" + String(cfg.deviceMode) + "\"";
+  httpServer.sendHeader("Cache-Control", "no-cache");
+  httpServer.sendHeader("ETag", etag);
+  if (httpServer.hasHeader("If-None-Match") && httpServer.header("If-None-Match") == etag) {
+    httpServer.send(304, "text/plain", "");
+    return;
+  }
+  // One-time scan: find the mode.js script tag position in PROGMEM
+  if (_rootMarkerPos == SIZE_MAX) {
+    static const char marker[] = "<script src=\"/api/mode.js\"></script>";
+    _rootMarkerLen = sizeof(marker) - 1;
+    size_t htmlLen = strlen_P(HTML_PAGE);
+    _rootMarkerPos = htmlLen;  // fallback: not found → inject at end
+    for (size_t i = 0; i + _rootMarkerLen <= htmlLen; i++) {
+      bool match = true;
+      for (size_t j = 0; j < _rootMarkerLen && match; j++)
+        if (pgm_read_byte(HTML_PAGE + i + j) != (uint8_t)marker[j]) match = false;
+      if (match) { _rootMarkerPos = i; break; }
+    }
+  }
+
+  // Build inline replacement: <script>window.DEVICE_MODE=N;window.GOTEK_DIR="…";</script>
+  String inlineScript = "<script>window.DEVICE_MODE=" + String(cfg.deviceMode) +
+                        ";window.GOTEK_DIR=\"" + jsonEsc(gotekImgDir.c_str()) + "\";</script>";
+
+  size_t htmlLen     = strlen_P(HTML_PAGE);
+  size_t afterOff    = _rootMarkerPos + _rootMarkerLen;
+  size_t afterLen    = htmlLen - afterOff;
+  size_t totalLen    = _rootMarkerPos + inlineScript.length() + afterLen;
+
+  httpServer.setContentLength(totalLen);
+  httpServer.send(200, "text/html; charset=utf-8", "");
+  httpServer.sendContent_P(HTML_PAGE, _rootMarkerPos);    // HTML up to the script tag
+  httpServer.sendContent(inlineScript);                    // inline DEVICE_MODE
+  httpServer.sendContent_P(HTML_PAGE + afterOff, afterLen); // rest of HTML
 }
 
 void handleApiStatus() {
@@ -4128,6 +4244,7 @@ void handleApiLog() {
   // Determine how much of the buffer to return
   uint32_t total = webLogHead;
   uint32_t start = (total > WEB_LOG_SIZE) ? (total - WEB_LOG_SIZE) : 0;
+  resp.reserve(WEB_LOG_SIZE + 64);  // avoid repeated realloc during character loop
   resp += "\"";  // JSON string open
   // Escape and output
   for (uint32_t i = start; i < total; i++) {
@@ -4699,6 +4816,8 @@ void handleApiDelete() {
 
 void handleApiUploadDone() {
   if (!checkAuth()) return;
+  // Client might have disconnected (upload aborted) — sending on dead TCP blocks the ESP32.
+  if (!httpServer.client().connected()) return;
   if (uploadOk) httpServer.send(200, "text/plain", "OK");
   else          httpServer.send(500, "text/plain", "ERROR: upload failed");
 }
@@ -5646,8 +5765,8 @@ void setupWebServer() {
   httpServer.on("/api/audio/volume", HTTP_GET,  handleApiAudioVolume);
   httpServer.on("/api/audio/mute",   HTTP_GET,  handleApiAudioMute);
   httpServer.on("/api/audio/seek",   HTTP_GET,  handleApiAudioSeek);
-  static const char* hdrs[] = {"X-Internal-Proxy", "Authorization", "Content-Type", "Host"};
-  httpServer.collectHeaders(hdrs, 4);
+  static const char* hdrs[] = {"X-Internal-Proxy", "Authorization", "Content-Type", "Host", "If-None-Match"};
+  httpServer.collectHeaders(hdrs, 5);
   httpServer.begin();
   if (cfg.httpsEnabled) {
     httpServer.onNotFound(handleHttpRedirect);
@@ -6129,6 +6248,7 @@ void reinitSD() {
 void processCommand(String &line) {
   line.trim();
   if (!line.length()) return;
+  dualPrint.printf("> %s\n", line.c_str());  // echo command to Serial + HTML log
   if      (line.equalsIgnoreCase("help"))           printHelp();
   else if (line.equalsIgnoreCase("show config"))    printConfig();
   else if (line.length() >= 10 &&
@@ -6367,7 +6487,23 @@ void processCommand(String &line) {
 // =============================================================================
 void setup() {
   Serial.begin(115200);
+  // Arduino-ESP32 3.3.8 PR #11159 hooks ets_printf (low-level UART function used
+  // by WiFi/lwIP stack internally) in addition to esp_log_set_vprintf.
+  // esp_log_level_set("*", NONE) suppresses ESP_LOGI/D macros but NOT ets_printf.
+  // With setDebugOutput(false), ets_printf is unhooked from UART — WiFi stack
+  // internal prints go nowhere instead of blocking at 115200 baud on every TCP packet.
+  // Our own Serial.printf() calls are unaffected (they write to UART directly).
+  Serial.setDebugOutput(false);
   delay(800);
+
+  // Arduino-ESP32 3.3.8 introduced "log redirection" (PR #11159) which hooks
+  // esp_log_set_vprintf() and routes ALL ESP-IDF internal logs (WiFi, lwIP,
+  // TCP stack) through Arduino HardwareSerial — adding mutex overhead on every
+  // internal log message.  During a 157KB HTTP response the WiFi/lwIP stack
+  // generates dozens of these, blocking the serial path and slowing page load
+  // by 3-10×.  Silencing IDF-level logs eliminates this overhead entirely.
+  // User dualPrint / Serial.printf() calls are unaffected — they bypass this path.
+  esp_log_level_set("*", ESP_LOG_NONE);  // suppress all IDF internal logs
 
   rgbLed.begin();
   rgbLed.setBrightness(0);
