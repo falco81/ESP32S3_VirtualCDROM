@@ -63,6 +63,8 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 #delModal.show{display:flex!important}
 #imgDelModal.show{display:flex!important}
 #imgMkModal.show{display:flex!important}
+#isoMkModal.show{display:flex!important}
+#isoDelModal.show{display:flex!important}
 .bc{display:flex;align-items:center;gap:4px;flex-wrap:wrap;margin-bottom:clamp(6px,1vw,10px);font-size:clamp(.7rem,1.3vw,.85rem)}
 .bcp{color:var(--blue);cursor:pointer}.bcp:hover{text-decoration:underline}
 .bcs{color:var(--tx3)}
@@ -156,6 +158,7 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
     <div class="ct">&#127908; Current medium</div>
     <div class="sbar">
       <span id="cdInfoBadge" class="badge def" style="display:none;cursor:pointer" onclick="cdShowInfo()" title="Click for USB debug info">USB info</span>
+      <span id="isoEditorRoBadge" class="badge" style="display:none;background:rgba(248,113,113,.12);color:#f87171;border:1px solid rgba(248,113,113,.3)" title="ISO editor is read-only — set iso-edit rw to enable editing">ISO editor: RO</span>
       <span class="badge off" id="badge">NONE</span>
       <span class="mname" id="mname">&#8212; nothing mounted &#8212;</span>
       <button class="btn r" onclick="doEject()">&#9167; Eject</button>
@@ -171,16 +174,26 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
   <div class="card" style="flex:1;display:flex;flex-direction:column;min-height:0;overflow:hidden">
     <div class="ct" style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:6px">
       <span>&#128190; Browse SD for disc images <span class="sp" id="cdSp"></span></span>
-      <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(.68rem,1.3vw,.8rem);color:var(--tx2);text-transform:none;letter-spacing:0">
-        <span>Show BIN tracks</span>
-        <div class="tog" onclick="toggleBin()"><div class="tknob"></div></div>
-      </label>
+      <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:clamp(.68rem,1.3vw,.8rem);color:var(--tx2);text-transform:none;letter-spacing:0">
+          <span>Show BIN tracks</span>
+          <div class="tog" onclick="toggleBin()"><div class="tknob"></div></div>
+        </label>
+        <button class="btn g" onclick="isoShowCreate()">&#43; New ISO</button>
+      </div>
+    </div>
+    <!-- ISO create row — identical style to GoTek gkCreateRow -->
+    <div id="isoCreateRow" style="display:none;padding:8px 0 6px;gap:8px;flex-wrap:wrap;align-items:center;border-bottom:1px solid var(--border2)">
+      <input type="text" id="isoNewName" placeholder="mydisc.iso" class="cfg-inp" style="flex:1;min-width:160px" onkeydown="if(event.key==='Enter')isoCreateDo();if(event.key==='Escape')isoShowCreate();">
+      <button class="btn g" onclick="isoCreateDo()">&#43; Create</button>
+      <span class="sp" id="isoCrSp"></span>
+      <span id="isoCrMsg" style="font-size:.8rem"></span>
     </div>
     <div class="bc" id="cdBc"></div>
     <div id="cdNone" class="ni" style="display:none">No disc images found here.</div>
     <div class="tbl-wrap">
       <table id="cdTbl" style="table-layout:fixed;width:100%">
-        <colgroup><col style="width:32px"><col><col style="width:100px"><col style="width:130px"></colgroup>
+        <colgroup><col style="width:32px"><col><col style="width:100px"><col style="width:170px"></colgroup>
         <thead><tr><th class="ic"></th><th>Name</th><th class="sz">Size</th><th class="ac"></th></tr></thead>
         <tbody id="cdBody"></tbody>
       </table>
@@ -602,6 +615,21 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
       </div>
     </div>
 
+    <!-- ISO Image Editor access -->
+    <div class="card" id="cfgCardIso">
+      <div class="ct">&#128190; ISO Image Editor</div>
+      <div class="cfg-row">
+        <label class="cfg-lbl">Write access</label>
+        <select class="cfg-inp" id="cfgIsoEditorRO" style="width:100%">
+          <option value="0">Read-Write (RW) — full edit: upload, delete, new folder, label</option>
+          <option value="1">Read-Only (RO) — browse and download only, no modifications</option>
+        </select>
+      </div>
+      <div style="font-size:.75rem;color:var(--tx2);margin-top:6px">
+        &#9432; RO mode prevents accidental changes to ISO images. Applies to all ISOs regardless of size.
+      </div>
+    </div>
+
     <!-- DOS Compatibility Mode -->
     <div class="card" id="cfgCardDos">
       <div class="ct">&#128190; DOS Compatibility Mode</div>
@@ -770,6 +798,53 @@ td.ac .btn{margin-left:4px;white-space:nowrap;min-width:28px;padding:4px 8px}
 
   </div>
 
+</div>
+
+<!-- ═══ ISO Browser / Editor Modal ══════════════════════════════════ -->
+<div id="isoModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:100;align-items:center;justify-content:center;overflow:hidden">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:10px;width:min(calc(100% - clamp(12px,3vw,40px)),960px);height:calc(100% - clamp(12px,3vw,40px));display:flex;flex-direction:column;overflow:hidden">
+    <div style="padding:10px 14px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
+      <span id="isoModalTitle" style="color:#79c0ff;font-size:.9rem;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">&#128190;</span>
+      <span id="isoRwBadge" style="display:none;font-size:.7rem;padding:2px 7px;border-radius:4px;border:1px solid;white-space:nowrap"></span>
+      <button class="btn gr" onclick="isoModalClose()" style="padding:3px 12px;font-size:.8rem">&#10005; Close</button>
+    </div>
+    <div id="isoBreadcrumb" class="bc" style="padding:5px 14px;border-bottom:1px solid var(--border2);background:rgba(0,0,0,.15);margin-bottom:0"></div>
+    <div class="tb" id="isoToolbar" style="padding:7px 14px;border-bottom:1px solid var(--border2)">
+      <button class="btn b" id="isoUpBtn" onclick="isoOpenDz()" style="display:none">&#8679; Upload</button>
+      <button class="btn gr" id="isoMkBtn" onclick="isoOpenMkdir()" style="display:none">&#128193; New folder</button>
+      <span class="sp" id="isoUpMsg"></span>
+    </div>
+    <div class="dz" id="isoDz" style="display:none">
+      Drop files here or
+      <button class="btn b" style="margin:0 6px" onclick="document.getElementById('isoUpFile').click()">Browse&hellip;</button>
+      <button class="btn gr" onclick="isoCloseDz()">&#10005;</button>
+      <input type="file" id="isoUpFile" multiple style="display:none" onchange="isoQueueFiles(this.files)">
+    </div>
+    <div class="pw" id="isoPw" style="display:none"><div class="pf" id="isoPf"></div><div class="pb"><div class="pbi" id="isoPbi"></div></div><div class="pp" id="isoPp"></div></div>
+    <div id="isoFileList" style="overflow-y:auto;overflow-x:hidden;flex:1;min-height:0">
+      <table style="width:100%;border-collapse:collapse;font-size:.85rem;table-layout:fixed">
+        <colgroup><col style="width:32px"><col><col style="width:100px"><col style="width:90px"></colgroup>
+        <thead><tr><th class="ic"></th><th>Name</th><th class="sz">Size</th><th class="ac"></th></tr></thead>
+        <tbody id="isoTbody"><tr><td colspan="4" style="padding:16px;color:var(--tx2)">Loading&hellip;</td></tr></tbody>
+      </table>
+    </div>
+    <div style="padding:6px 14px;border-top:1px solid var(--border2)">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <span style="font-size:.72rem;color:var(--tx2)">Label:</span>
+        <input id="isoLabelInp" type="text" maxlength="32" class="cfg-inp"
+               style="font-size:.72rem;padding:2px 6px;width:180px;display:none"
+               placeholder="Max 32 znaků"
+               onkeydown="if(event.key==='Enter')isoSaveLabel();if(event.key==='Escape')isoLabelCancel();">
+        <span id="isoLabelTxt" style="font-size:.72rem;color:var(--tx);font-family:monospace"></span>
+        <button id="isoLabelEditBtn" class="btn gr" onclick="isoLabelEdit()" style="display:none;font-size:.7rem;padding:1px 7px">✎ Edit</button>
+        <button id="isoLabelSaveBtn" class="btn g" onclick="isoSaveLabel()" style="display:none;font-size:.7rem;padding:1px 7px">✓ Save</button>
+        <button id="isoLabelCancelBtn" class="btn gr" onclick="isoLabelCancel()" style="display:none;font-size:.7rem;padding:1px 7px">✕</button>
+        <span id="isoLabelMsg" style="font-size:.7rem"></span>
+        <span style="flex:1"></span>
+        <span id="isoFooter" style="font-size:.72rem;color:var(--tx2)"></span>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ═══ IMG Browser Modal ════════════════════════════════════════════ -->
@@ -1110,7 +1185,7 @@ function webAuthToggle(){
   $('webAuthFields').style.display=$('cfgWebAuth').value==='1'?'block':'none';
 }
 function cfgApplyMode(isGotek){
-  var cdCards=['cfgCardAudio','cfgCardDos'];
+  var cdCards=['cfgCardAudio','cfgCardDos','cfgCardIso'];
   cdCards.forEach(function(id){ var el=$(id); if(el) el.style.display=isGotek?'none':''; });
   var gkCards=['cfgCardGotek'];
   gkCards.forEach(function(id){ var el=$(id); if(el) el.style.display=isGotek?'':'none'; });
@@ -1955,7 +2030,313 @@ function imgUpload(){ imgOpenDz(); } // legacy — open dropzone instead
 document.addEventListener('click',function(e){
   var m=$('imgModal');
   if(m&&m.style.display!=='none'&&e.target===m) imgModalClose();
+  var m2=$('isoModal');
+  if(m2&&m2.style.display!=='none'&&e.target===m2) isoModalClose();
 });
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ISO 9660 Editor JS
+// ═══════════════════════════════════════════════════════════════════════════
+var isoCurIso='', isoCurDir='/', isoDirStack=[], isoIsRw=false, isoIsBin=false, isoRwChanged=false;
+
+function isoOpen(isoPath, displayName){
+  isoCurIso=isoPath; isoCurDir='/'; isoDirStack=[]; isoRwChanged=false;
+  $('isoModalTitle').innerHTML='&#128190; '+escHtml(displayName);
+  $('isoUpMsg').textContent='';
+  var m=$('isoModal'); m.style.display='flex';
+  isoLoadDir('/');
+}
+function isoModalClose(){
+  $('isoModal').style.display='none';
+  isoCloseDz();
+  // Refresh CD-ROM file list if RW changes were made (sizes may have changed)
+  if(isoRwChanged) { cdLoadDir(cdPath); isoRwChanged=false; }
+  isoCurIso=''; isoCurDir='/'; isoDirStack=[];
+}
+
+function isoLoadDir(dir){
+  isoCurDir=dir;
+  renderBc('isoBreadcrumb', dir, isoLoadDir);
+  $('isoTbody').innerHTML='<tr><td colspan="4" style="padding:12px;color:var(--tx2)">Loading&hellip;</td></tr>';
+  fetch('/api/iso/ls?iso='+encodeURIComponent(isoCurIso)+'&dir='+encodeURIComponent(dir))
+    .then(function(r){return r.json();}).then(function(d){
+      var tb=$('isoTbody'); if(!tb) return;
+      if(!d.ok){
+        tb.innerHTML='<tr><td colspan="4" style="color:var(--red);padding:10px">'+escHtml(d.error||'Error reading ISO')+'</td></tr>';
+        return;
+      }
+      isoIsRw=d.rw||false; isoIsBin=d.bin||false;
+
+      // RW/RO badge
+      var badge=$('isoRwBadge');
+      if(isoIsRw){
+        badge.textContent='RW — editable'; badge.style.display='';
+        badge.style.background='rgba(34,197,94,.12)';
+        badge.style.color='var(--green)'; badge.style.borderColor='rgba(34,197,94,.3)';
+      } else {
+        var reason=isoIsBin?'BIN — read-only':
+                   (d.iso_size>838860800?'> 800 MB — read-only':'read-only');
+        badge.textContent=reason; badge.style.display='';
+        badge.style.background='rgba(248,113,113,.1)';
+        badge.style.color='#f87171'; badge.style.borderColor='rgba(248,113,113,.3)';
+      }
+      // Show upload and mkdir buttons only in RW mode
+      var upBtn=$('isoUpBtn'), mkBtn=$('isoMkBtn');
+      if(upBtn) upBtn.style.display=isoIsRw?'':'none';
+      if(mkBtn) mkBtn.style.display=isoIsRw?'':'none';
+
+      $('isoFooter').textContent=
+        d.vol_sectors?('Volume: '+d.vol_sectors+' sectors × 2048 B = '+(Math.round(d.vol_sectors*2048/1048576*10)/10)+' MB'):'';
+
+      // Label display
+      var labelTxt=$('isoLabelTxt'), labelInp=$('isoLabelInp');
+      if(labelTxt){ labelTxt.textContent=d.label||(d.label===''?'(none)':d.label)||''; labelTxt.style.display=''; }
+      if(labelInp) labelInp.style.display='none';
+      var eBtn=$('isoLabelEditBtn'), sBtn=$('isoLabelSaveBtn'), cBtn=$('isoLabelCancelBtn');
+      if(eBtn) eBtn.style.display=isoIsRw?'':'none';
+      if(sBtn) sBtn.style.display='none';
+      if(cBtn) cBtn.style.display='none';
+      var lMsg=$('isoLabelMsg'); if(lMsg&&!isoIsRw) lMsg.textContent='';
+
+      tb.innerHTML='';
+      // Up row
+      if(dir!=='/'){
+        var up=dir.lastIndexOf('/')>0?dir.substring(0,dir.lastIndexOf('/')):'/',tr=mkTr();
+        tr.append(mkTd('ic','📁'),Object.assign(mkTd('nm d','.. (up)'),{onclick:function(){isoLoadDir(up);}}),mkTd('sz',''),mkTd('ac',''));
+        tb.appendChild(tr);
+      }
+      var dirs=(d.files||[]).filter(function(f){return f.dir;}).sort(cmp);
+      var files=(d.files||[]).filter(function(f){return !f.dir;}).sort(cmp);
+      dirs.concat(files).forEach(function(f){
+        var fpath=(isoCurDir==='/'?'':isoCurDir)+'/'+f.name;
+        var tr=mkTr();
+        tr.appendChild(mkTd('ic', f.dir?'📁':'📄'));
+        var tdN=document.createElement('td'); tdN.className='nm'+(f.dir?' d':'');
+        tdN.appendChild(Object.assign(document.createElement('span'),{textContent:f.name}));
+        if(f.dir) tdN.onclick=(function(p){return function(){isoDirStack.push(isoCurDir);isoLoadDir(p);};})(fpath);
+        tr.appendChild(tdN);
+        tr.appendChild(mkTd('sz', f.dir?'':fmtSz(f.size)));
+        var tdA=mkTd('ac','');
+        if(!f.dir){
+          // Download button
+          var dl=document.createElement('a');
+          dl.href='/api/iso/get?iso='+encodeURIComponent(isoCurIso)+'&file='+encodeURIComponent(fpath);
+          dl.download=f.name;
+          var dlb=document.createElement('button');dlb.className='btn gr';dlb.title='Download';dlb.textContent='⬇';
+          dl.appendChild(dlb); tdA.appendChild(dl);
+          // Delete button — only in RW mode
+          if(isoIsRw){
+            var rb=document.createElement('button');rb.className='btn r';rb.title='Delete from ISO';rb.textContent='🗑';
+            rb.onclick=(function(fp2,nm){return function(){isoDelete(fp2,nm,false);};})(fpath,f.name);
+            tdA.appendChild(rb);
+          }
+        } else if(isoIsRw){
+          // Delete directory button in RW mode
+          var rd2=document.createElement('button');rd2.className='btn r';rd2.title='Delete folder and contents';rd2.textContent='🗑';
+          rd2.onclick=(function(fp2,nm){return function(){isoDelete(fp2,nm,true);};})(fpath,f.name);
+          tdA.appendChild(rd2);
+        }
+        tr.appendChild(tdA);
+        tb.appendChild(tr);
+      });
+      if(!dirs.length&&!files.length&&dir==='/'){
+        tb.innerHTML='<tr><td colspan="4" style="padding:16px;color:var(--tx2);text-align:center">ISO is empty or directory listing failed.</td></tr>';
+      }
+    }).catch(function(err){
+      $('isoTbody').innerHTML='<tr><td colspan="4" style="color:var(--red);padding:10px">Error reading ISO contents.</td></tr>';
+      console.error('isoLoadDir error:',err);
+    });
+}
+
+var _isoDelPending=null;
+function isoDelete(fpath, name, isDir){
+  _isoDelPending={fpath:fpath, name:name, isDir:isDir};
+  $('isoDelTitle').textContent=isDir?'Delete Folder':'Delete File';
+  $('isoDelMsg').innerHTML=isDir
+    ? 'Delete folder <b>'+escHtml(name)+'</b> and <b>all its contents</b> from ISO?<br><br><span style="color:var(--red);font-size:.8rem">⚠ This cannot be undone.</span>'
+    : 'Delete <b>'+escHtml(name)+'</b> from ISO?';
+  $('isoDelModal').classList.add('show');
+}
+function isoDelCancel(){$('isoDelModal').classList.remove('show');_isoDelPending=null;}
+function isoDelConfirm(){
+  $('isoDelModal').classList.remove('show');
+  if(!_isoDelPending) return;
+  var p=_isoDelPending; _isoDelPending=null;
+  var endpoint=p.isDir?'/api/iso/rmdir':'/api/iso/rm';
+  fetch(endpoint+'?iso='+encodeURIComponent(isoCurIso)+'&file='+encodeURIComponent(p.fpath))
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.ok){
+        $('isoUpMsg').textContent='Deleted: '+p.name;
+        $('isoUpMsg').style.color='var(--green)';
+        isoRwChanged=true;
+        isoLoadDir(isoCurDir);
+      } else {
+        $('isoUpMsg').textContent='Error: '+(d.error||'delete failed');
+        $('isoUpMsg').style.color='var(--red)';
+      }
+    }).catch(function(){$('isoUpMsg').textContent='Network error';$('isoUpMsg').style.color='var(--red)';});
+}
+
+function isoOpenMkdir(){$('isoMkName').value='';if($('isoMkPreview'))$('isoMkPreview').textContent='';$('isoMkModal').classList.add('show');setTimeout(function(){$('isoMkName').focus();},80);}
+function isoCloseMkdir(){$('isoMkModal').classList.remove('show');}
+// Sanitize ISO/Joliet folder name: strip chars forbidden by Joliet spec and Windows CDFS
+// Forbidden: \ / : * ? " < > | and control chars (U+0000–U+001F)
+function isoSanitizeFolderName(s){
+  return s.replace(/[\\\/:\*\?"<>\|]/g,'_').replace(/[\x00-\x1f]/g,'').replace(/^[\.\s]+|[\.\s]+$/g,'');
+}
+function isoMkdir(){
+  var raw=($('isoMkName').value||'').trim();
+  if(!raw){$('isoMkModal').classList.remove('show');alert('Zadej název složky.');$('isoMkModal').classList.add('show');return;}
+  var name=isoSanitizeFolderName(raw);
+  if(!name){$('isoMkModal').classList.remove('show');alert('Název obsahuje jen zakázané znaky.\nZakázáno: \\ / : * ? " < > |');$('isoMkModal').classList.add('show');return;}
+  // Show live preview if name was sanitized
+  var prev=$('isoMkPreview');
+  if(prev) prev.textContent=(name!==raw?'→ bude uloženo jako: '+name:'');
+  if(new TextEncoder().encode(name).length>64) name=name.substring(0,64);
+  isoCloseMkdir();
+  fetch('/api/iso/mkdir?iso='+encodeURIComponent(isoCurIso)+'&dir='+encodeURIComponent(isoCurDir)+'&name='+encodeURIComponent(name))
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok) { isoRwChanged=true; isoLoadDir(isoCurDir); }
+      else { $('isoUpMsg').textContent='Chyba: '+(d.error||'mkdir selhalo'); $('isoUpMsg').style.color='var(--red)'; }
+    }).catch(function(){$('isoUpMsg').textContent='Chyba sítě';$('isoUpMsg').style.color='var(--red)';});
+}
+
+// ── ISO Label ─────────────────────────────────────────────────────────────
+function isoLabelEdit(){
+  var inp=$('isoLabelInp'), txt=$('isoLabelTxt');
+  inp.value=txt.textContent;
+  txt.style.display='none'; inp.style.display='';
+  $('isoLabelEditBtn').style.display='none';
+  $('isoLabelSaveBtn').style.display='';
+  $('isoLabelCancelBtn').style.display='';
+  inp.focus(); inp.select();
+}
+function isoLabelCancel(){
+  var inp=$('isoLabelInp'), txt=$('isoLabelTxt');
+  inp.style.display='none'; txt.style.display='';
+  $('isoLabelEditBtn').style.display=isoIsRw?'':'none';
+  $('isoLabelSaveBtn').style.display='none';
+  $('isoLabelCancelBtn').style.display='none';
+  $('isoLabelMsg').textContent='';
+}
+function isoSaveLabel(){
+  // Send label as-is — firmware handles both ISO 9660 (uppercase ASCII) and Joliet (UCS-2 UTF-8)
+  var val=($('isoLabelInp').value||'').trim().substring(0,32);
+  $('isoLabelMsg').textContent='Ukládám…'; $('isoLabelMsg').style.color='var(--tx2)';
+  fetch('/api/iso/label?iso='+encodeURIComponent(isoCurIso)+'&label='+encodeURIComponent(val))
+    .then(function(r){return r.json();}).then(function(d){
+      if(d.ok){
+        // Display what the user typed (Joliet stores original, PVD stores uppercase)
+        $('isoLabelTxt').textContent=val||'(none)';
+        isoRwChanged=true;
+        $('isoLabelMsg').textContent='Uloženo'; $('isoLabelMsg').style.color='var(--green)';
+        setTimeout(function(){$('isoLabelMsg').textContent='';},2000);
+        isoLabelCancel();
+      } else {
+        $('isoLabelMsg').textContent='Chyba: '+(d.error||'failed'); $('isoLabelMsg').style.color='var(--red)';
+      }
+    }).catch(function(){$('isoLabelMsg').textContent='Chyba sítě';$('isoLabelMsg').style.color='var(--red)';});
+}
+
+// ── ISO Upload ────────────────────────────────────────────────────────────
+var isoUpQ=[],isoUpIdx=0,isoUpRun=false,isoUpXhr=null;
+function isoOpenDz(){if(isoIsRw)$('isoDz').style.display='block';}
+function isoCloseDz(){
+  if(isoUpXhr){isoUpXhr.abort();isoUpXhr=null;}
+  $('isoDz').style.display='none';
+  $('isoPw').style.display='none';
+  var fi=$('isoUpFile'); if(fi) fi.value='';
+  isoUpQ=[];isoUpIdx=0;isoUpRun=false;
+}
+function isoQueueFiles(files){
+  if(!files||!files.length) return;
+  isoUpQ=isoUpRun?isoUpQ.concat(Array.from(files)):Array.from(files);
+  isoUpIdx=isoUpRun?isoUpIdx:0;
+  if(!isoUpRun) isoUploadNext();
+}
+function isoUploadNext(){
+  if(isoUpIdx>=isoUpQ.length){
+    isoUpRun=false; isoUpXhr=null;
+    $('isoPw').style.display='none';
+    $('isoUpMsg').textContent='Done — '+isoUpQ.length+' file'+(isoUpQ.length>1?'s':'')+' added to ISO';
+    $('isoUpMsg').style.color='var(--green)';
+    isoLoadDir(isoCurDir);
+    isoCloseDz();
+    return;
+  }
+  isoUpRun=true;
+  var file=isoUpQ[isoUpIdx];
+  $('isoPw').style.display='block';
+  $('isoPf').textContent='('+(isoUpIdx+1)+'/'+isoUpQ.length+') '+file.name;
+  $('isoPbi').style.width='0%'; $('isoPp').textContent='0%';
+  $('isoUpMsg').textContent=''; $('isoUpMsg').style.color='var(--tx2)';
+  var _upStart=Date.now();
+  var xhr=new XMLHttpRequest(); isoUpXhr=xhr;
+  xhr.open('POST','/api/iso/put?iso='+encodeURIComponent(isoCurIso)+'&dir='+encodeURIComponent(isoCurDir));
+  xhr.upload.onprogress=function(e){
+    if(e.lengthComputable){
+      var p=Math.round(e.loaded/e.total*100);
+      $('isoPbi').style.width=p+'%';
+      var dt=(Date.now()-_upStart)/1000;
+      var spd=dt>0.2?fmtSpeed(e.loaded/dt):'';
+      $('isoPp').textContent=p+'%  '+fmtSz(e.loaded)+'/'+fmtSz(e.total)+(spd?'  • '+spd:'');
+    }
+  };
+  xhr.onload=function(){
+    isoUpXhr=null;
+    try{
+      var d=JSON.parse(xhr.responseText);
+      if(!d.ok){$('isoUpMsg').textContent='Error: '+(d.error||'upload failed');$('isoUpMsg').style.color='var(--red)';}
+      else { isoRwChanged=true; }
+    }catch(e){}
+    isoUpIdx++; isoUploadNext();
+  };
+  xhr.onerror=function(){isoUpXhr=null;$('isoUpMsg').textContent='Network error: '+file.name;$('isoUpMsg').style.color='var(--red)';isoUpIdx++;isoUploadNext();};
+  xhr.onabort=function(){isoUpXhr=null;isoUpRun=false;$('isoPw').style.display='none';};
+  var fd=new FormData(); fd.append('file', file, file.name);
+  xhr.send(fd);
+}
+// Drag-and-drop on ISO modal file list
+(function(){
+  var dz=$('isoDz'), fl=$('isoFileList');
+  if(!dz||!fl) return;
+  [dz,fl].forEach(function(el){
+    el.addEventListener('dragover',function(e){e.preventDefault();if(isoIsRw){isoOpenDz();dz.classList.add('ov');}});
+    el.addEventListener('dragleave',function(){dz.classList.remove('ov');});
+    el.addEventListener('drop',function(e){e.preventDefault();dz.classList.remove('ov');if(isoIsRw&&e.dataTransfer.files.length)isoQueueFiles(e.dataTransfer.files);});
+  });
+})();
+// New ISO — inline create bar (GoTek style)
+function isoShowCreate(){
+  var r=$('isoCreateRow');
+  if(!r) return;
+  var show=r.style.display==='none'||!r.style.display;
+  r.style.display=show?'flex':'none';
+  if(show){$('isoCrMsg').textContent='';setTimeout(function(){$('isoNewName').focus();},60);}
+}
+function isoCreateDo(){
+  var nm=($('isoNewName').value||'').trim();
+  if(!nm){$('isoCrMsg').textContent='Enter filename.';$('isoCrMsg').style.color='var(--red)';return;}
+  if(!nm.toLowerCase().endsWith('.iso')) nm+='.iso';
+  nm=nm.replace(/[\/\\]/g,'');
+  var fp=(cdPath==='/'?'':cdPath)+'/'+nm;
+  spin('isoCrSp',true);$('isoCrMsg').textContent='';
+  fetch('/api/iso/create?path='+encodeURIComponent(fp))
+    .then(function(r){return r.json();}).then(function(d){
+      spin('isoCrSp',false);
+      if(d.ok){
+        $('isoCrMsg').textContent='Created: '+nm;$('isoCrMsg').style.color='var(--green)';
+        $('isoNewName').value='';
+        cdLoadDir(cdPath);
+        setTimeout(function(){$('isoCreateRow').style.display='none';$('isoCrMsg').textContent='';},2000);
+      } else {
+        $('isoCrMsg').textContent='Error: '+(d.error||'failed');$('isoCrMsg').style.color='var(--red)';
+      }
+    }).catch(function(){spin('isoCrSp',false);$('isoCrMsg').textContent='Network error';$('isoCrMsg').style.color='var(--red)';});
+}
+// ── end ISO Editor JS ────────────────────────────────────────────────────────
+
 // ── end GoTek JS ─────────────────────────────────────────────────────────────
 // Refresh space display for a single slot after image editor changes
 function gkRefreshOneSlot(imgPath){
@@ -2361,6 +2742,7 @@ function cfgLoad(){
   var wpRow=$('cfgGotekFatWPRow'); if(wpRow) wpRow.style.display=(c.gotekUsbMode===1)?'flex':'none';
   var f83El=$('cfgImgFat83'); if(f83El) f83El.value=(c.imgFat83===false||c.imgFat83===0)?'0':'1';
   _imgFat83=(c.imgFat83!==false&&c.imgFat83!==0); // sync immediately on config load
+  var isoRoEl=$('cfgIsoEditorRO'); if(isoRoEl) isoRoEl.value=(c.isoEditorRO===true||c.isoEditorRO===1)?'1':'0';
     eapRestoreSaved();
     if(c.dhcp){$('rDhcp').checked=true;}else{$('rStatic').checked=true;}
     cfgDhcpToggle();
@@ -2405,6 +2787,7 @@ function cfgSave(){
   var um=$('cfgGotekUsbMode'); if(um) params.set('gotekUsbMode',um.value);
   var wp=$('cfgGotekFatWP'); if(wp) params.set('gotekFatWP',wp.value);
   var f83=$('cfgImgFat83'); if(f83) params.set('imgFat83',f83.value);
+  var isoRo=$('cfgIsoEditorRO'); if(isoRo) params.set('isoEditorRO',isoRo.value);
   if(!dhcp){
     params.set('ip',$('cfgIp').value.trim());
     params.set('mask',$('cfgMask').value.trim());
@@ -2416,6 +2799,8 @@ function cfgSave(){
     spin('cfgActSp',false);$('cfgSaveBtn').disabled=false;
     cfgMsg('cfgActMsg',m,m.indexOf('OK')===0);
     var f83sv=$('cfgImgFat83');if(f83sv)_imgFat83=(f83sv.value!=='0'); // sync on save
+    var roB=$('isoEditorRoBadge');var isoRoSv=$('cfgIsoEditorRO');
+    if(roB&&isoRoSv) roB.style.display=isoRoSv.value==='1'?'inline':'none';
     log(m);
   }).catch(function(){spin('cfgActSp',false);$('cfgSaveBtn').disabled=false;cfgMsg('cfgActMsg','ERROR: request failed',false);});
 }
@@ -2558,6 +2943,13 @@ function loadSysinfo(){
       siRow(ti,'Status','No disc mounted','si-warn');
       if(s.img_default.length) siRow(ti,'Default on boot',s.img_default);
     }
+    // ISO editor access mode — always shown in CD-ROM mode
+    if(s.device_mode!==1){
+      var roVal=(s.iso_editor_ro===true||s.iso_editor_ro===1);
+      siRow(ti,'ISO editor',roVal
+        ?'<span style="color:#f87171">&#128274; Read-Only (RO)</span>'
+        :'<span style="color:var(--ok)">&#9998; Read-Write (RW)</span>');
+    }
 
     // System
     var sy=$('siSys');sy.innerHTML='';
@@ -2660,6 +3052,9 @@ function loadStatus(){
       var cb=$('cmdBar');if(cb)cb.style.display=_debugMode?'flex':'none';
       var cib=$('cdInfoBadge');if(cib)cib.style.display=_debugMode?'inline':'none';
     }
+    // ISO editor RO badge
+    var roB=$('isoEditorRoBadge');
+    if(roB) roB.style.display=(s.iso_editor_ro===true||s.iso_editor_ro===1)?'inline':'none';
     $('badge').textContent=s.mounted?'MOUNTED':'NONE';
     $('badge').className='badge '+(s.mounted?'on':'off');
     $('mname').textContent=s.mounted?s.file:'— nothing mounted —';
@@ -2714,6 +3109,13 @@ function cdLoadDir(path){
       if(!item.dir){
         var mb=document.createElement('button');mb.className='btn g';mb.style.whiteSpace='nowrap';mb.textContent=isCue?'▶ Mount disc':'▶ Mount';
         mb.onclick=(function(p){return function(){doMount(p);};})(fp);tdA.appendChild(mb);
+        // Edit button — only for .iso files
+        if(isIso){
+          var eb=document.createElement('button');eb.className='btn b';eb.title='Browse / edit ISO contents';
+          eb.textContent='💿';
+          eb.onclick=(function(p,n){return function(){isoOpen(p,n);};})(fp,item.name);
+          tdA.appendChild(eb);
+        }
       }
       tr.append(tdI,tdN,tdS,tdA);tb.appendChild(tr);shown++;
     });
@@ -2931,6 +3333,29 @@ loadStatus();cdLoadDir('/');fmLoadDir('/');setInterval(loadStatus,5000);
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button class="btn" onclick="imgCloseMkdir()">Cancel</button>
       <button class="btn b" onclick="imgMkdir()">&#10003; Create</button>
+    </div>
+  </div>
+</div>
+
+<div id="isoMkModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1001;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div class="ct" style="margin-bottom:12px">&#128193; Nová složka v ISO</div>
+    <input id="isoMkName" type="text" class="cfg-inp" style="width:100%;margin-bottom:4px" placeholder="Název složky (čeština, mezery, max 64 znaků)" onkeydown="if(event.key==='Enter')isoMkdir();if(event.key==='Escape')isoCloseMkdir();" oninput="var s=isoSanitizeFolderName(this.value.trim());var p=$('isoMkPreview');if(p)p.textContent=(s!==this.value.trim()&&s?'→ '+s:s?'':'Zakázané znaky: \\ / : * ? \u0022 < > |');">
+    <div id="isoMkPreview" style="font-size:.72rem;color:var(--tx2);min-height:1em;margin-bottom:12px"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="isoCloseMkdir()">Zrušit</button>
+      <button class="btn b" onclick="isoMkdir()">&#10003; Vytvořit</button>
+    </div>
+  </div>
+</div>
+
+<div id="isoDelModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1002;align-items:center;justify-content:center">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:20px;min-width:280px;max-width:420px;width:90%">
+    <div id="isoDelTitle" class="ct" style="margin-bottom:12px;color:var(--red)">&#128465; Delete</div>
+    <div id="isoDelMsg" style="font-size:.85rem;color:var(--tx2);margin-bottom:16px;line-height:1.5"></div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="isoDelCancel()">Cancel</button>
+      <button class="btn r" onclick="isoDelConfirm()">&#128465; Delete</button>
     </div>
   </div>
 </div>

@@ -171,6 +171,32 @@ struct ImgBPB {
   uint32_t dataClu;   // total data clusters
 };
 
+// ISO 9660 Primary Volume Descriptor — parsed from sector 16
+#define ISO_RW_MAX_BYTES  (800UL * 1024UL * 1024UL)  // 800 MB — covers 74min/80min/90min CD formats
+#define ISO_SECTOR        2048                         // logical sector size (bytes)
+#define ISO_BIN_STRIDE    2352                         // Mode1/2352 raw sector stride
+#define ISO_BIN_HDR       16                           // data offset within BIN sector
+struct IsoPVD {
+  uint32_t rootLBA;
+  uint32_t rootSize;
+  uint32_t volSectors;
+  bool     isBin;
+  bool     valid;
+  char     label[33];
+  // Joliet extension fields
+  bool     hasJoliet;
+  uint32_t jolietRootLBA;
+  uint32_t jolietRootSize;
+  uint8_t  jolietSvdLBA;
+  // Path table fields (for updating when creating directories)
+  uint32_t isoPathTableLBA_L;    // ISO 9660 Type-L path table LBA
+  uint32_t isoPathTableLBA_M;    // ISO 9660 Type-M path table LBA
+  uint32_t isoPathTableSize;     // current path table size in bytes
+  uint32_t jolietPathTableLBA_L; // Joliet Type-L path table LBA
+  uint32_t jolietPathTableLBA_M; // Joliet Type-M path table LBA
+  uint32_t jolietPathTableSize;  // current Joliet path table size
+};
+
 // =============================================================================
 //  CONFIGURATION (NVS / Preferences)
 // =============================================================================
@@ -215,6 +241,7 @@ struct Config {
   uint8_t  wifiTxPower;        // default 40 = 10 dBm
   bool     debugMode;          // true = verbose SCSI/API logs (default: off)
   bool     imgFat83;           // true = auto-convert upload names to FAT 8.3 format (default: on)
+  bool     isoEditorRO;        // true = ISO editor is read-only (no write, delete, mkdir, label edit)
   uint16_t win98StopMs;        // Win98 Stop/Pause detect timeout ms (0=off, default:1200)
   // Device mode — determines which USB profile is presented at boot.
   // 0 = CD-ROM (default, all existing functionality)
@@ -271,6 +298,7 @@ void loadConfig() {
   cfg.wifiTxPower = (uint8_t)constrain((int)prefs.getUChar("wifiTxPow", 40), 8, 80);
   cfg.debugMode   = prefs.getBool("debugMode", false);
   cfg.imgFat83    = prefs.getBool("imgFat83",  true);
+  cfg.isoEditorRO = prefs.getBool("isoEditorRO", false);
   cfg.win98StopMs = (uint16_t)constrain((int)prefs.getUShort("win98StopMs", 1200), 0, 9999);
   cfg.httpsEnabled = prefs.getBool("httpsEnabled", false);
   strlcpy(cfg.httpsCertPath, prefs.getString("httpsCert", "").c_str(), sizeof(cfg.httpsCertPath));
@@ -320,6 +348,7 @@ void saveConfig() {
   prefs.putUChar("wifiTxPow", cfg.wifiTxPower);
   prefs.putBool("debugMode",   cfg.debugMode);
   prefs.putBool("imgFat83",    cfg.imgFat83);
+  prefs.putBool("isoEditorRO", cfg.isoEditorRO);
   prefs.putUShort("win98StopMs", cfg.win98StopMs);
   prefs.putUChar("deviceMode",   cfg.deviceMode);
   prefs.putUChar("gotekUsbMode", cfg.gotekUsbMode);
@@ -438,6 +467,7 @@ void clearConfig() {
   cfg.wifiTxPower = 40;  // 10 dBm default — reduces RF→PCM5102 interference
   cfg.debugMode   = false;
   cfg.imgFat83    = true;
+  cfg.isoEditorRO = false;
   cfg.win98StopMs = 1200;  // default: 1.2s
   cfg.deviceMode  = 0;     // default: CD-ROM
   gotekImgDir     = "/gotek";
@@ -1074,11 +1104,18 @@ String normPath(String p) {
 String jsonEsc(const char *s) {
   String r;
   while (*s) {
-    if      (*s == '"')  r += "\\\"";
-    else if (*s == '\\') r += "\\\\";
-    else if (*s == '\n') r += "\\n";
-    else if (*s == '\r') r += "\\r";
-    else                 r += *s;
+    uint8_t c = (uint8_t)*s;
+    if      (c == '"')  r += "\\\"";
+    else if (c == '\\') r += "\\\\";
+    else if (c == '\n') r += "\\n";
+    else if (c == '\r') r += "\\r";
+    else if (c == '\t') r += "\\t";
+    else if (c < 0x20 || c == 0x7F) {
+      // Escape other control characters as \uXXXX
+      char buf[8]; snprintf(buf, sizeof(buf), "\\u%04X", c);
+      r += buf;
+    }
+    else r += (char)c;
     s++;
   }
   return r;
@@ -2205,6 +2242,7 @@ static void gkRefresh() {
 // SD mutex helpers for GoTek web handlers (forward-declared here, defined after upload state)
 static inline bool gkMtxTake();
 static void gkInvalidateForPath(const String& imgPath);  // forward decl
+void processCommand(String &line);  // forward decl
 static inline void gkMtxGive();
 
 // ── Session globals ───────────────────────────────────────────────────────────
@@ -4215,6 +4253,1425 @@ void handleRoot() {
   httpServer.sendContent_P(HTML_PAGE + afterOff, afterLen); // rest of HTML
 }
 
+
+// ============================================================================
+//  ISO 9660 Image Editor — RO browser for all ISOs, RW for ISOs ≤ 200 MB
+// ============================================================================
+
+static uint8_t _isoBuf[ISO_SECTOR];   // shared ISO sector read buffer
+
+// Read one 2048-byte logical sector from ISO or Mode1/2352 BIN file
+static bool isoReadSec(File& f, uint32_t lba, bool isBin) {
+  uint64_t off = isBin ? (uint64_t)lba * ISO_BIN_STRIDE + ISO_BIN_HDR
+                        : (uint64_t)lba * ISO_SECTOR;
+  if (!f.seek(off)) return false;
+  return f.read(_isoBuf, ISO_SECTOR) == ISO_SECTOR;
+}
+
+// Write a buffer to the ISO at an exact byte offset (for RW operations)
+static bool isoWriteAt(File& f, uint64_t off, const uint8_t* buf, size_t n) {
+  if (!f.seek(off)) return false;
+  return f.write(buf, n) == n;
+}
+
+// Parse PVD (sector 16) — tries ISO first, then BIN. Also detects Joliet SVD.
+static bool isoParsePVD(File& f, IsoPVD& pvd) {
+  pvd.valid = false; pvd.hasJoliet = false; pvd.jolietRootLBA = pvd.jolietRootSize = 0;
+  for (int pass = 0; pass < 2; pass++) {
+    bool isBin = (pass == 1);
+    if (!isoReadSec(f, 16, isBin)) continue;
+    if (_isoBuf[0] == 1 && memcmp(_isoBuf + 1, "CD001", 5) == 0) {
+      pvd.isBin      = isBin;
+      pvd.rootLBA    = (uint32_t)_isoBuf[158] | ((uint32_t)_isoBuf[159]<<8)  |
+                       ((uint32_t)_isoBuf[160]<<16) | ((uint32_t)_isoBuf[161]<<24);
+      pvd.rootSize   = (uint32_t)_isoBuf[166] | ((uint32_t)_isoBuf[167]<<8)  |
+                       ((uint32_t)_isoBuf[168]<<16) | ((uint32_t)_isoBuf[169]<<24);
+      pvd.volSectors = (uint32_t)_isoBuf[80]  | ((uint32_t)_isoBuf[81]<<8)   |
+                       ((uint32_t)_isoBuf[82]<<16) | ((uint32_t)_isoBuf[83]<<24);
+      memcpy(pvd.label, _isoBuf + 40, 32); pvd.label[32] = '\0';
+      for (int i = 31; i >= 0 && pvd.label[i] == ' '; i--) pvd.label[i] = '\0';
+      // Path table LBAs and current size
+      pvd.isoPathTableSize  = (uint32_t)_isoBuf[132]|((uint32_t)_isoBuf[133]<<8)|
+                              ((uint32_t)_isoBuf[134]<<16)|((uint32_t)_isoBuf[135]<<24);
+      pvd.isoPathTableLBA_L = (uint32_t)_isoBuf[140]|((uint32_t)_isoBuf[141]<<8)|
+                              ((uint32_t)_isoBuf[142]<<16)|((uint32_t)_isoBuf[143]<<24);
+      pvd.isoPathTableLBA_M = (uint32_t)_isoBuf[148]|  // BE: stored big-endian
+                              ((uint32_t)_isoBuf[149]<<8)|((uint32_t)_isoBuf[150]<<16)|
+                              ((uint32_t)_isoBuf[151]<<24);  // actually BE bytes → swap
+      // Fix: Type-M LBA is stored as BE in PVD bytes 148-151
+      pvd.isoPathTableLBA_M = ((uint32_t)_isoBuf[148]<<24)|((uint32_t)_isoBuf[149]<<16)|
+                               ((uint32_t)_isoBuf[150]<<8)| (uint32_t)_isoBuf[151];
+      pvd.valid = true;
+
+      // Scan sectors 17..22 for Joliet SVD (type=2 with UCS-2 escape sequence)
+      for (uint8_t svdLBA = 17; svdLBA < 23; svdLBA++) {
+        if (!isoReadSec(f, svdLBA, isBin)) break;
+        if (_isoBuf[0] == 0xFF) break;  // Volume Descriptor Set Terminator
+        if (_isoBuf[0] != 2 || memcmp(_isoBuf+1, "CD001", 5) != 0) continue;
+        // Joliet escape sequences at offset 88: %/@, %/C, or %/E
+        if (memcmp(_isoBuf+88, "\x25\x2F\x40", 3) == 0 ||
+            memcmp(_isoBuf+88, "\x25\x2F\x43", 3) == 0 ||
+            memcmp(_isoBuf+88, "\x25\x2F\x45", 3) == 0) {
+          pvd.jolietSvdLBA   = svdLBA;
+          // Root dir record is at SVD offset 156. LBA is at +2 (LE), size at +10 (LE)
+          pvd.jolietRootLBA  = (uint32_t)_isoBuf[158] | ((uint32_t)_isoBuf[159]<<8) |
+                               ((uint32_t)_isoBuf[160]<<16) | ((uint32_t)_isoBuf[161]<<24);
+          pvd.jolietRootSize = (uint32_t)_isoBuf[166] | ((uint32_t)_isoBuf[167]<<8) |
+                               ((uint32_t)_isoBuf[168]<<16) | ((uint32_t)_isoBuf[169]<<24);
+          pvd.jolietPathTableSize  = (uint32_t)_isoBuf[132]|((uint32_t)_isoBuf[133]<<8)|
+                                     ((uint32_t)_isoBuf[134]<<16)|((uint32_t)_isoBuf[135]<<24);
+          pvd.jolietPathTableLBA_L = (uint32_t)_isoBuf[140]|((uint32_t)_isoBuf[141]<<8)|
+                                     ((uint32_t)_isoBuf[142]<<16)|((uint32_t)_isoBuf[143]<<24);
+          pvd.jolietPathTableLBA_M = ((uint32_t)_isoBuf[148]<<24)|((uint32_t)_isoBuf[149]<<16)|
+                                     ((uint32_t)_isoBuf[150]<<8)|(uint32_t)_isoBuf[151];
+          pvd.hasJoliet = true;
+          break;
+        }
+      }
+      return true;
+    }
+  }
+  return false;
+}
+
+// Scan directory at (dirLBA, dirSize) — return JSON array of entries
+static String isoScanDir(File& f, const IsoPVD& pvd, uint32_t dirLBA, uint32_t dirSize) {
+  String json = "[";
+  bool first = true;
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < secUsed) {
+      uint8_t recLen = _isoBuf[off];
+      if (recLen == 0 || off + recLen > secUsed || recLen < 33) break;
+      uint8_t nameLen = _isoBuf[off + 32];
+      // Skip . and ..
+      if (nameLen == 1 && (_isoBuf[off+33] == 0x00 || _isoBuf[off+33] == 0x01)) { off += recLen; continue; }
+      // Skip "deleted" entries (nameLen zeroed by isoRm)
+      if (nameLen == 0) { off += recLen; continue; }
+      bool     isDir   = (_isoBuf[off+25] & 0x02) != 0;
+      uint32_t fileLBA = (uint32_t)_isoBuf[off+ 2]|((uint32_t)_isoBuf[off+ 3]<<8)|
+                         ((uint32_t)_isoBuf[off+ 4]<<16)|((uint32_t)_isoBuf[off+ 5]<<24);
+      uint32_t fileSz  = (uint32_t)_isoBuf[off+10]|((uint32_t)_isoBuf[off+11]<<8)|
+                         ((uint32_t)_isoBuf[off+12]<<16)|((uint32_t)_isoBuf[off+13]<<24);
+      char nm[222] = {0};
+      memcpy(nm, _isoBuf + off + 33, nameLen < 221 ? nameLen : 221);
+      char* semi = strchr(nm, ';'); if (semi) *semi = '\0';
+      int nl = strlen(nm); if (nl > 0 && nm[nl-1] == '.') nm[nl-1] = '\0';
+      if (!nm[0]) { off += recLen; continue; }
+      if (!first) json += ','; first = false;
+      json += "{\"name\":\"" + jsonEsc(nm) + "\",\"dir\":" + String(isDir?"true":"false") +
+              ",\"size\":" + String(fileSz) + ",\"lba\":" + String(fileLBA) + "}";
+      off += recLen;
+    }
+    remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+  json += "]";
+  return json;
+}
+
+// Navigate a path like "/SYSTEM/DATA" from root — fill outLBA/outSize
+// Navigate Joliet directory tree using UCS-2 BE name comparison.
+static bool isoNavPathJoliet(File& f, const IsoPVD& pvd, const String& path,
+                              uint32_t& outLBA, uint32_t& outSize) {
+  outLBA = pvd.jolietRootLBA; outSize = pvd.jolietRootSize;
+  if (!pvd.hasJoliet) return false;
+  if (path == "/" || path.length() == 0) return true;
+  String remain = path;
+  if (remain.startsWith("/")) remain = remain.substring(1);
+  while (remain.length() > 0) {
+    int slash = remain.indexOf('/');
+    String part = (slash < 0) ? remain : remain.substring(0, slash);
+    remain = (slash < 0) ? "" : remain.substring(slash + 1);
+    if (!part.length()) continue;
+    uint8_t partUCS2[128];
+    int partChars = utf8ToUCS2BE(part.c_str(), partUCS2, 64);
+    uint8_t partBytes = (uint8_t)(partChars * 2);
+    bool found = false;
+    uint32_t rem = outSize, lba = outLBA;
+    while (rem > 0 && !found) {
+      if (!isoReadSec(f, lba, pvd.isBin)) return false;
+      uint32_t used = (rem < (uint32_t)ISO_SECTOR) ? rem : (uint32_t)ISO_SECTOR;
+      uint32_t off = 0;
+      while (off < used) {
+        uint8_t rl = _isoBuf[off]; if (!rl || rl < 33) break;
+        uint8_t nl = _isoBuf[off+32];
+        if (nl==1&&(_isoBuf[off+33]==0||_isoBuf[off+33]==1)){off+=rl;continue;}
+        if (nl==0){off+=rl;continue;}
+        if ((_isoBuf[off+25]&0x02) && nl==partBytes &&
+            memcmp(_isoBuf+off+33, partUCS2, partBytes)==0) {
+          outLBA  = (uint32_t)_isoBuf[off+2]|((uint32_t)_isoBuf[off+3]<<8)|
+                    ((uint32_t)_isoBuf[off+4]<<16)|((uint32_t)_isoBuf[off+5]<<24);
+          outSize = (uint32_t)_isoBuf[off+10]|((uint32_t)_isoBuf[off+11]<<8)|
+                    ((uint32_t)_isoBuf[off+12]<<16)|((uint32_t)_isoBuf[off+13]<<24);
+          found = true; break;
+        }
+        off += rl;
+      }
+      rem -= (rem<(uint32_t)ISO_SECTOR)?rem:(uint32_t)ISO_SECTOR;
+      lba++;
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+static bool isoNavPath(File& f, const IsoPVD& pvd, const String& path,
+                        uint32_t& outLBA, uint32_t& outSize) {
+  outLBA = pvd.rootLBA; outSize = pvd.rootSize;
+  if (path == "/" || path.length() == 0) return true;
+  String p = path.startsWith("/") ? path.substring(1) : path;
+  while (p.length()) {
+    int sl = p.indexOf('/');
+    String comp = (sl < 0) ? p : p.substring(0, sl);
+    p = (sl < 0) ? "" : p.substring(sl + 1);
+    String compU = comp; compU.toUpperCase();
+    bool found = false;
+    uint32_t remain = outSize, curLBA = outLBA;
+    while (remain > 0 && !found) {
+      if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+      uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+      uint32_t off = 0;
+      while (off < secUsed && !found) {
+        uint8_t recLen = _isoBuf[off];
+        if (!recLen || recLen < 33 || off + recLen > secUsed) break;
+        uint8_t nameLen = _isoBuf[off+32];
+        bool isDir = (_isoBuf[off+25] & 0x02) != 0;
+        if (isDir && nameLen > 1 && nameLen < 222) {
+          char nm[222] = {0};
+          memcpy(nm, _isoBuf + off + 33, nameLen);
+          int nl = strlen(nm); if (nl > 0 && nm[nl-1] == '.') nm[nl-1] = '\0';
+          String nmU(nm); nmU.toUpperCase();
+          if (nmU == compU) {
+            outLBA  = (uint32_t)_isoBuf[off+2]|((uint32_t)_isoBuf[off+3]<<8)|
+                      ((uint32_t)_isoBuf[off+4]<<16)|((uint32_t)_isoBuf[off+5]<<24);
+            outSize = (uint32_t)_isoBuf[off+10]|((uint32_t)_isoBuf[off+11]<<8)|
+                      ((uint32_t)_isoBuf[off+12]<<16)|((uint32_t)_isoBuf[off+13]<<24);
+            found = true;
+          }
+        }
+        off += recLen;
+      }
+      remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+      curLBA++;
+    }
+    if (!found) return false;
+  }
+  return true;
+}
+
+// Find offset of a named file in directory — returns byte offset in ISO file, or -1
+static int64_t isoFindFile(File& f, const IsoPVD& pvd, uint32_t dirLBA, uint32_t dirSize,
+                            const String& nameU) {
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < secUsed) {
+      uint8_t recLen = _isoBuf[off];
+      if (!recLen || recLen < 33 || off + recLen > secUsed) break;
+      uint8_t nameLen = _isoBuf[off+32];
+      if (nameLen > 1 && nameLen < 222) {
+        char nm[222] = {0};
+        memcpy(nm, _isoBuf + off + 33, nameLen);
+        char* semi = strchr(nm, ';'); if (semi) *semi = '\0';
+        String nmU(nm); nmU.toUpperCase();
+        if (nmU == nameU) {
+          return (int64_t)curLBA * ISO_SECTOR + off;
+        }
+      }
+      off += recLen;
+    }
+    remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+  return -1;
+}
+
+// Find free space at end of last directory sector for a new record of `needBytes`
+// Returns byte offset (in ISO file) of where new record can be written, or -1 if no space
+static int64_t isoFindDirSpace(File& f, const IsoPVD& pvd, uint32_t dirLBA, uint32_t dirSize,
+                                uint32_t needBytes) {
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < secUsed) {
+      uint8_t recLen = _isoBuf[off];
+      if (!recLen) {
+        // End-of-sector marker — check remaining space
+        uint32_t free = secUsed - off;
+        if (free >= needBytes) {
+          return (int64_t)curLBA * ISO_SECTOR + off;
+        }
+        break;
+      }
+      if (recLen < 33 || off + recLen > secUsed) break;
+      off += recLen;
+    }
+    // Check if we're at end of last sector and there's trailing space
+    if (remain <= (uint32_t)ISO_SECTOR && secUsed < ISO_SECTOR) {
+      uint32_t free = ISO_SECTOR - secUsed;
+      if (free >= needBytes) return (int64_t)curLBA * ISO_SECTOR + secUsed;
+    }
+    remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+  return -1;
+}
+
+// ---- ISO API: GET /api/iso/ls?iso=<path>&dir=<path> -------------------------
+void handleIsoLs() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso") ? normPath(httpServer.arg("iso")) : "";
+  String dir     = httpServer.hasArg("dir") ? httpServer.arg("dir") : "/";
+  if (!isoPath.length()) { httpServer.send(400,"application/json","{\"error\":\"Missing iso\"}"); return; }
+
+  dualPrint.printf("[ISO] ls: %s  dir=%s\n", isoPath.c_str(), dir.c_str());
+
+  File f = SD_MMC.open(isoPath.c_str());
+  if (!f) { dualPrint.printf("[ISO] ls: cannot open\n"); httpServer.send(404,"application/json","{\"error\":\"File not found\"}"); return; }
+
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd)) {
+    f.close(); dualPrint.printf("[ISO] ls: PVD fail\n");
+    httpServer.send(400,"application/json","{\"error\":\"Not a valid ISO 9660 image\"}"); return;
+  }
+  dualPrint.printf("[ISO] ls: rootLBA=%u rootSize=%u volSec=%u bin=%d\n",
+                   pvd.rootLBA, pvd.rootSize, pvd.volSectors, (int)pvd.isBin);
+
+  uint32_t dirLBA, dirSize;
+  if (!isoNavPath(f, pvd, dir, dirLBA, dirSize)) {
+    f.close(); httpServer.send(404,"application/json","{\"error\":\"Directory not found\"}"); return;
+  }
+
+  uint64_t isoFileSize = f.size();
+  bool rw = !pvd.isBin && isoFileSize <= ISO_RW_MAX_BYTES && !cfg.isoEditorRO;
+
+  // Use sendContent for proper HTTP/1.1 chunked response — client.print() bypasses chunking
+  // and the browser cannot detect end-of-response, causing fetch() to never resolve.
+  httpServer.sendHeader("Connection", "close");
+  httpServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  httpServer.send(200, "application/json", "");
+
+  String hdr = "{\"ok\":true,\"dir\":\"" + jsonEsc(dir.c_str()) + "\""
+               ",\"rw\":"  + String(rw        ? "true" : "false") +
+               ",\"bin\":" + String(pvd.isBin ? "true" : "false") +
+               ",\"joliet\":" + String(pvd.hasJoliet ? "true" : "false") +
+               ",\"label\":\"" + jsonEsc(pvd.label) + "\""
+               ",\"iso_size\":" + String((uint32_t)isoFileSize) +
+               ",\"vol_sectors\":" + String(pvd.volSectors) +
+               ",\"files\":[";
+  httpServer.sendContent(hdr);
+
+  // If Joliet is present, navigate and scan the Joliet directory (UTF-16 BE names → UTF-8)
+  // Otherwise fall back to ISO 9660 directory (bytes as-is)
+  bool useJoliet = pvd.hasJoliet;
+  if (useJoliet) {
+    uint32_t jLBA = pvd.jolietRootLBA, jSize = pvd.jolietRootSize;
+    if (!isoNavPathJoliet(f, pvd, dir, jLBA, jSize)) useJoliet = false;
+    if (useJoliet) { dirLBA = jLBA; dirSize = jSize; }
+  }
+
+  bool first = true;
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < secUsed) {
+      uint8_t recLen = _isoBuf[off];
+      if (recLen == 0 || off + recLen > secUsed || recLen < 33) break;
+      uint8_t nameLen = _isoBuf[off+32];
+      if (nameLen==1&&(_isoBuf[off+33]==0x00||_isoBuf[off+33]==0x01)){off+=recLen;continue;}
+      if (nameLen==0){off+=recLen;continue;}
+      bool     isDir = (_isoBuf[off+25]&0x02)!=0;
+      uint32_t fileLBA=(uint32_t)_isoBuf[off+2]|((uint32_t)_isoBuf[off+3]<<8)|
+                       ((uint32_t)_isoBuf[off+4]<<16)|((uint32_t)_isoBuf[off+5]<<24);
+      uint32_t fileSz=(uint32_t)_isoBuf[off+10]|((uint32_t)_isoBuf[off+11]<<8)|
+                      ((uint32_t)_isoBuf[off+12]<<16)|((uint32_t)_isoBuf[off+13]<<24);
+      char nm[448]={0};  // enough for 64 UCS-2 chars → up to 192 UTF-8 bytes
+      if (useJoliet && (nameLen & 1) == 0 && nameLen >= 2) {
+        // Joliet: UCS-2 BE → UTF-8
+        int chars = nameLen / 2;
+        ucs2BEToUtf8(_isoBuf + off + 33, chars, nm, sizeof(nm));
+      } else {
+        // ISO 9660: raw bytes
+        memcpy(nm, _isoBuf+off+33, nameLen < 447 ? nameLen : 447);
+        char* semi=strchr(nm,';'); if(semi)*semi='\0';
+        int nl=strlen(nm); if(nl>0&&nm[nl-1]=='.') nm[nl-1]='\0';
+        for(int ci=0;nm[ci];ci++) if((uint8_t)nm[ci]<0x20||(uint8_t)nm[ci]==0x7F) nm[ci]='_';
+      }
+      if(!nm[0]){off+=recLen;continue;}
+      String entry=String(first?"":",")+"{\"name\":\""+jsonEsc(nm)+
+                   "\",\"dir\":" +(isDir?"true":"false")+
+                   ",\"size\":"+String(fileSz)+",\"lba\":"+String(fileLBA)+"}";
+      httpServer.sendContent(entry);
+      first=false; off+=recLen;
+    }
+    remain-=(remain<(uint32_t)ISO_SECTOR)?remain:(uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+  f.close();
+  httpServer.sendContent("]}");
+  httpServer.sendContent("");  // terminate chunked encoding
+}
+
+// ---- ISO API: GET /api/iso/stat?iso=<path> ----------------------------------
+void handleIsoStat() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso") ? httpServer.arg("iso") : "";
+  if (!isoPath.length()) { httpServer.send(400,"application/json","{\"error\":\"Missing iso\"}"); return; }
+  File f = SD_MMC.open(isoPath.c_str());
+  if (!f) { httpServer.send(404,"application/json","{\"error\":\"Not found\"}"); return; }
+  uint64_t fsize = f.size();
+  IsoPVD pvd; bool valid = isoParsePVD(f, pvd);
+  f.close();
+  bool rw = valid && !pvd.isBin && fsize <= ISO_RW_MAX_BYTES && !cfg.isoEditorRO;
+  httpServer.send(200,"application/json",
+    "{\"ok\":" + String(valid?"true":"false") +
+    ",\"rw\":" + String(rw?"true":"false") +
+    ",\"bin\":" + String((valid&&pvd.isBin)?"true":"false") +
+    ",\"size\":" + String((uint32_t)fsize) +
+    ",\"vol_sectors\":" + String(valid?pvd.volSectors:0) + "}");
+}
+
+// ---- ISO API: GET /api/iso/get?iso=<path>&file=<path> -----------------------
+void handleIsoGet() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"text/plain","SD not ready"); return; }
+  String isoPath = httpServer.hasArg("iso")  ? httpServer.arg("iso")  : "";
+  String fpath   = httpServer.hasArg("file") ? httpServer.arg("file") : "";
+  if (!isoPath.length()||!fpath.length()) { httpServer.send(400,"text/plain","Missing params"); return; }
+  File f = SD_MMC.open(isoPath.c_str());
+  if (!f) { httpServer.send(404,"text/plain","ISO not found"); return; }
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd)) { f.close(); httpServer.send(400,"text/plain","Bad ISO"); return; }
+  String parent = "/", fname = fpath;
+  int sl = fpath.lastIndexOf('/');
+  if (sl > 0) { parent = fpath.substring(0,sl); fname = fpath.substring(sl+1); }
+  else if (sl == 0) fname = fpath.substring(1);
+  uint32_t dirLBA, dirSize;
+  if (!isoNavPath(f, pvd, parent, dirLBA, dirSize)) {
+    f.close(); httpServer.send(404,"text/plain","Dir not found"); return;
+  }
+  String fnameU = fname; fnameU.toUpperCase();
+  int64_t recOff = isoFindFile(f, pvd, dirLBA, dirSize, fnameU);
+  if (recOff < 0) { f.close(); httpServer.send(404,"text/plain","File not found"); return; }
+  f.seek((uint64_t)recOff);
+  uint8_t de[34]; f.read(de, 34);
+  uint32_t fileLBA = (uint32_t)de[2]|((uint32_t)de[3]<<8)|((uint32_t)de[4]<<16)|((uint32_t)de[5]<<24);
+  uint32_t fileSz  = (uint32_t)de[10]|((uint32_t)de[11]<<8)|((uint32_t)de[12]<<16)|((uint32_t)de[13]<<24);
+  httpServer.sendHeader("Content-Disposition","attachment; filename=\""+fname+"\"");
+  httpServer.setContentLength(fileSz);
+  httpServer.send(200,"application/octet-stream","");
+  WiFiClient client = httpServer.client();
+  uint32_t sent = 0;
+  for (uint32_t lba = fileLBA; sent < fileSz; lba++) {
+    if (!isoReadSec(f, lba, pvd.isBin)) break;
+    uint32_t toSend = min(fileSz - sent, (uint32_t)ISO_SECTOR);
+    client.write(_isoBuf, toSend);
+    sent += toSend;
+  }
+  f.close();
+}
+
+// Compact a directory sector: remove all deleted (nl=0) entries by moving
+// valid entries forward, leaving no ghost entries that confuse parsers like UltraISO.
+static void isoCompactDir(File& f, const IsoPVD& pvd, uint32_t dirLBA, uint32_t dirSize) {
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  uint8_t* newSec = (uint8_t*)malloc(ISO_SECTOR);
+  if (!newSec) return;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    memset(newSec, 0, ISO_SECTOR);
+    uint32_t newOff = 0, off = 0;
+    bool changed = false;
+    while (off < ISO_SECTOR) {
+      uint8_t rl = _isoBuf[off];
+      if (!rl) break;
+      if (rl < 33) break;
+      uint8_t nl = _isoBuf[off+32];
+      if (nl > 0) {  // valid entry: copy
+        memcpy(newSec + newOff, _isoBuf + off, rl);
+        newOff += rl;
+      } else {
+        changed = true;  // skipped deleted entry
+      }
+      off += rl;
+    }
+    if (changed) {
+      isoWriteAt(f, (uint64_t)curLBA * ISO_SECTOR, newSec, ISO_SECTOR);
+    }
+    remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+  free(newSec);
+}
+
+// Recursively mark all entries in a directory as deleted (helper for handleIsoRmDir)
+static void isoRmDirRecursive(File& f, const IsoPVD& pvd, uint32_t dirLBA, uint32_t dirSize) {
+  static const uint8_t zeroBuf[256] = {0};  // static = no stack cost
+  uint32_t remain = dirSize, curLBA = dirLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t secUsed = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < secUsed) {
+      uint8_t recLen = _isoBuf[off];
+      if (!recLen || recLen < 33 || off + recLen > secUsed) break;
+      uint8_t nameLen = _isoBuf[off+32];
+      if (nameLen == 1 && (_isoBuf[off+33] == 0x00 || _isoBuf[off+33] == 0x01)) { off += recLen; continue; }
+      if (nameLen == 0) { off += recLen; continue; }
+      bool isDir2 = (_isoBuf[off+25] & 0x02) != 0;
+      uint32_t childLBA  = (uint32_t)_isoBuf[off+2]|((uint32_t)_isoBuf[off+3]<<8)|
+                           ((uint32_t)_isoBuf[off+4]<<16)|((uint32_t)_isoBuf[off+5]<<24);
+      uint32_t childSize = (uint32_t)_isoBuf[off+10]|((uint32_t)_isoBuf[off+11]<<8)|
+                           ((uint32_t)_isoBuf[off+12]<<16)|((uint32_t)_isoBuf[off+13]<<24);
+      if (isDir2) isoRmDirRecursive(f, pvd, childLBA, childSize);
+      // Zero entire record content (bytes 1..recLen-1)
+      uint64_t recStart = (uint64_t)curLBA * ISO_SECTOR + off;
+      uint8_t toZero = recLen - 1;
+      // Write in ≤256-byte chunks using static zero buffer
+      for (uint8_t written = 0; written < toZero; ) {
+        uint8_t chunk = min((uint8_t)(toZero - written), (uint8_t)255);
+        f.seek(recStart + 1 + written); f.write(zeroBuf, chunk);
+        written += chunk;
+      }
+      off += recLen;
+    }
+    // Zero entire directory sector using isoWriteAt (no extra stack alloc)
+    // We use a heap-allocated buffer via isoWriteAt indirection
+    // Write the sector as zeros by seeking and writing from zeroBuf in 256B chunks
+    uint64_t secOff = (uint64_t)curLBA * ISO_SECTOR;
+    for (int chunk = 0; chunk < ISO_SECTOR; chunk += 256) {
+      f.seek(secOff + chunk);
+      f.write(zeroBuf, min(256, ISO_SECTOR - chunk));
+    }
+    remain -= (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+}
+
+// ---- ISO API: GET /api/iso/rmdir?iso=<>&file=<> — delete directory recursively ----
+void handleIsoRmDir() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso")  ? normPath(httpServer.arg("iso"))  : "";
+  String fpath   = httpServer.hasArg("file") ? httpServer.arg("file") : "";
+  if (!isoPath.length()||!fpath.length()) {
+    httpServer.send(400,"application/json","{\"error\":\"Missing params\"}"); return;
+  }
+  File f = SD_MMC.open(isoPath.c_str(), "r+");
+  if (!f) { httpServer.send(404,"application/json","{\"error\":\"Cannot open ISO\"}"); return; }
+  if (cfg.isoEditorRO) { f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO editor is read-only (set iso-edit rw to enable)\"}"); return; }
+  if (f.size() > ISO_RW_MAX_BYTES) {
+    f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO >800MB — read-only\"}"); return;
+  }
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd) || pvd.isBin) {
+    f.close(); httpServer.send(400,"application/json","{\"error\":\"Not RW-capable\"}"); return;
+  }
+  String parent = "/", dname = fpath;
+  int sl = fpath.lastIndexOf('/');
+  if (sl > 0) { parent = fpath.substring(0,sl); dname = fpath.substring(sl+1); }
+  else if (sl == 0) dname = fpath.substring(1);
+
+  uint8_t zeros[2] = {0, 0};
+
+  // ── Step 1: Find and delete ISO 9660 directory entry ─────────────────────
+  uint32_t parentIsoLBA, parentIsoSize;
+  uint32_t iso9660ChildLBA = 0, iso9660ChildSize = 0;
+  int64_t  iso9660RecOff = -1;
+  if (isoNavPath(f, pvd, parent, parentIsoLBA, parentIsoSize)) {
+    String dnameU = dname; dnameU.toUpperCase();
+    iso9660RecOff = isoFindFile(f, pvd, parentIsoLBA, parentIsoSize, dnameU);
+    if (iso9660RecOff >= 0) {
+      f.seek((uint64_t)iso9660RecOff);
+      uint8_t de[36]; f.read(de, 36);
+      iso9660ChildLBA  = (uint32_t)de[2]|(uint32_t)de[3]<<8|(uint32_t)de[4]<<16|(uint32_t)de[5]<<24;
+      iso9660ChildSize = (uint32_t)de[10]|(uint32_t)de[11]<<8|(uint32_t)de[12]<<16|(uint32_t)de[13]<<24;
+      isoRmDirRecursive(f, pvd, iso9660ChildLBA, iso9660ChildSize);
+      // Zero entire record (except recLen byte 0) — prevents tools from following deleted entry
+      { f.seek((uint64_t)iso9660RecOff);
+        uint8_t hdr[1]; f.read(hdr, 1); uint8_t rl = hdr[0];
+        uint8_t zeroBuf[256]={0}; if(rl>1) { f.seek((uint64_t)iso9660RecOff+1); f.write(zeroBuf, rl-1); } }
+    }
+  }
+
+  // ── Step 2: Find and delete Joliet directory entry (independent LBA) ──────
+  if (pvd.hasJoliet) {
+    // Navigate to the target dir in Joliet tree to learn its LBA
+    uint32_t jolietChildLBA = 0, jolietChildSize = 0;
+    if (isoNavPathJoliet(f, pvd, fpath, jolietChildLBA, jolietChildSize)) {
+      // Navigate to the Joliet parent dir
+      uint32_t jParentLBA = pvd.jolietRootLBA, jParentSize = pvd.jolietRootSize;
+      isoNavPathJoliet(f, pvd, parent, jParentLBA, jParentSize);
+      // Search Joliet parent for entry with this exact LBA
+      uint32_t rem = jParentSize, lba2 = jParentLBA;
+      bool found = false;
+      while (rem > 0 && !found) {
+        if (!isoReadSec(f, lba2, pvd.isBin)) break;
+        uint32_t used = (rem < (uint32_t)ISO_SECTOR) ? rem : (uint32_t)ISO_SECTOR;
+        uint32_t off2 = 0;
+        while (off2 < used) {
+          uint8_t rl = _isoBuf[off2]; if (!rl || rl < 33) break;
+          uint8_t nl = _isoBuf[off2+32];
+          if (nl == 1 && (_isoBuf[off2+33]==0||_isoBuf[off2+33]==1)) { off2+=rl; continue; }
+          uint32_t entLBA = (uint32_t)_isoBuf[off2+2]|((uint32_t)_isoBuf[off2+3]<<8)|
+                            ((uint32_t)_isoBuf[off2+4]<<16)|((uint32_t)_isoBuf[off2+5]<<24);
+          if (entLBA == jolietChildLBA && (_isoBuf[off2+25]&0x02) && nl > 0) {
+            uint64_t jRecOff = (uint64_t)lba2 * ISO_SECTOR + off2;
+            // Also recursively clean Joliet subdir contents (if different from ISO 9660)
+            if (jolietChildLBA != iso9660ChildLBA)
+              isoRmDirRecursive(f, pvd, jolietChildLBA, jolietChildSize);
+            { f.seek(jRecOff);
+              uint8_t hdr2[1]; f.read(hdr2, 1); uint8_t rl2 = hdr2[0];
+              uint8_t zb[256]={0}; if(rl2>1) { f.seek(jRecOff+1); f.write(zb, rl2-1); } }
+            found = true; break;
+          }
+          off2 += rl;
+        }
+        rem -= (rem<(uint32_t)ISO_SECTOR)?rem:(uint32_t)ISO_SECTOR;
+        lba2++;
+      }
+    }
+  }
+
+  if (iso9660RecOff < 0 && !pvd.hasJoliet) {
+    f.close(); httpServer.send(404,"application/json","{\"error\":\"Directory not found\"}"); return;
+  }
+
+  f.close();
+  // Compact parent directories to remove ghost entries and rebuild Joliet path table
+  { File fc = SD_MMC.open(isoPath.c_str(), "r+");
+    if (fc) { isoCompactDir(fc, pvd, parentIsoLBA, parentIsoSize);
+              if (pvd.hasJoliet) {
+                uint32_t jPLBA=pvd.jolietRootLBA, jPSz=pvd.jolietRootSize;
+                isoNavPathJoliet(fc, pvd, parent, jPLBA, jPSz);
+                isoCompactDir(fc, pvd, jPLBA, jPSz);
+                // Rebuild Joliet path table after compaction (removes stale entries)
+                isoRebuildJolietPathTable(fc, pvd);
+              }
+              fc.close(); } }
+  dualPrint.printf("[ISO] rmdir: %s from %s\n", dname.c_str(), isoPath.c_str());
+  if (isoPath.equalsIgnoreCase(mountedFile)) doMount(isoPath);
+  httpServer.send(200,"application/json","{\"ok\":true}");
+}
+void handleIsoRm() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso")  ? httpServer.arg("iso")  : "";
+  String fpath   = httpServer.hasArg("file") ? httpServer.arg("file") : "";
+  if (!isoPath.length()||!fpath.length()) {
+    httpServer.send(400,"application/json","{\"error\":\"Missing params\"}"); return;
+  }
+  File f = SD_MMC.open(isoPath.c_str(), "r+");
+  if (!f) { httpServer.send(404,"application/json","{\"error\":\"Cannot open ISO\"}"); return; }
+  if (cfg.isoEditorRO) { f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO editor is read-only (set iso-edit rw to enable)\"}"); return; }
+  if (f.size() > ISO_RW_MAX_BYTES) {
+    f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO >800MB — read-only\"}"); return;
+  }
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd) || pvd.isBin) {
+    f.close(); httpServer.send(400,"application/json","{\"error\":\"Not RW-capable\"}"); return;
+  }
+  String parent = "/", fname = fpath;
+  int sl = fpath.lastIndexOf('/');
+  if (sl > 0) { parent = fpath.substring(0,sl); fname = fpath.substring(sl+1); }
+  else if (sl == 0) fname = fpath.substring(1);
+
+  // Delete from ISO 9660 directory
+  uint32_t dirLBA, dirSize;
+  if (!isoNavPath(f, pvd, parent, dirLBA, dirSize)) {
+    f.close(); httpServer.send(404,"application/json","{\"error\":\"Dir not found\"}"); return;
+  }
+  String fnameU = fname; fnameU.toUpperCase();
+  int64_t recOff = isoFindFile(f, pvd, dirLBA, dirSize, fnameU);
+  if (recOff < 0) { f.close(); httpServer.send(404,"application/json","{\"error\":\"File not found\"}"); return; }
+  uint8_t zeros[2] = {0, 0};
+  // Zero entire ISO 9660 record (except recLen) — prevents tools from seeing deleted entry
+  { f.seek((uint64_t)recOff);
+    uint8_t hdr3[1]; f.read(hdr3, 1); uint8_t rl3 = hdr3[0];
+    uint8_t zb3[256]={0}; if(rl3>1) { f.seek((uint64_t)recOff+1); f.write(zb3, rl3-1); } }
+
+  // Get LBA of file data (used for Joliet LBA-based matching)
+  f.seek((uint64_t)recOff + 2);
+  { uint8_t lb[4]; f.read(lb, 4);
+    uint32_t targetLBA = (uint32_t)lb[0]|((uint32_t)lb[1]<<8)|((uint32_t)lb[2]<<16)|((uint32_t)lb[3]<<24);
+
+    // Also delete from Joliet directory (navigate with isoNavPathJoliet, match by LBA)
+    if (pvd.hasJoliet) {
+      uint32_t jdirLBA = pvd.jolietRootLBA, jdirSize = pvd.jolietRootSize;
+      isoNavPathJoliet(f, pvd, parent, jdirLBA, jdirSize);
+      uint32_t rem = jdirSize, lba2 = jdirLBA;
+      bool found = false;
+      while (rem > 0 && !found) {
+        if (!isoReadSec(f, lba2, pvd.isBin)) break;
+        uint32_t used = (rem < (uint32_t)ISO_SECTOR) ? rem : (uint32_t)ISO_SECTOR;
+        uint32_t off2 = 0;
+        while (off2 < used) {
+          uint8_t rl = _isoBuf[off2]; if (!rl || rl < 33) break;
+          uint32_t entLBA = (uint32_t)_isoBuf[off2+2]|((uint32_t)_isoBuf[off2+3]<<8)|
+                            ((uint32_t)_isoBuf[off2+4]<<16)|((uint32_t)_isoBuf[off2+5]<<24);
+          if (entLBA == targetLBA && _isoBuf[off2+32] > 0) {
+            uint64_t jRecOff = (uint64_t)lba2 * ISO_SECTOR + off2;
+            f.seek(jRecOff + 32); f.write(zeros, 2);
+            found = true; break;
+          }
+          off2 += rl;
+        }
+        rem -= (rem<(uint32_t)ISO_SECTOR)?rem:(uint32_t)ISO_SECTOR;
+        lba2++;
+      }
+    }
+  }
+
+  f.close();
+  // Compact parent directories to remove ghost entries
+  { File fc = SD_MMC.open(isoPath.c_str(), "r+");
+    if (fc) { IsoPVD pvd2; if(isoParsePVD(fc, pvd2)) {
+                uint32_t pdLBA, pdSz; isoNavPath(fc, pvd2, parent, pdLBA, pdSz);
+                isoCompactDir(fc, pvd2, pdLBA, pdSz);
+                if (pvd2.hasJoliet) {
+                  uint32_t jPLBA=pvd2.jolietRootLBA, jPSz=pvd2.jolietRootSize;
+                  isoNavPathJoliet(fc, pvd2, parent, jPLBA, jPSz);
+                  isoCompactDir(fc, pvd2, jPLBA, jPSz);
+                  // Rebuild Joliet path table (removes any stale dir entries)
+                  isoRebuildJolietPathTable(fc, pvd2);
+                }
+              } fc.close(); } }
+  dualPrint.printf("[ISO] Deleted: %s from %s\n", fname.c_str(), isoPath.c_str());
+  if (isoPath.equalsIgnoreCase(mountedFile)) doMount(isoPath);
+  httpServer.send(200,"application/json","{\"ok\":true}");
+}
+
+// ---- ISO PUT upload state ---------------------------------------------------
+static File     _ipFile;            // open ISO file handle
+static String   _ipIsoPath;         // ISO path (for remount check)
+static String   _ipFileName;        // bare filename to create (uppercase + ;1)
+static uint64_t _ipDirRecOff;       // byte offset in ISO of dir record to fill at END
+static uint64_t _ipDataOff;         // byte offset in ISO where data is being appended
+static uint64_t _ipJolietDirRecOff; // byte offset of Joliet dir record (0 = no Joliet)
+static bool     _ipHasJoliet;       // true if ISO has Joliet extension
+static uint32_t _ipDataLBA;         // LBA of first appended data sector
+static uint32_t _ipWritten;         // total content bytes written
+static uint8_t  _ipSecBuf[ISO_SECTOR]; // partial sector accumulation buffer
+static uint32_t _ipSecUsed;         // bytes currently in _ipSecBuf
+static bool     _ipOk;
+static bool     _ipDone;
+static uint32_t _ipOrigVolSectors;  // PVD vol size before edit (to update at end)
+
+static bool _ipFlushSector(bool pad) {
+  if (!_ipOk || !_ipFile) return false;
+  if (pad && _ipSecUsed < ISO_SECTOR)
+    memset(_ipSecBuf + _ipSecUsed, 0, ISO_SECTOR - _ipSecUsed);
+  _ipFile.seek(_ipDataOff);
+  bool ok = _ipFile.write(_ipSecBuf, ISO_SECTOR) == ISO_SECTOR;
+  _ipDataOff += ISO_SECTOR;
+  _ipSecUsed = 0;
+  return ok;
+}
+
+// ---- ISO API: POST /api/iso/put?iso=<>&dir=<>&file=<> (RW only) -------------
+void handleIsoPut() {
+  if (!checkAuth()) return;
+  HTTPUpload& up = httpServer.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    _ipOk = false; _ipDone = false; _ipWritten = 0; _ipSecUsed = 0;
+    _ipHasJoliet = false; _ipJolietDirRecOff = 0;
+    _ipIsoPath = httpServer.hasArg("iso") ? httpServer.arg("iso") : "";
+    String dir = httpServer.hasArg("dir") ? httpServer.arg("dir") : "/";
+    // ISO 9660 filename: uppercase + ;1 version suffix
+    String iso9660Name = up.filename; iso9660Name.toUpperCase();
+    if (!iso9660Name.endsWith(";1")) iso9660Name += ";1";
+    _ipFileName = iso9660Name;  // stored for ;1 filename
+    String jolietName = up.filename;  // original UTF-8 name for Joliet
+    if (!_ipIsoPath.length() || !_ipFileName.length()) return;
+
+    _ipFile = SD_MMC.open(_ipIsoPath.c_str(), "r+");
+    if (!_ipFile) return;
+    if (cfg.isoEditorRO || _ipFile.size() > ISO_RW_MAX_BYTES) { _ipFile.close(); return; }
+
+    IsoPVD pvd;
+    if (!isoParsePVD(_ipFile, pvd) || pvd.isBin) { _ipFile.close(); return; }
+    _ipOrigVolSectors = pvd.volSectors;
+    _ipHasJoliet = pvd.hasJoliet;
+
+    uint32_t dirLBA, dirSize;
+    if (!isoNavPath(_ipFile, pvd, dir, dirLBA, dirSize)) { _ipFile.close(); return; }
+
+    uint8_t nameLen = (uint8_t)_ipFileName.length();
+    uint8_t recLen  = (uint8_t)(33 + nameLen); if (recLen & 1) recLen++;
+
+    int64_t slotOff = isoFindDirSpace(_ipFile, pvd, dirLBA, dirSize, recLen);
+    if (slotOff < 0) { _ipFile.close(); return; }
+
+    _ipDirRecOff = (uint64_t)slotOff;
+    _ipDataOff   = (uint64_t)pvd.volSectors * ISO_SECTOR;
+    _ipDataLBA   = pvd.volSectors;
+
+    // Write provisional ISO 9660 directory record (size=0, updated at END)
+    uint8_t drec[34 + 222] = {0};
+    isoFillDirEntry(drec, _ipDataLBA, 0, 0x00, (const uint8_t*)_ipFileName.c_str(), nameLen);
+    drec[0] = recLen;
+    if (!isoWriteAt(_ipFile, _ipDirRecOff, drec, recLen)) { _ipFile.close(); return; }
+
+    // If Joliet present: write provisional Joliet directory record too
+    if (pvd.hasJoliet) {
+      uint32_t jdirLBA = pvd.jolietRootLBA, jdirSize = pvd.jolietRootSize;
+      isoNavPathJoliet(_ipFile, pvd, dir, jdirLBA, jdirSize);  // navigate to correct Joliet subdir
+      uint8_t jdrec[34+256]={0};
+      isoFillJolietDirEntry(jdrec, _ipDataLBA, 0, 0x00, jolietName.c_str());
+      uint8_t jRecLen = jdrec[0];
+      int64_t jSlot = isoFindDirSpace(_ipFile, pvd, jdirLBA, jdirSize, jRecLen);
+      if (jSlot >= 0) {
+        isoWriteAt(_ipFile, (uint64_t)jSlot, jdrec, jRecLen);
+        _ipJolietDirRecOff = (uint64_t)jSlot;
+      }
+    }
+
+    memset(_ipSecBuf, 0, ISO_SECTOR);
+    _ipOk = true;
+    dualPrint.printf("[ISO] Upload start: %s → %s  LBA=%u\n",
+                     _ipFileName.c_str(), _ipIsoPath.c_str(), _ipDataLBA);
+
+    // Set socket recv timeout for abort detection
+    int fd = httpServer.client().fd();
+    if (fd >= 0) { struct timeval tv={3,0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)); }
+
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!_ipOk) return;
+    uint32_t rem = up.currentSize; const uint8_t* src = up.buf;
+    while (rem > 0) {
+      uint32_t space = ISO_SECTOR - _ipSecUsed;
+      uint32_t chunk = (rem < space) ? rem : space;
+      memcpy(_ipSecBuf + _ipSecUsed, src, chunk);
+      _ipSecUsed += chunk; src += chunk; rem -= chunk; _ipWritten += chunk;
+      if (_ipSecUsed == ISO_SECTOR) { if (!_ipFlushSector(false)) { _ipOk = false; return; } }
+    }
+
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!_ipOk) { if (_ipFile) _ipFile.close(); return; }
+    if (_ipSecUsed > 0) { if (!_ipFlushSector(true)) { _ipOk = false; _ipFile.close(); return; } }
+    uint32_t addedSectors = (_ipWritten + ISO_SECTOR - 1) / ISO_SECTOR;
+
+    // Update ISO 9660 directory record size (LE+BE)
+    uint8_t szBytes[8];
+    szBytes[0]=(uint8_t)_ipWritten;     szBytes[1]=(uint8_t)(_ipWritten>>8);
+    szBytes[2]=(uint8_t)(_ipWritten>>16); szBytes[3]=(uint8_t)(_ipWritten>>24);
+    szBytes[4]=szBytes[3]; szBytes[5]=szBytes[2]; szBytes[6]=szBytes[1]; szBytes[7]=szBytes[0];
+    isoWriteAt(_ipFile, _ipDirRecOff + 10, szBytes, 8);
+
+    // If Joliet: update Joliet dir record size too
+    if (_ipHasJoliet && _ipJolietDirRecOff) {
+      isoWriteAt(_ipFile, _ipJolietDirRecOff + 10, szBytes, 8);
+    }
+
+    // Update PVD volume size (both LE+BE)
+    uint32_t newVolSectors = _ipOrigVolSectors + addedSectors;
+    uint8_t vsBytes[8];
+    vsBytes[0]=(uint8_t)newVolSectors;     vsBytes[1]=(uint8_t)(newVolSectors>>8);
+    vsBytes[2]=(uint8_t)(newVolSectors>>16); vsBytes[3]=(uint8_t)(newVolSectors>>24);
+    vsBytes[4]=vsBytes[3]; vsBytes[5]=vsBytes[2]; vsBytes[6]=vsBytes[1]; vsBytes[7]=vsBytes[0];
+    isoWriteAt(_ipFile, (uint64_t)16 * ISO_SECTOR + 80, vsBytes, 8);
+
+    // If Joliet: update Joliet SVD volume size too
+    if (_ipHasJoliet) {
+      // Re-read PVD to get jolietSvdLBA
+      IsoPVD pvdTmp; isoParsePVD(_ipFile, pvdTmp);
+      isoWriteAt(_ipFile, (uint64_t)pvdTmp.jolietSvdLBA * ISO_SECTOR + 80, vsBytes, 8);
+    }
+
+    _ipFile.close(); _ipDone = true;
+    dualPrint.printf("[ISO] Upload OK: %u B → %u sectors. Joliet:%d\n",
+                     _ipWritten, addedSectors, (int)_ipHasJoliet);
+    if (_ipIsoPath.equalsIgnoreCase(mountedFile)) {
+      dualPrint.printf("[ISO] Remounting: %s\n", _ipIsoPath.c_str());
+      doMount(_ipIsoPath);
+    }
+
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    _ipOk = false;
+    if (_ipFile && _ipDirRecOff) {
+      uint8_t z = 0; _ipFile.seek(_ipDirRecOff); _ipFile.write(&z, 1);
+      if (_ipJolietDirRecOff) { _ipFile.seek(_ipJolietDirRecOff); _ipFile.write(&z, 1); }
+    }
+    if (_ipFile) _ipFile.close();
+    dualPrint.println(F("[ISO] Upload aborted."));
+  }
+}
+
+void handleIsoPutDone() {
+  if (!checkAuth()) return;
+  if (!httpServer.client().connected()) return;
+  httpServer.send(200,"application/json",
+    _ipDone ? "{\"ok\":true,\"bytes\":" + String(_ipWritten) + "}" : "{\"error\":\"upload failed\"}");
+}
+
+// ---- ISO API: GET /api/iso/mkdir?iso=<>&dir=<>&name=<> (RW only) -----------
+// Rebuild Joliet path table from the actual current state of the Joliet root directory.
+// Called after mkdir and rmdir to keep path table consistent with directory records.
+// Only handles root-level directories (parent dir number = 1) which is our use case.
+static void isoRebuildJolietPathTable(File& f, const IsoPVD& pvd) {
+  if (!pvd.hasJoliet || !pvd.jolietPathTableLBA_L || !pvd.jolietPathTableLBA_M) return;
+
+  // Allocate from heap — stack is too small (2×2048 = 4KB would overflow)
+  uint8_t* ptL = (uint8_t*)calloc(ISO_SECTOR, 1);
+  uint8_t* ptM = (uint8_t*)calloc(ISO_SECTOR, 1);
+  if (!ptL || !ptM) { free(ptL); free(ptM); return; }
+  uint32_t ptSize = 0;
+
+  // Root entry (always first): nameLen=1, LBA=jolietRootLBA, parent=1, id=0x00, pad=0x00
+  ptL[0]=1; ptL[1]=0;
+  ptL[2]=(uint8_t)pvd.jolietRootLBA; ptL[3]=(uint8_t)(pvd.jolietRootLBA>>8);
+  ptL[4]=(uint8_t)(pvd.jolietRootLBA>>16); ptL[5]=(uint8_t)(pvd.jolietRootLBA>>24);
+  ptL[6]=1; ptL[7]=0; ptL[8]=0x00; ptL[9]=0x00;
+  ptM[0]=1; ptM[1]=0;
+  ptM[2]=(uint8_t)(pvd.jolietRootLBA>>24); ptM[3]=(uint8_t)(pvd.jolietRootLBA>>16);
+  ptM[4]=(uint8_t)(pvd.jolietRootLBA>>8);  ptM[5]=(uint8_t)pvd.jolietRootLBA;
+  ptM[6]=0; ptM[7]=1; ptM[8]=0x00; ptM[9]=0x00;
+  ptSize = 10;
+
+  // Scan Joliet root for current directory entries and add them to path tables
+  uint32_t remain = pvd.jolietRootSize, curLBA = pvd.jolietRootLBA;
+  while (remain > 0) {
+    if (!isoReadSec(f, curLBA, pvd.isBin)) break;
+    uint32_t used = (remain < (uint32_t)ISO_SECTOR) ? remain : (uint32_t)ISO_SECTOR;
+    uint32_t off = 0;
+    while (off < used) {
+      uint8_t rl = _isoBuf[off]; if (!rl || rl < 33) break;
+      uint8_t nl = _isoBuf[off+32];
+      // Skip . and .. (single-byte identifiers 0x00/0x01)
+      if (nl==1 && (_isoBuf[off+33]==0x00||_isoBuf[off+33]==0x01)) { off+=rl; continue; }
+      if (nl==0) { off+=rl; continue; }  // deleted entry
+      uint8_t flags = _isoBuf[off+25];
+      if (flags & 0x02) {  // directory entry
+        uint32_t dirLBA = (uint32_t)_isoBuf[off+2]|((uint32_t)_isoBuf[off+3]<<8)|
+                          ((uint32_t)_isoBuf[off+4]<<16)|((uint32_t)_isoBuf[off+5]<<24);
+        uint8_t entLen = 8 + nl + (nl & 1);  // name bytes (UCS-2) + header
+        if (ptSize + entLen <= ISO_SECTOR - 10) {  // don't overflow
+          // Type-L entry (LBA LE)
+          ptL[ptSize+0]=nl; ptL[ptSize+1]=0;
+          ptL[ptSize+2]=(uint8_t)dirLBA;       ptL[ptSize+3]=(uint8_t)(dirLBA>>8);
+          ptL[ptSize+4]=(uint8_t)(dirLBA>>16); ptL[ptSize+5]=(uint8_t)(dirLBA>>24);
+          ptL[ptSize+6]=1; ptL[ptSize+7]=0;  // parent=1 (root) LE
+          memcpy(ptL+ptSize+8, _isoBuf+off+33, nl);
+          if (nl & 1) ptL[ptSize+8+nl]=0;
+          // Type-M entry (LBA BE)
+          ptM[ptSize+0]=nl; ptM[ptSize+1]=0;
+          ptM[ptSize+2]=(uint8_t)(dirLBA>>24); ptM[ptSize+3]=(uint8_t)(dirLBA>>16);
+          ptM[ptSize+4]=(uint8_t)(dirLBA>>8);  ptM[ptSize+5]=(uint8_t)dirLBA;
+          ptM[ptSize+6]=0; ptM[ptSize+7]=1;  // parent=1 BE
+          memcpy(ptM+ptSize+8, _isoBuf+off+33, nl);
+          if (nl & 1) ptM[ptSize+8+nl]=0;
+          ptSize += entLen;
+        }
+      }
+      off += rl;
+    }
+    remain -= (remain<(uint32_t)ISO_SECTOR)?remain:(uint32_t)ISO_SECTOR;
+    curLBA++;
+  }
+
+  // Write both path tables
+  isoWriteAt(f, (uint64_t)pvd.jolietPathTableLBA_L * ISO_SECTOR, ptL, ISO_SECTOR);
+  isoWriteAt(f, (uint64_t)pvd.jolietPathTableLBA_M * ISO_SECTOR, ptM, ISO_SECTOR);
+
+  // Update Joliet SVD path table size (LE+BE at SVD offset 132)
+  uint8_t ps[8]={(uint8_t)ptSize,(uint8_t)(ptSize>>8),(uint8_t)(ptSize>>16),(uint8_t)(ptSize>>24),
+                 (uint8_t)(ptSize>>24),(uint8_t)(ptSize>>16),(uint8_t)(ptSize>>8),(uint8_t)ptSize};
+  isoWriteAt(f, (uint64_t)pvd.jolietSvdLBA * ISO_SECTOR + 132, ps, 8);
+
+  dualPrint.printf("[ISO] Rebuilt Joliet path table: %u bytes, %u dirs\n",
+                   ptSize, (ptSize > 10) ? (ptSize-10)/10 + 1 : 1);
+  free(ptL); free(ptM);
+}
+
+// Append a new directory entry to ISO 9660 and Joliet path tables.
+static void isoAppendPathTables(File& f, IsoPVD& pvd, uint32_t isoDirLBA, uint32_t jolDirLBA,
+                                 const String& isoName, const String& utf8Name) {
+  auto writePathEntry_L = [&](uint32_t tableLBA, uint32_t& tableSize, uint32_t dirLBA,
+                               const uint8_t* name, uint8_t nl) {
+    uint8_t entLen = 8 + nl + (nl & 1);
+    uint8_t ent[256] = {0};
+    ent[0]=nl; ent[1]=0;
+    ent[2]=(uint8_t)dirLBA;       ent[3]=(uint8_t)(dirLBA>>8);   // LBA LE
+    ent[4]=(uint8_t)(dirLBA>>16); ent[5]=(uint8_t)(dirLBA>>24);
+    ent[6]=1; ent[7]=0;                                            // parent=1 LE
+    memcpy(ent+8, name, nl);
+    isoWriteAt(f, (uint64_t)tableLBA * ISO_SECTOR + tableSize, ent, entLen);
+    tableSize += entLen;
+  };
+  auto writePathEntry_M = [&](uint32_t tableLBA, uint32_t tableSize, uint32_t dirLBA,
+                               const uint8_t* name, uint8_t nl) {
+    uint8_t entLen = 8 + nl + (nl & 1);
+    uint8_t ent[256] = {0};
+    ent[0]=nl; ent[1]=0;
+    ent[2]=(uint8_t)(dirLBA>>24); ent[3]=(uint8_t)(dirLBA>>16);  // LBA BE
+    ent[4]=(uint8_t)(dirLBA>>8);  ent[5]=(uint8_t)dirLBA;
+    ent[6]=0; ent[7]=1;                                            // parent=1 BE
+    memcpy(ent+8, name, nl);
+    // Write at same offset as the L table entry (tableSize already updated by L writer)
+    isoWriteAt(f, (uint64_t)tableLBA * ISO_SECTOR + (tableSize - entLen), ent, entLen);
+  };
+
+  // ISO 9660 path tables
+  uint8_t isoNl = (uint8_t)isoName.length();
+  writePathEntry_L(pvd.isoPathTableLBA_L, pvd.isoPathTableSize,
+                   isoDirLBA, (const uint8_t*)isoName.c_str(), isoNl);
+  writePathEntry_M(pvd.isoPathTableLBA_M, pvd.isoPathTableSize,
+                   isoDirLBA, (const uint8_t*)isoName.c_str(), isoNl);
+  // Update ISO 9660 PVD path table size (LE+BE at offset 132)
+  { uint8_t ps[8]={(uint8_t)pvd.isoPathTableSize,(uint8_t)(pvd.isoPathTableSize>>8),
+                   (uint8_t)(pvd.isoPathTableSize>>16),(uint8_t)(pvd.isoPathTableSize>>24),
+                   (uint8_t)(pvd.isoPathTableSize>>24),(uint8_t)(pvd.isoPathTableSize>>16),
+                   (uint8_t)(pvd.isoPathTableSize>>8),(uint8_t)pvd.isoPathTableSize};
+    isoWriteAt(f, (uint64_t)16 * ISO_SECTOR + 132, ps, 8); }
+
+  if (!pvd.hasJoliet || !jolDirLBA) return;
+
+  // Joliet path tables (UCS-2 BE name)
+  uint8_t ucs2[128]; int nChars = utf8ToUCS2BE(utf8Name.c_str(), ucs2, 64);
+  uint8_t jnl = (uint8_t)(nChars * 2);
+  writePathEntry_L(pvd.jolietPathTableLBA_L, pvd.jolietPathTableSize,
+                   jolDirLBA, ucs2, jnl);
+  writePathEntry_M(pvd.jolietPathTableLBA_M, pvd.jolietPathTableSize,
+                   jolDirLBA, ucs2, jnl);
+  // Update Joliet SVD path table size
+  { uint8_t ps[8]={(uint8_t)pvd.jolietPathTableSize,(uint8_t)(pvd.jolietPathTableSize>>8),
+                   (uint8_t)(pvd.jolietPathTableSize>>16),(uint8_t)(pvd.jolietPathTableSize>>24),
+                   (uint8_t)(pvd.jolietPathTableSize>>24),(uint8_t)(pvd.jolietPathTableSize>>16),
+                   (uint8_t)(pvd.jolietPathTableSize>>8),(uint8_t)pvd.jolietPathTableSize};
+    isoWriteAt(f, (uint64_t)pvd.jolietSvdLBA * ISO_SECTOR + 132, ps, 8); }
+}
+
+void handleIsoMkdir() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso")  ? normPath(httpServer.arg("iso"))  : "";
+  String dir     = httpServer.hasArg("dir")  ? httpServer.arg("dir")  : "/";
+  String name    = httpServer.hasArg("name") ? httpServer.arg("name") : "";
+  if (!isoPath.length()||!name.length()) {
+    httpServer.send(400,"application/json","{\"error\":\"Missing params\"}"); return;
+  }
+  // Store name as-is (UTF-8 bytes). ISO 9660 name field is a raw byte array.
+  // Modern OSes (Windows 10+, Linux) display UTF-8 bytes correctly from USB MSC.
+  // Limit to 63 bytes (UTF-8) — ISO record max is 221 bytes, 63 is generous for display.
+  if (name.length() > 63) name = name.substring(0, 63);
+  // Sanitize: replace Joliet-forbidden characters (\ / : * ? " < > | and control chars)
+  // These break Windows CDFS navigation when stored in Joliet UCS-2 path names
+  { String clean;
+    for (int i = 0; i < (int)name.length(); i++) {
+      unsigned char c = (unsigned char)name[i];
+      if (c < 0x20) continue;  // skip control chars
+      // Multi-byte UTF-8: pass through unchanged (0x80-0xFF)
+      if (c >= 0x80) { clean += (char)c; continue; }
+      // ASCII forbidden by Joliet: \ / : * ? " < > |
+      if (c=='\\'||c=='/'||c==':'||c=='*'||c=='?'||c=='"'||c=='<'||c=='>'||c=='|')
+        clean += '_';
+      else clean += (char)c;
+    }
+    // Trim leading/trailing dots and spaces
+    while (clean.length() > 0 && (clean[0]=='.' || clean[0]==' ')) clean.remove(0,1);
+    while (clean.length() > 0 && (clean[clean.length()-1]=='.' || clean[clean.length()-1]==' '))
+      clean.remove(clean.length()-1);
+    name = clean;
+  }
+  if (!name.length()) { httpServer.send(400,"application/json","{\"error\":\"Empty name after sanitization\"}"); return; }
+  if (!name.length()) { httpServer.send(400,"application/json","{\"error\":\"Empty name\"}"); return; }
+  File f = SD_MMC.open(isoPath.c_str(), "r+");
+  if (!f) { httpServer.send(404,"application/json","{\"error\":\"Cannot open ISO\"}"); return; }
+  if (f.size() > ISO_RW_MAX_BYTES) {
+    f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO >200MB\"}"); return;
+  }
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd) || pvd.isBin) {
+    f.close(); httpServer.send(400,"application/json","{\"error\":\"Not RW-capable\"}"); return;
+  }
+  uint32_t dirLBA, dirSize;
+  if (!isoNavPath(f, pvd, dir, dirLBA, dirSize)) {
+    f.close(); httpServer.send(404,"application/json","{\"error\":\"Parent dir not found\"}"); return;
+  }
+  uint8_t nameLen=(uint8_t)name.length();
+  uint8_t recLen=(uint8_t)(33+nameLen); if(recLen&1) recLen++;
+  int64_t slotOff=isoFindDirSpace(f,pvd,dirLBA,dirSize,recLen);
+  if(slotOff<0){f.close();httpServer.send(507,"application/json","{\"error\":\"Parent directory full\"}");return;}
+  uint32_t newDirLBA=pvd.volSectors;
+  uint32_t sectorsAdded = 1;
+
+  // Write new ISO 9660 directory sector (. and ..)
+  uint8_t sec[ISO_SECTOR]; memset(sec,0,ISO_SECTOR);
+  { uint8_t d=0x00; isoFillDirEntry(sec+0,  newDirLBA, ISO_SECTOR, 0x02, &d, 1); }
+  { uint8_t d=0x01; isoFillDirEntry(sec+34, dirLBA,    dirSize,    0x02, &d, 1); }
+  isoWriteAt(f,(uint64_t)newDirLBA*ISO_SECTOR,sec,ISO_SECTOR);
+
+  // Write ISO 9660 dir record in parent (raw UTF-8 bytes for name)
+  uint8_t drec[256]={0};
+  isoFillDirEntry(drec, newDirLBA, ISO_SECTOR, 0x02, (const uint8_t*)name.c_str(), nameLen);
+  drec[0]=recLen;
+  isoWriteAt(f,(uint64_t)slotOff,drec,recLen);
+
+  // If Joliet present: write parallel Joliet directory sector and Joliet parent entry
+  if (pvd.hasJoliet) {
+    uint32_t jolNewDirLBA = pvd.volSectors + 1;
+    sectorsAdded = 2;
+
+    // Navigate to correct Joliet parent dir using UCS-2 aware navigation
+    uint32_t jdirLBA = pvd.jolietRootLBA, jdirSize = pvd.jolietRootSize;
+    isoNavPathJoliet(f, pvd, dir, jdirLBA, jdirSize);
+
+    // Always write Joliet dir sector (. and ..)
+    memset(sec, 0, ISO_SECTOR);
+    { uint8_t d=0x00; isoFillDirEntry(sec+0,  jolNewDirLBA, ISO_SECTOR, 0x02, &d, 1); }
+    { uint8_t d=0x01; isoFillDirEntry(sec+34, jdirLBA,      jdirSize,   0x02, &d, 1); }
+    isoWriteAt(f, (uint64_t)jolNewDirLBA * ISO_SECTOR, sec, ISO_SECTOR);
+
+    // Write Joliet parent dir entry with UCS-2 name
+    uint8_t jdRec[256]={0};
+    isoFillJolietDirEntry(jdRec, jolNewDirLBA, ISO_SECTOR, 0x02, name.c_str());
+    uint8_t jRecLen = jdRec[0];
+    int64_t jSlot = isoFindDirSpace(f, pvd, jdirLBA, jdirSize, jRecLen);
+    if (jSlot >= 0) {
+      isoWriteAt(f, (uint64_t)jSlot, jdRec, jRecLen);
+      dualPrint.printf("[ISO] Joliet entry: %s at slot=0x%llx LBA=%u recLen=%u\n",
+                       name.c_str(), (unsigned long long)jSlot, jolNewDirLBA, jRecLen);
+    } else {
+      dualPrint.printf("[ISO] ERROR: No space in Joliet dir for: %s\n", name.c_str());
+    }
+
+    // Update Joliet SVD volume size
+    uint32_t nv2 = pvd.volSectors + sectorsAdded;
+    uint8_t vs2[8]={(uint8_t)nv2,(uint8_t)(nv2>>8),(uint8_t)(nv2>>16),(uint8_t)(nv2>>24),
+                    (uint8_t)(nv2>>24),(uint8_t)(nv2>>16),(uint8_t)(nv2>>8),(uint8_t)nv2};
+    isoWriteAt(f,(uint64_t)pvd.jolietSvdLBA*ISO_SECTOR+80, vs2, 8);
+  }
+
+  // Update PVD vol size
+  uint32_t nv = pvd.volSectors + sectorsAdded;
+  uint8_t vs[8]={(uint8_t)nv,(uint8_t)(nv>>8),(uint8_t)(nv>>16),(uint8_t)(nv>>24),
+                 (uint8_t)(nv>>24),(uint8_t)(nv>>16),(uint8_t)(nv>>8),(uint8_t)nv};
+  isoWriteAt(f,(uint64_t)16*ISO_SECTOR+80,vs,8);
+  // Note: We do NOT update ISO 9660 path tables here because:
+  // - ISO 9660 path table entries with raw UTF-8 bytes confuse Windows CDFS
+  // - Joliet navigation uses directory records directly, not path tables
+  // - Path tables are optional (advisory only) per ISO 9660 and Joliet specs
+  // HOWEVER: we DO rebuild the Joliet path table so Windows can navigate.
+  if (pvd.hasJoliet) isoRebuildJolietPathTable(f, pvd);
+  f.close();
+  dualPrint.printf("[ISO] mkdir: %s (Joliet:%d) in %s\n", name.c_str(), pvd.hasJoliet, isoPath.c_str());
+  if (isoPath.equalsIgnoreCase(mountedFile)) doMount(isoPath);
+  httpServer.send(200,"application/json","{\"ok\":true}");
+}
+
+// ---- ISO API: GET /api/iso/label?iso=<>&label=<> — get or set volume label --
+void handleIsoLabel() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String isoPath = httpServer.hasArg("iso") ? normPath(httpServer.arg("iso")) : "";
+  if (!isoPath.length()) { httpServer.send(400,"application/json","{\"error\":\"Missing iso\"}"); return; }
+
+  bool hasLabel = httpServer.hasArg("label");
+
+  if (!hasLabel) {
+    // GET: just read and return current label
+    File f = SD_MMC.open(isoPath.c_str());
+    if (!f) { httpServer.send(404,"application/json","{\"error\":\"File not found\"}"); return; }
+    IsoPVD pvd; bool ok = isoParsePVD(f, pvd); f.close();
+    if (!ok) { httpServer.send(400,"application/json","{\"error\":\"Not a valid ISO\"}"); return; }
+    httpServer.send(200,"application/json","{\"ok\":true,\"label\":\""+jsonEsc(pvd.label)+"\"}");
+    return;
+  }
+
+  // SET: write new label to PVD
+  File f = SD_MMC.open(isoPath.c_str(), "r+");
+  if (!f) { httpServer.send(404,"application/json","{\"error\":\"Cannot open ISO\"}"); return; }
+  if (cfg.isoEditorRO) { f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO editor is read-only (set iso-edit rw to enable)\"}"); return; }
+  if (f.size() > ISO_RW_MAX_BYTES) {
+    f.close(); httpServer.send(403,"application/json","{\"error\":\"ISO >800MB — read-only\"}"); return;
+  }
+  IsoPVD pvd;
+  if (!isoParsePVD(f, pvd) || pvd.isBin) {
+    f.close(); httpServer.send(400,"application/json","{\"error\":\"Not RW-capable\"}"); return;
+  }
+
+  String newLabel = httpServer.arg("label");
+  // ISO 9660 PVD label: printable ASCII, max 32 chars, space-padded, uppercase recommended
+  // We allow full printable ASCII (0x20-0x7E) — ECMA-119 says d-characters but many tools accept more
+  char labelBuf[32]; memset(labelBuf, ' ', 32);
+  // Convert to uppercase for ISO 9660 compatibility
+  String labelUpper = newLabel; labelUpper.toUpperCase();
+  int len = labelUpper.length(); if (len > 32) len = 32;
+  for (int i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)labelUpper[i];
+    if (c >= 0x20 && c <= 0x7E) labelBuf[i] = (char)c;  // allow all printable ASCII
+    else if (c < 0x20 || c == 0x7F) labelBuf[i] = ' ';   // control chars → space
+    else labelBuf[i] = '_';  // non-ASCII → underscore
+  }
+
+  // Write to ISO 9660 PVD (sector 16, offset 40)
+  uint64_t pvdOff = pvd.isBin ? (uint64_t)16 * ISO_BIN_STRIDE + ISO_BIN_HDR
+                               : (uint64_t)16 * ISO_SECTOR;
+  isoWriteAt(f, pvdOff + 40, (const uint8_t*)labelBuf, 32);
+
+  // Write to Joliet SVD (sector jolietSvdLBA, offset 40) as UCS-2 BE
+  // Joliet Volume Identifier is 16 UCS-2 chars (32 bytes), space-padded with U+0020
+  if (pvd.hasJoliet) {
+    uint8_t jolLabelBuf[32]; memset(jolLabelBuf, 0, 32);
+    // Fill with UCS-2 BE spaces first
+    for (int i = 0; i < 16; i++) { jolLabelBuf[i*2]=0x00; jolLabelBuf[i*2+1]=0x20; }
+    // Convert original (non-uppercased) label to UCS-2 BE — preserves Czech etc.
+    uint8_t ucs2[64]; int nChars = utf8ToUCS2BE(newLabel.c_str(), ucs2, 16);
+    if (nChars > 16) nChars = 16;
+    memcpy(jolLabelBuf, ucs2, nChars * 2);
+    uint64_t svdOff = (uint64_t)pvd.jolietSvdLBA * ISO_SECTOR;
+    isoWriteAt(f, svdOff + 40, jolLabelBuf, 32);
+  }
+
+  f.close();
+  dualPrint.printf("[ISO] Label set: '%.32s' on %s (Joliet:%d)\n", labelBuf, isoPath.c_str(), pvd.hasJoliet);
+  if (isoPath.equalsIgnoreCase(mountedFile)) doMount(isoPath);
+  httpServer.send(200,"application/json","{\"ok\":true}");
+}
+
+void handleIsoRemount() {
+  if (!checkAuth()) return;
+  if (!mountedFile.length()) { httpServer.send(400,"application/json","{\"error\":\"Nothing mounted\"}"); return; }
+  bool ok = doMount(mountedFile);
+  httpServer.send(200,"application/json", ok?"{\"ok\":true}":"{\"error\":\"remount failed\"}");
+}
+
+// ── UTF-8 ↔ UCS-2 BE helpers (for Joliet extension) ─────────────────────────
+
+// Convert UTF-8 string to UCS-2 BE. Returns number of UCS-2 chars written.
+static int utf8ToUCS2BE(const char* src, uint8_t* dst, int maxChars) {
+  int n = 0;
+  const uint8_t* p = (const uint8_t*)src;
+  while (*p && n < maxChars) {
+    uint32_t cp;
+    if (!(*p & 0x80))                          { cp = *p++; }
+    else if ((*p & 0xE0)==0xC0 && *(p+1))     { cp=((uint32_t)(*p++&0x1F)<<6)|(*p++&0x3F); }
+    else if ((*p & 0xF0)==0xE0 && *(p+1) && *(p+2)) {
+      cp=((uint32_t)(*p++&0x0F)<<12)|((uint32_t)(*p++&0x3F)<<6)|(*p++&0x3F); }
+    else                                        { cp='?'; p++; }
+    if (cp > 0xFFFF) cp = '?';
+    dst[n*2]   = (uint8_t)(cp >> 8);
+    dst[n*2+1] = (uint8_t)(cp & 0xFF);
+    n++;
+  }
+  return n;
+}
+
+// Convert UCS-2 BE to UTF-8. Returns byte count written (no null terminator).
+static int ucs2BEToUtf8(const uint8_t* src, int chars, char* dst, int maxBytes) {
+  int n = 0;
+  for (int i = 0; i < chars && n < maxBytes - 4; i++) {
+    uint32_t cp = ((uint32_t)src[i*2]<<8) | src[i*2+1];
+    if (cp < 0x80)       { dst[n++]=(char)cp; }
+    else if (cp < 0x800) { dst[n++]=(char)(0xC0|(cp>>6)); dst[n++]=(char)(0x80|(cp&0x3F)); }
+    else { dst[n++]=(char)(0xE0|(cp>>12)); dst[n++]=(char)(0x80|((cp>>6)&0x3F)); dst[n++]=(char)(0x80|(cp&0x3F)); }
+  }
+  if (n < maxBytes) dst[n] = '\0';
+  return n;
+}
+
+// Fill a Joliet directory entry with UCS-2 BE encoded name from UTF-8 source
+static void isoFillJolietDirEntry(uint8_t* de, uint32_t lba, uint32_t size,
+                                   uint8_t flags, const char* utf8name) {
+  uint8_t ucs2[128];
+  int nChars = utf8ToUCS2BE(utf8name, ucs2, 64);
+  uint8_t nameBytes = (uint8_t)(nChars * 2);
+  uint8_t recLen = 33 + nameBytes; if (recLen & 1) recLen++;
+  memset(de, 0, recLen);
+  de[0]=recLen; de[1]=0;
+  de[2]=(uint8_t)lba;      de[3]=(uint8_t)(lba>>8);
+  de[4]=(uint8_t)(lba>>16); de[5]=(uint8_t)(lba>>24);
+  de[6]=de[5]; de[7]=de[4]; de[8]=de[3]; de[9]=de[2];
+  de[10]=(uint8_t)size;    de[11]=(uint8_t)(size>>8);
+  de[12]=(uint8_t)(size>>16); de[13]=(uint8_t)(size>>24);
+  de[14]=de[13]; de[15]=de[12]; de[16]=de[11]; de[17]=de[10];
+  de[18]=125; de[19]=1; de[20]=1;
+  de[25]=flags; de[26]=0; de[27]=0;
+  de[28]=1; de[29]=0; de[30]=0; de[31]=1;
+  de[32]=nameBytes;
+  if (nameBytes > 0) memcpy(de+33, ucs2, nameBytes);
+}
+
+// Handles ALL byte offsets correctly per ECMA-119 section 9.1.
+static void isoFillDirEntry(uint8_t* de, uint32_t lba, uint32_t size,
+                             uint8_t flags, const uint8_t* name, uint8_t nameLen) {
+  uint8_t recLen = 33 + nameLen; if (recLen & 1) recLen++;
+  memset(de, 0, recLen);
+  de[0]  = recLen;
+  de[1]  = 0;                                             // Extended Attribute Length
+  de[2]  = (uint8_t)lba;       de[3]  = (uint8_t)(lba>>8);   // Extent LBA LE
+  de[4]  = (uint8_t)(lba>>16); de[5]  = (uint8_t)(lba>>24);
+  de[6]  = de[5]; de[7] = de[4]; de[8] = de[3]; de[9] = de[2]; // Extent LBA BE
+  de[10] = (uint8_t)size;       de[11] = (uint8_t)(size>>8);  // Data Length LE
+  de[12] = (uint8_t)(size>>16); de[13] = (uint8_t)(size>>24);
+  de[14] = de[13]; de[15] = de[12]; de[16] = de[11]; de[17] = de[10]; // Data Length BE
+  de[18] = 125; de[19] = 1; de[20] = 1;  // Date: 2025-01-01
+  de[21] = 0; de[22] = 0; de[23] = 0; de[24] = 0;
+  de[25] = flags;   // File Flags (0x02=dir, 0x00=file)
+  de[26] = 0;       // File Unit Size      (0 = not interleaved — MUST be 0)
+  de[27] = 0;       // Interleave Gap Size (0 = not interleaved — MUST be 0)
+  de[28] = 1; de[29] = 0;  // Volume Sequence Number LE = 1
+  de[30] = 0; de[31] = 1;  // Volume Sequence Number BE = 1
+  de[32] = nameLen;         // Length of File Identifier
+  if (nameLen > 0) memcpy(de + 33, name, nameLen);
+}
+
+// ---- ISO API: GET /api/iso/create?path=<path> — create minimal blank ISO ----
+void handleIsoCreate() {
+  if (!checkAuth()) return;
+  if (!sdReady) { httpServer.send(503,"application/json","{\"error\":\"SD not ready\"}"); return; }
+  String path = httpServer.hasArg("path") ? normPath(httpServer.arg("path")) : "";
+  if (!path.length() || !path.endsWith(".iso")) {
+    httpServer.send(400,"application/json","{\"error\":\"Missing or invalid path\"}"); return;
+  }
+  if (SD_MMC.exists(path.c_str())) {
+    httpServer.send(409,"application/json","{\"error\":\"File already exists\"}"); return;
+  }
+  File f = SD_MMC.open(path.c_str(), FILE_WRITE);
+  if (!f) { httpServer.send(500,"application/json","{\"error\":\"Cannot create file\"}"); return; }
+
+  uint8_t sec[ISO_SECTOR];
+  // ISO layout with Joliet extension:
+  //  0-15: system area
+  //  16:   PVD (ISO 9660) → root dir at LBA 24
+  //  17:   Joliet SVD     → Joliet root dir at LBA 25
+  //  18:   VDST
+  //  19:   ISO 9660 Type-L Path Table
+  //  20:   ISO 9660 Type-M Path Table
+  //  21:   Joliet Type-L Path Table
+  //  22:   Joliet Type-M Path Table
+  //  23:   (unused / alignment)
+  //  24:   ISO 9660 root dir (empty — just . and ..)
+  //  25:   Joliet root dir (actual content goes here)
+  const uint32_t TOTAL_SECS = 26;
+  const uint32_t LBA_ISO_PATH_L = 19, LBA_ISO_PATH_M = 20;
+  const uint32_t LBA_JOL_PATH_L = 21, LBA_JOL_PATH_M = 22;
+  const uint32_t LBA_ISO_ROOT   = 24, LBA_JOL_ROOT   = 25;
+
+  // Sectors 0-15: zeros
+  memset(sec, 0, ISO_SECTOR);
+  for (int i = 0; i < 16; i++) f.write(sec, ISO_SECTOR);
+
+  // Helper lambda-like macro to write LE+BE uint32
+  #define WRITE_LE_BE_32(buf, off, val) do { \
+    (buf)[(off)]=(uint8_t)(val);     (buf)[(off)+1]=(uint8_t)((val)>>8); \
+    (buf)[(off)+2]=(uint8_t)((val)>>16); (buf)[(off)+3]=(uint8_t)((val)>>24); \
+    (buf)[(off)+4]=(buf)[(off)+3]; (buf)[(off)+5]=(buf)[(off)+2]; \
+    (buf)[(off)+6]=(buf)[(off)+1]; (buf)[(off)+7]=(buf)[(off)+0]; } while(0)
+
+  // ── Sector 16: Primary Volume Descriptor (ISO 9660) ─────────────────────
+  memset(sec, 0x20, ISO_SECTOR); memset(sec, 0, 80); memset(sec+88, 0, ISO_SECTOR-88);
+  sec[0]=1; memcpy(sec+1,"CD001",5); sec[6]=1;
+  memset(sec+8,  0x20, 32);  // System Identifier (spaces)
+  memset(sec+40, 0x20, 32); memcpy(sec+40, "BLANK", 5);  // Volume Identifier
+  WRITE_LE_BE_32(sec, 80, TOTAL_SECS);   // Volume Space Size
+  sec[120]=1;sec[121]=0;sec[122]=0;sec[123]=1;   // Vol Set Size LE+BE=1
+  sec[124]=1;sec[125]=0;sec[126]=0;sec[127]=1;   // Vol Seq Num LE+BE=1
+  sec[128]=0;sec[129]=8;sec[130]=8;sec[131]=0;   // Logical Block Size=2048 LE+BE
+  WRITE_LE_BE_32(sec, 132, 10);                  // Path Table Size
+  sec[140]=(uint8_t)LBA_ISO_PATH_L;              // Type-L Path Table LBA (LE)
+  sec[148]=0;sec[149]=0;sec[150]=0;sec[151]=(uint8_t)LBA_ISO_PATH_M; // Type-M (BE)
+  { uint8_t d=0; isoFillDirEntry(sec+156, LBA_ISO_ROOT, ISO_SECTOR, 0x02, &d, 1); } // Root dir record
+  memcpy(sec+813, "2025010100000000", 16); sec[829]=0;  // Creation date
+  memcpy(sec+830, "2025010100000000", 16); sec[846]=0;  // Modification date
+  memset(sec+847, 0x30, 16); sec[863]=0;  // Expiration (unset)
+  memset(sec+864, 0x30, 16); sec[880]=0;  // Effective (unset)
+  sec[881]=1;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 17: Joliet Supplementary Volume Descriptor ───────────────────
+  memset(sec, 0x20, ISO_SECTOR); memset(sec, 0, 80); memset(sec+88, 0, ISO_SECTOR-88);
+  sec[0]=2; memcpy(sec+1,"CD001",5); sec[6]=1;
+  memset(sec+8,  0x20, 32);  // System Identifier
+  // Volume Identifier "BLANK" in UCS-2 BE at offset 40 (32 bytes = 16 UCS-2 chars)
+  memset(sec+40, 0, 32);
+  { const char* lbl="BLANK"; uint8_t ucs2[12]; int n=utf8ToUCS2BE(lbl,ucs2,6); memcpy(sec+40,ucs2,n*2); }
+  WRITE_LE_BE_32(sec, 80, TOTAL_SECS);   // Volume Space Size
+  // Joliet escape sequence at offset 88: %/@ = UCS-2 Level 1
+  sec[88]=0x25;sec[89]=0x2F;sec[90]=0x40; memset(sec+91,0x20,29);
+  sec[120]=1;sec[121]=0;sec[122]=0;sec[123]=1;
+  sec[124]=1;sec[125]=0;sec[126]=0;sec[127]=1;
+  sec[128]=0;sec[129]=8;sec[130]=8;sec[131]=0;   // Block size=2048
+  WRITE_LE_BE_32(sec, 132, 10);                  // Path Table Size
+  sec[140]=(uint8_t)LBA_JOL_PATH_L;
+  sec[148]=0;sec[149]=0;sec[150]=0;sec[151]=(uint8_t)LBA_JOL_PATH_M;
+  { uint8_t d=0; isoFillDirEntry(sec+156, LBA_JOL_ROOT, ISO_SECTOR, 0x02, &d, 1); }  // Joliet root
+  memcpy(sec+813, "2025010100000000", 16); sec[829]=0;
+  memcpy(sec+830, "2025010100000000", 16); sec[846]=0;
+  memset(sec+847, 0x30, 16); sec[863]=0;
+  memset(sec+864, 0x30, 16); sec[880]=0;
+  sec[881]=1;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 18: Volume Descriptor Set Terminator ──────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  sec[0]=0xFF; memcpy(sec+1,"CD001",5); sec[6]=1;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 19: ISO 9660 Type-L Path Table ────────────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  sec[0]=1;sec[1]=0;
+  sec[2]=(uint8_t)LBA_ISO_ROOT;sec[3]=0;sec[4]=0;sec[5]=0;
+  sec[6]=1;sec[7]=0; sec[8]=0x00; sec[9]=0x00;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 20: ISO 9660 Type-M Path Table ────────────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  sec[0]=1;sec[1]=0;
+  sec[2]=0;sec[3]=0;sec[4]=0;sec[5]=(uint8_t)LBA_ISO_ROOT;
+  sec[6]=0;sec[7]=1; sec[8]=0x00; sec[9]=0x00;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 21: Joliet Type-L Path Table ──────────────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  sec[0]=1;sec[1]=0;
+  sec[2]=(uint8_t)LBA_JOL_ROOT;sec[3]=0;sec[4]=0;sec[5]=0;
+  sec[6]=1;sec[7]=0; sec[8]=0x00; sec[9]=0x00;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 22: Joliet Type-M Path Table ──────────────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  sec[0]=1;sec[1]=0;
+  sec[2]=0;sec[3]=0;sec[4]=0;sec[5]=(uint8_t)LBA_JOL_ROOT;
+  sec[6]=0;sec[7]=1; sec[8]=0x00; sec[9]=0x00;
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 23: unused/alignment ──────────────────────────────────────────
+  memset(sec, 0, ISO_SECTOR);
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 24: ISO 9660 root directory (empty — just . and ..) ───────────
+  memset(sec, 0, ISO_SECTOR);
+  { uint8_t d=0x00; isoFillDirEntry(sec+0,  LBA_ISO_ROOT, ISO_SECTOR, 0x02, &d, 1); }
+  { uint8_t d=0x01; isoFillDirEntry(sec+34, LBA_ISO_ROOT, ISO_SECTOR, 0x02, &d, 1); }
+  f.write(sec, ISO_SECTOR);
+
+  // ── Sector 25: Joliet root directory (empty — just . and ..) ─────────────
+  memset(sec, 0, ISO_SECTOR);
+  { uint8_t d=0x00; isoFillDirEntry(sec+0,  LBA_JOL_ROOT, ISO_SECTOR, 0x02, &d, 1); }
+  { uint8_t d=0x01; isoFillDirEntry(sec+34, LBA_JOL_ROOT, ISO_SECTOR, 0x02, &d, 1); }
+  f.write(sec, ISO_SECTOR);
+
+  #undef WRITE_LE_BE_32
+
+  f.close();
+  dualPrint.printf("[ISO] Created Joliet ISO: %s (%u sectors)\n", path.c_str(), TOTAL_SECS);
+  httpServer.send(200,"application/json","{\"ok\":true,\"sectors\":" + String(TOTAL_SECS) + "}");
+}
+
 void handleApiStatus() {
   if (!checkAuth()) return;
   String j = "{\"mounted\":";
@@ -4226,6 +5683,7 @@ void handleApiStatus() {
   j += ",\"hdroffset\":" + String(binHeaderOffset);
   j += ",\"default\":\"" + jsonEsc(defaultMount.c_str()) + "\"";
   j += ",\"debug_mode\":" + String(cfg.debugMode ? "true" : "false");
+  j += ",\"iso_editor_ro\":" + String(cfg.isoEditorRO ? "true" : "false");
   j += "}";
   httpServer.send(200, "application/json", j);
 }
@@ -4352,6 +5810,7 @@ void handleApiSysinfo() {
   j += ",\"dos_compat\":" + String(cfg.dosCompat ? "true" : "false");
   j += ",\"dos_driver\":" + String(cfg.dosDriver);
   j += ",\"debug_mode\":" + String(cfg.debugMode ? "true" : "false");
+  j += ",\"iso_editor_ro\":" + String(cfg.isoEditorRO ? "true" : "false");
   j += ",\"img_fat83\":" + String(cfg.imgFat83  ? "true" : "false");
   j += ",\"win98_stop_ms\":" + String(cfg.win98StopMs);
   j += ",\"device_mode\":" + String(cfg.deviceMode);
@@ -4575,6 +6034,7 @@ void handleApiGetConfig() {
   j += ",\"dosDriver\":" + String(cfg.dosDriver);
   j += ",\"debugMode\":" + String(cfg.debugMode ? "true" : "false");
   j += ",\"imgFat83\":" + String(cfg.imgFat83  ? "true" : "false");
+  j += ",\"isoEditorRO\":" + String(cfg.isoEditorRO ? "true" : "false");
   j += ",\"win98StopMs\":" + String(cfg.win98StopMs);
   j += ",\"gotekUsbMode\":" + String(cfg.gotekUsbMode);
   j += ",\"gotekFatWP\":"  + String(cfg.gotekFatWP);
@@ -4696,6 +6156,11 @@ void handleApiSaveConfig() {
   if (httpServer.hasArg("imgFat83")) {
     String v=httpServer.arg("imgFat83");
     cfg.imgFat83=(v=="1"||v=="true"||v=="on"); changed=true;
+  }
+  if (httpServer.hasArg("isoEditorRO")) {
+    String v=httpServer.arg("isoEditorRO");
+    cfg.isoEditorRO=(v=="1"||v=="true"||v=="on"); changed=true;
+    dualPrint.printf("[OK]  ISO editor: %s\n", cfg.isoEditorRO ? "Read-Only" : "Read-Write");
   }
   if (httpServer.hasArg("win98StopMs")) {
     cfg.win98StopMs=(uint16_t)constrain(httpServer.arg("win98StopMs").toInt(),0,9999); changed=true;
@@ -5522,6 +6987,16 @@ void setupWebServer() {
   httpServer.on("/api/config/save",  HTTP_GET,  handleApiSaveConfig);
   httpServer.on("/api/reboot",       HTTP_GET,  handleApiReboot);
   httpServer.on("/api/factory",      HTTP_GET,  handleApiFactoryReset);
+  httpServer.on("/api/iso/ls",     HTTP_GET,  handleIsoLs);
+  httpServer.on("/api/iso/stat",   HTTP_GET,  handleIsoStat);
+  httpServer.on("/api/iso/get",    HTTP_GET,  handleIsoGet);
+  httpServer.on("/api/iso/rm",     HTTP_GET,  handleIsoRm);
+  httpServer.on("/api/iso/rmdir",  HTTP_GET,  handleIsoRmDir);
+  httpServer.on("/api/iso/mkdir",  HTTP_GET,  handleIsoMkdir);
+  httpServer.on("/api/iso/put",    HTTP_POST, handleIsoPutDone, handleIsoPut);
+  httpServer.on("/api/iso/label",  HTTP_GET,  handleIsoLabel);
+  httpServer.on("/api/iso/remount",HTTP_GET,  handleIsoRemount);
+  httpServer.on("/api/iso/create", HTTP_GET,  handleIsoCreate);
   httpServer.on("/api/img/ls",    HTTP_GET,  handleImgLs);
   httpServer.on("/api/img/rm",    HTTP_GET,  handleImgRm);
   httpServer.on("/api/img/get",   HTTP_GET,  handleImgGet);
@@ -5838,6 +7313,7 @@ void printConfig(bool showRuntime = true) {
     dualPrint.printf("  USB block cnt : %u  (%.2f MB)\n",
       gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
     dualPrint.printf("  Image FAT 8.3 : %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
+    dualPrint.printf("  ISO editor    : %s\n", cfg.isoEditorRO ? "Read-Only (RO)" : "Read-Write (RW)");
     dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   }
   // DOS compat + driver (driver jen kdyz compat=ON)
@@ -6010,6 +7486,7 @@ void printStatus() {
     dualPrint.printf("  USB sectors   : %u  (%.2f MB)\n",
       gkBlockCount(), (float)gkBlockCount()*GK_SECTOR_SIZE/1048576.0f);
     dualPrint.printf("  Image FAT 8.3 : %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
+    dualPrint.printf("  ISO editor    : %s\n", cfg.isoEditorRO ? "Read-Only (RO)" : "Read-Write (RW)");
     dualPrint.println(F("  └────────────────────────────────────────────────┘"));
 
   } else {
@@ -6025,6 +7502,7 @@ void printStatus() {
       dualPrint.println(F("  Mounted image : (none)"));
     }
     dualPrint.printf("  Default image : %s\n", defaultMount.length() ? defaultMount.c_str() : "(none)");
+    dualPrint.printf("  ISO editor    : %s\n", cfg.isoEditorRO ? "Read-Only (RO)" : "Read-Write (RW)");
     dualPrint.println(F("  └────────────────────────────────────────────────┘"));
     dualPrint.println(F(""));
 
@@ -6178,6 +7656,7 @@ void printHelp() {
   dualPrint.println(F("  help                  Show this help"));
   dualPrint.println(F("  set debug on|off      Verbose SCSI/API logging (default: off, saved)"));
   dualPrint.println(F("  set img-fat83 on|off  ON=FAT 8.3 auto-convert (~N dedup), OFF=VFAT long names"));
+  dualPrint.println(F("  set iso-edit ro|rw    ISO image editor access: ro=read-only, rw=read-write (default)"));
 
   dualPrint.println(F("  └────────────────────────────────────────────────┘"));
   printSep();
@@ -6272,6 +7751,12 @@ void processCommand(String &line) {
     cfg.imgFat83 = (v == "on" || v == "1" || v == "yes");
     saveConfig();
     dualPrint.printf("[OK]  Image FAT 8.3: %s\n", cfg.imgFat83 ? "FAT 8.3 auto-convert" : "VFAT long names");
+  }
+  else if (line.startsWith("set iso-edit") || line.startsWith("SET ISO-EDIT")) {
+    String v = line.substring(12); v.trim(); v.toLowerCase();
+    cfg.isoEditorRO = (v == "ro" || v == "readonly" || v == "off" || v == "0");
+    saveConfig();
+    dualPrint.printf("[OK]  ISO editor: %s\n", cfg.isoEditorRO ? "Read-Only (RO)" : "Read-Write (RW)");
   }
   else if (line.startsWith("set win98-stop") || line.startsWith("SET WIN98-STOP")) {
     String v = line.substring(14); v.trim();
