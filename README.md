@@ -72,6 +72,7 @@ The `build_exfat_libs.py` patch script must be run before compiling either build
 - [Web UI Authentication](#web-ui-authentication)
 - [HTTPS / TLS](#https--tls)
 - [Audio CD Playback](#audio-cd-playback)
+- [ISO Image Editor](#iso-image-editor-1)
 - [SCSI Command Reference](#scsi-command-reference)
 - [Supported Disc Image Formats](#supported-disc-image-formats)
 - [Python Scripts](#python-scripts)
@@ -113,6 +114,7 @@ The `build_exfat_libs.py` patch script must be run before compiling either build
 - **Win98 Stop/Pause detection** — detects Win98 CDPlayer Stop/Pause via READ_SUB_CHANNEL polling absence; configurable timeout
 - **CUE parser** — all sector formats, physical/virtual pregap, single-BIN and per-track-BIN layouts
 - **Web file manager** — upload, download, delete, folders, drag-and-drop
+- **ISO Image Editor** — in-browser editor for `.iso` files: browse, upload files, create folders, delete, download individual files, edit volume label; full Joliet (Unicode) support for Czech and other non-ASCII names; read-only lock mode; up to 800 MB images
 - **Wi-Fi** — WPA2-Personal, WPA2-Enterprise PEAP, WPA2-Enterprise EAP-TLS with certificate management
 - **mDNS** — device reachable at `hostname.local`
 - **NVS persistence** — all settings survive reboot
@@ -543,7 +545,7 @@ The I2S module is initialised immediately at runtime — no reboot required. Dis
 
 Available at `http://cd.local` or via the device IP address.
 
-**CD-ROM** -- browse the SD card, mount/eject disc images, set the default image loaded on boot.
+**CD-ROM** -- browse the SD card, mount/eject disc images, set the default image loaded on boot. Each `.iso` file has a 💿 button to open the ISO Image Editor.
 
 **Audio** -- appears automatically when a CUE image with audio tracks is mounted. Contains: progress bar (clickable seek), play/pause/stop/prev/next controls, volume slider, mute toggle, scrollable track list. Tab is greyed out when no audio CD is mounted.
 
@@ -551,13 +553,14 @@ Available at `http://cd.local` or via the device IP address.
 
 **Log** -- live output stream (same messages as the serial port).
 
-**Status** -- real-time device status: Wi-Fi, SD card, disc image, EAP certificate details, audio module, system info.
+**Status** -- real-time device status: Wi-Fi, SD card, disc image (including ISO editor RW/RO mode), EAP certificate details, audio module, system info.
 
 **Config** -- complete configuration without a serial cable. Sections scroll freely; Save/Reboot/Factory Reset remain fixed at the bottom of the tab at all times. Sections:
 - **WiFi** -- SSID, password, network scan
 - **Network** -- DHCP/Static, IP/mask/gateway/DNS, Hostname with live mDNS preview
 - **802.1x Enterprise WiFi** -- EAP Mode, identity, **Scan SD** for auto-detection of `.pem/.crt/.key` files, CA cert, Client cert/key, passphrase
 - **Audio Module** -- PCM5102 I2S enable/disable dropdown; takes effect immediately without reboot
+- **ISO Image Editor** -- read-write or read-only access mode for the ISO editor (CD-ROM mode only)
 - **Web UI Authentication** -- enable/disable HTTP Basic Auth, username, password (write-only)
 - **DOS Compatibility Mode** -- UNIT ATTENTION instead of USB re-enum on mount/eject; expands to show DOS driver selector when enabled
 - **HTTPS / TLS** — optional HTTPS on port 443 with certificate from SD card; HTTP auto-redirects to HTTPS; hardware AES/SHA/RSA acceleration
@@ -651,7 +654,8 @@ All `set` commands save the value to NVS immediately. Most take effect after `re
 
 | Command | Default | Notes |
 |---|---|---|
-| `set img-fat83 on\|off` | `on` | Image editor upload filename mode. `on` = FAT 8.3 auto-convert with `~N` deduplication (max DOS compatibility). `off` = VFAT long filenames stored as proper UTF-16LE LFN entries. Folder names follow the same setting. Saved to NVS. |
+| `set img-fat83 on\|off` | `on` | GoTek image editor upload filename mode. `on` = FAT 8.3 auto-convert with `~N` deduplication (max DOS compatibility). `off` = VFAT long filenames stored as proper UTF-16LE LFN entries. Folder names follow the same setting. Saved to NVS. |
+| `set iso-edit ro\|rw` | `rw` | ISO image editor write access. `rw` = full editing (upload, delete, create folders, edit label). `ro` = browse and download only — no modifications possible. Saved to NVS. Takes effect immediately. |
 
 #### Web UI Security
 
@@ -1116,6 +1120,56 @@ CUE tracks are parsed and all SCSI audio commands work correctly. The audio task
 ---
 
 
+## ISO Image Editor
+
+The ISO Image Editor is a browser-based tool for viewing and modifying `.iso` files stored on the SD card without removing the card or using a PC tool. Open it by clicking the 💿 button next to any `.iso` file in the CD-ROM tab.
+
+### Supported images
+
+| Type | Browse | Edit |
+|---|---|---|
+| ISO 9660 (`.iso`) ≤ 800 MB | ✓ | ✓ RW mode |
+| ISO 9660 (`.iso`) > 800 MB | ✓ | — read-only |
+| BIN/raw (`.bin`, `.img`) | — | — |
+
+### Joliet (Unicode) support
+
+Images created by the editor include a **Joliet Supplementary Volume Descriptor** alongside the ISO 9660 Primary Volume Descriptor. Joliet stores file and folder names as UCS-2 (Unicode), allowing:
+
+- Czech, German, Japanese and other non-ASCII names in file and folder names
+- Names up to 64 UTF-8 bytes (approximately 32 Czech characters)
+- Correct display in Windows Explorer via USB (Windows reads from the Joliet tree)
+
+### Operations
+
+| Action | Description |
+|---|---|
+| Browse | Navigate into folders by clicking them |
+| Download | Download any file from inside the ISO to the browser |
+| Upload | Drag files onto the list or use the Upload button. Files are appended to the end of the ISO; both ISO 9660 and Joliet directory entries are created |
+| New folder | Create a directory. Name can contain Unicode (Czech etc.); characters `\ / : * ? " < > |` are replaced with `_` automatically |
+| Delete file | Removes the file entry from ISO 9660 and Joliet trees, compacts the directory |
+| Delete folder | Recursively deletes all contents, then removes the folder entry from both trees and rebuilds the Joliet path table |
+| Edit label | Change the volume identifier shown in Windows Explorer. Written to both PVD (uppercase ASCII, max 32 chars) and Joliet SVD (Unicode, max 16 chars) |
+| New ISO | Create a blank 26-sector ISO with Joliet extension from the CD-ROM tab (+ New ISO button) |
+
+### Read-only lock
+
+Set `set iso-edit ro` (CLI) or select **Read-Only** in the Config tab → ISO Image Editor card. In RO mode the editor shows all contents but the Upload, New folder, Delete and Edit label controls are hidden. A red **ISO editor: RO** badge appears in the CD-ROM status bar.
+
+### Character restrictions
+
+Folder and file names must not contain `\ / : * ? " < > |`. These are the characters forbidden by the Joliet specification and Windows CDFS — storing them causes navigation failures. The editor automatically replaces them with `_`.
+
+### Limitations
+
+- Path tables are only rebuilt for the Joliet tree (root level); the ISO 9660 path table is not updated (raw UTF-8 bytes in that table confuse Windows CDFS)
+- Deleted files free directory entries but do not reclaim data sectors — the ISO file on the SD card does not shrink
+- Subdirectory navigation works through directory record chains; nested directories deeper than one level may not be reachable via Windows path table lookup but remain accessible via the web editor
+
+---
+
+
 ## SCSI Command Reference
 
 The firmware implements the USB MSC CD-ROM profile with SCSI-2 commands per **Pioneer OB-U0077C v3.1**. Commands are handled in a patched `tud_msc_scsi_cb` via `build_exfat_libs.py --skip-full-build`.
@@ -1316,7 +1370,9 @@ Returns current disc image state.
   "mediaPresent": true,
   "dosCompat": true,
   "dosDriver": 2,
-  "default": "/games/TombRaider.cue"
+  "default": "/games/TombRaider.cue",
+  "debug_mode": false,
+  "iso_editor_ro": false
 }
 ```
 
@@ -1436,6 +1492,7 @@ Read all configuration keys. Password fields (`pass`, `eap-pass`, `web-pass`, `e
   "audio-module": "off",
   "dos-compat": "on", "dos-driver": "2",
   "img-fat83": "on",
+  "isoEditorRO": false,
   "web-auth": "off", "web-user": "admin", "web-pass": "",
   "https-enable": "off", "https-cert": "", "https-key": ""
 }
@@ -1551,6 +1608,87 @@ Safely unmount the SD card so it can be physically removed. Returns `{"ok": true
 
 Remount the SD card after reinsertion. Returns `{"ok": true}`.
 
+
+### ISO Image Editor
+
+The ISO Image Editor allows browsing and modifying `.iso` files stored on the SD card directly from the browser. Supports ISO 9660 + Joliet (Unicode file names). Files up to 800 MB are supported in read-write mode. BIN/raw images are read-only.
+
+All endpoints require `iso=<absolute-path>` pointing to the `.iso` file on the SD card.
+
+#### `GET /api/iso/ls?iso=<path>&dir=<dir>`
+
+List directory contents inside the ISO. Uses Joliet (UCS-2) names when available, falling back to ISO 9660 raw bytes. `dir` defaults to `/`.
+
+```json
+{
+  "ok": true,
+  "dir": "/",
+  "rw": true,
+  "bin": false,
+  "joliet": true,
+  "label": "MYDISC",
+  "iso_size": 724992,
+  "vol_sectors": 354,
+  "files": [
+    {"name": "Documents", "dir": true,  "size": 0,      "lba": 27},
+    {"name": "readme.txt","dir": false, "size": 1024,   "lba": 29}
+  ]
+}
+```
+
+`rw` is `false` when: the ISO editor is locked (`set iso-edit ro`), the image is a BIN/raw file, or the file exceeds 800 MB.
+
+#### `GET /api/iso/stat?iso=<path>`
+
+Quick status check for an ISO file.
+
+```json
+{"ok": true, "rw": true, "bin": false, "size": 724992, "vol_sectors": 354}
+```
+
+#### `GET /api/iso/get?iso=<path>&file=<path>`
+
+Download a file from inside the ISO. Returns raw file bytes with `Content-Disposition: attachment`.
+
+#### `GET /api/iso/rm?iso=<path>&file=<path>`
+
+Delete a file from the ISO. Removes entries from both ISO 9660 and Joliet directory trees. Automatically remounts the image if it is currently in use by USB.
+
+#### `GET /api/iso/rmdir?iso=<path>&file=<path>`
+
+Delete a directory and all its contents recursively. Rebuilds the Joliet path table after deletion.
+
+#### `GET /api/iso/mkdir?iso=<path>&dir=<dir>&name=<name>`
+
+Create a new directory inside the ISO. `dir` is the parent directory (e.g. `/`), `name` is the new folder name. Names are stored as raw UTF-8 in the ISO 9660 entry and as UCS-2 in the Joliet entry — Czech and other Unicode names are fully supported. Characters `\ / : * ? " < > |` are replaced with `_` automatically.
+
+#### `POST /api/iso/put?iso=<path>&dir=<dir>`
+
+Upload a file into the ISO. Send file as `multipart/form-data`. The filename from the upload is used (uppercase + `;1` suffix for ISO 9660, original case for Joliet). Appends data sectors to the end of the ISO and updates volume size in PVD and Joliet SVD.
+
+#### `GET /api/iso/label?iso=<path>[&label=<text>]`
+
+Without `label`: return the current volume identifier.
+
+```json
+{"ok": true, "label": "MYDISC"}
+```
+
+With `label`: write a new volume label. Written to ISO 9660 PVD (uppercase ASCII, max 32 chars) and to Joliet SVD (UCS-2, max 16 chars — preserves Unicode case). Returns `{"ok": true}`.
+
+#### `GET /api/iso/create?path=<path>`
+
+Create a new blank ISO 9660 + Joliet image at the given path. The file must not already exist and must end in `.iso`. Creates a 26-sector image with both ISO 9660 and Joliet directory trees. Label defaults to `BLANK`.
+
+```json
+{"ok": true, "sectors": 26}
+```
+
+#### `GET /api/iso/remount`
+
+Force remount of the currently mounted ISO (if the mounted file is an ISO that was edited). Equivalent to ejecting and remounting.
+
+---
 
 ## RGB LED Status Codes
 
